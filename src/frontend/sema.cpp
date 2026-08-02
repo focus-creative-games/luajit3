@@ -41,6 +41,11 @@ void walk_expr(Expr& e, Ctx& ctx) {
       walk_expr(*a, ctx);
     break;
   }
+  case AstKind::ExprParen: {
+    auto& n = static_cast<ExprParen&>(e);
+    walk_expr(*n.inner, ctx);
+    break;
+  }
   case AstKind::ExprTable: {
     auto& n = static_cast<ExprTable&>(e);
     for (auto& f : n.fields) {

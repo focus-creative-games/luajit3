@@ -39,6 +39,8 @@
 - Generic `for`: iterator explist adjusted to 3 values; `TFORCALL` at `R[A+3]`; `fix_sbx` absolute dest
 - `pcall`/`xpcall` unwind leftover Lua frames on error
 - Coroutine `top` is **per-thread** (was shared `State::top_`, caused vector OOB on resume after yield)
+- Multret lowering: trailing call/vararg in `return`, call args, table lists (`SETLIST`); `(expr)` via `ExprParen` truncates
+- Language oracle suite modularized under `tests/lang53/` (~150+ cases); matrix in [test-coverage-lang53.md](spec/test-coverage-lang53.md)
 
 ## How to verify
 
@@ -49,4 +51,5 @@ ctest --test-dir build -C Debug --output-on-failure
 build\Debug\lj3_tests.exe
 ```
 
-Primary suite: `tests/test_lang53.cpp` (Lua 5.3 language oracle cases).
+Primary suite: `tests/test_lang53.cpp` + `tests/lang53/*.cpp`  
+Coverage matrix: [docs/spec/test-coverage-lang53.md](spec/test-coverage-lang53.md) (language-core rows Done or documented GAP; no TODO).

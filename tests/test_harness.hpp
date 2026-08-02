@@ -36,6 +36,7 @@ struct Run {
   }
   bool boolean(int idx = -1) const { return lua_toboolean(L, idx) != 0; }
   int top() const { return lua_gettop(L); }
+  int type(int idx = -1) const { return lua_type(L, idx); }
 };
 
 inline int expect_int(const char* group, const char* src, long long want) {
@@ -43,8 +44,19 @@ inline int expect_int(const char* group, const char* src, long long want) {
   if (!r.ok())
     return fail(group, std::string(src) + " :: " + (r.err() ? r.err() : "?"));
   if (r.integer() != want)
-    return fail(group, std::string(src) + " expected " + std::to_string(want) + " got " +
+    return fail(group, std::string(src) + " expected int " + std::to_string(want) + " got " +
                             std::to_string(r.integer()));
+  return 0;
+}
+
+inline int expect_num(const char* group, const char* src, double want, double eps = 1e-9) {
+  Run r(src);
+  if (!r.ok())
+    return fail(group, std::string(src) + " :: " + (r.err() ? r.err() : "?"));
+  double got = r.number();
+  if (!(std::fabs(got - want) <= eps))
+    return fail(group, std::string(src) + " expected num " + std::to_string(want) + " got " +
+                            std::to_string(got));
   return 0;
 }
 
@@ -62,7 +74,19 @@ inline int expect_bool(const char* group, const char* src, bool want) {
   if (!r.ok())
     return fail(group, std::string(src) + " :: " + (r.err() ? r.err() : "?"));
   if (r.boolean() != want)
-    return fail(group, std::string(src) + " expected bool");
+    return fail(group, std::string(src) + " expected bool " + (want ? "true" : "false"));
+  return 0;
+}
+
+inline int expect_true(const char* group, const char* src) { return expect_bool(group, src, true); }
+inline int expect_false(const char* group, const char* src) { return expect_bool(group, src, false); }
+
+inline int expect_nil(const char* group, const char* src) {
+  Run r(src);
+  if (!r.ok())
+    return fail(group, std::string(src) + " :: " + (r.err() ? r.err() : "?"));
+  if (r.top() < 1 || r.type(-1) != LUA_TNIL)
+    return fail(group, std::string(src) + " expected nil");
   return 0;
 }
 

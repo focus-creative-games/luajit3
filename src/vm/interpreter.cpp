@@ -524,8 +524,9 @@ int interpret(State* L) {
     }
     case OpCode::SETLIST: {
       int n = b;
+      // B==0: values occupy R[A+1]..R[top-1] (same top convention as CALL B==0).
       if (n == 0)
-        n = L->gettop() - (fbase() + a);
+        n = L->gettop() - (fbase() + a) - 1;
       int offset = (c - 1) * 50;
       if (!base[a].is_table())
         panic("SETLIST on non-table");

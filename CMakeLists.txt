@@ -71,11 +71,22 @@ if(LJ3_BUILD_TESTS)
     tests/test_vm.cpp
     tests/test_differential.cpp
     tests/test_lang53.cpp
+    tests/lang53/test_types_coercion.cpp
+    tests/lang53/test_ops.cpp
+    tests/lang53/test_statements.cpp
+    tests/lang53/test_tables_meta.cpp
+    tests/lang53/test_functions.cpp
+    tests/lang53/test_visibility_goto.cpp
+    tests/lang53/test_errors_coro.cpp
+    tests/lang53/test_baselib.cpp
     tests/test_parser_sema.cpp
     tests/test_gc_stress.cpp
   )
   target_link_libraries(lj3_tests PRIVATE luajit3)
-  target_include_directories(lj3_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_include_directories(lj3_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests
+  )
   add_test(NAME lj3_tests COMMAND lj3_tests)
   add_test(NAME lj3_cli_version COMMAND luajit3_cli --version)
 endif()

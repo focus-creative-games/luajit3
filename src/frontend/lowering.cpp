@@ -128,6 +128,21 @@ void expr(FuncState& fs, Expdesc& e, Expr& node);
 void statement(FuncState& fs, AstNode& node);
 void block(FuncState& fs, Block& b);
 
+// Patch the most recent CALL's C field. nresults==-1 means LUA_MULTRET (C=0).
+uint8_t patch_last_call_results(FuncState& fs, int nresults) {
+  auto& code = fs.proto->code;
+  for (int pi = static_cast<int>(code.size()) - 1; pi >= 0; --pi) {
+    if (static_cast<OpCode>(op_get(code[static_cast<size_t>(pi)])) != OpCode::CALL)
+      continue;
+    uint8_t ca = op_a(code[static_cast<size_t>(pi)]);
+    uint8_t cb = op_b(code[static_cast<size_t>(pi)]);
+    uint8_t cc = (nresults < 0) ? 0 : static_cast<uint8_t>(nresults + 1);
+    code[static_cast<size_t>(pi)] = encode_abc(OpCode::CALL, ca, cb, cc);
+    return ca;
+  }
+  return 0;
+}
+
 int add_upval(FuncState& fs, const std::string& name, bool instack, int idx) {
   for (size_t i = 0; i < fs.proto->upvalues.size(); ++i)
     if (fs.proto->upvalues[i].name == name)
@@ -278,9 +293,19 @@ void expr(FuncState& fs, Expdesc& e, Expr& node) {
     break;
   case AstKind::ExprVararg: {
     int r = fs.new_reg();
-    fs.code_abc(OpCode::VARARG, r, 2, 0); // one vararg value
+    fs.code_abc(OpCode::VARARG, r, 2, 0); // one vararg value (contexts may rewrite)
     e.kind = Expdesc::Nonrelocable;
     e.reg = r;
+    break;
+  }
+  case AstKind::ExprParen: {
+    auto& n = static_cast<ExprParen&>(node);
+    expr(fs, e, *n.inner);
+    // Truncate multret: expose only the first result to outer contexts.
+    if (e.kind == Expdesc::Call) {
+      e.reg = e.info;
+      e.kind = Expdesc::Nonrelocable;
+    }
     break;
   }
   case AstKind::ExprUn: {
@@ -448,39 +473,32 @@ void expr(FuncState& fs, Expdesc& e, Expr& node) {
     bool last_is_multret_call = false;
     for (size_t ai = 0; ai < n.args.size(); ++ai) {
       int dest = fs.freereg;
-      if (fs.freereg <= dest)
-        fs.reserve(1);
-      int after_slot = dest + 1;
-      fs.freereg = after_slot;
       auto& arg = n.args[ai];
       bool is_last = (ai + 1 == n.args.size());
       if (is_last && arg->kind == AstKind::ExprVararg) {
+        fs.freereg = dest;
+        fs.reserve(1);
         fs.code_abc(OpCode::VARARG, dest, 0, 0); // all varargs
         last_is_vararg = true;
-        fs.freereg = dest + 1; // top adjusted at runtime
         break;
       }
+      // Last call arg must land at `dest` so results are contiguous after prior args.
+      if (is_last && arg->kind == AstKind::ExprCall) {
+        fs.freereg = dest;
+        Expdesc ae;
+        expr(fs, ae, *arg);
+        patch_last_call_results(fs, -1);
+        last_is_multret_call = true;
+        break;
+      }
+      fs.freereg = dest + 1;
+      fs.maxstack = std::max(fs.maxstack, fs.freereg);
       Expdesc ae;
       expr(fs, ae, *arg);
-      if (is_last && ae.kind == Expdesc::Call) {
-        // re-emit last call with MULTRET: fix previous CALL's C to 0
-        auto& code = fs.proto->code;
-        for (int pi = static_cast<int>(code.size()) - 1; pi >= 0; --pi) {
-          if (static_cast<OpCode>(op_get(code[static_cast<size_t>(pi)])) == OpCode::CALL) {
-            uint8_t ca = op_a(code[static_cast<size_t>(pi)]);
-            uint8_t cb = op_b(code[static_cast<size_t>(pi)]);
-            code[static_cast<size_t>(pi)] = encode_abc(OpCode::CALL, ca, cb, 0);
-            last_is_multret_call = true;
-            break;
-          }
-        }
-        fs.freereg = ae.reg + 1;
-        break;
-      }
       int r = exp2reg(fs, ae);
       if (r != dest)
         fs.code_abc(OpCode::MOVE, dest, r, 0);
-      fs.freereg = after_slot;
+      fs.freereg = dest + 1;
     }
     int b_field = (last_is_vararg || last_is_multret_call) ? 0 : (fs.freereg - base);
     fs.code_abc(OpCode::CALL, base, static_cast<uint8_t>(b_field), 2); // 1 result by default
@@ -494,8 +512,11 @@ void expr(FuncState& fs, Expdesc& e, Expr& node) {
     auto& n = static_cast<ExprTable&>(node);
     int r = fs.new_reg();
     fs.code_abc(OpCode::NEWTABLE, r, 0, 0);
+    // Array fields go into registers R[r+1]... then SETLIST (supports trailing multret).
     int arr = 0;
-    for (auto& f : n.fields) {
+    bool arr_multret = false;
+    for (size_t fi = 0; fi < n.fields.size(); ++fi) {
+      auto& f = n.fields[fi];
       if (!f.name.empty()) {
         int k = fs.new_reg();
         fs.code_abx(OpCode::LOADK, k, fs.string_k(f.name));
@@ -503,7 +524,7 @@ void expr(FuncState& fs, Expdesc& e, Expr& node) {
         expr(fs, v, *f.value);
         int rv = exp2reg(fs, v);
         fs.code_abc(OpCode::SETTABLE, r, k, rv);
-        fs.freereg = r + 1;
+        fs.freereg = r + 1 + arr;
       } else if (f.key) {
         Expdesc k, v;
         expr(fs, k, *f.key);
@@ -511,16 +532,45 @@ void expr(FuncState& fs, Expdesc& e, Expr& node) {
         expr(fs, v, *f.value);
         int rv = exp2reg(fs, v);
         fs.code_abc(OpCode::SETTABLE, r, rk, rv);
-        fs.freereg = r + 1;
+        fs.freereg = r + 1 + arr;
       } else {
+        bool last_array = true;
+        for (size_t j = fi + 1; j < n.fields.size(); ++j) {
+          if (n.fields[j].name.empty() && !n.fields[j].key) {
+            last_array = false;
+            break;
+          }
+        }
+        int dest = r + 1 + arr;
+        fs.freereg = dest;
+        if (last_array && f.value->kind == AstKind::ExprVararg) {
+          fs.reserve(1);
+          fs.code_abc(OpCode::VARARG, dest, 0, 0);
+          arr_multret = true;
+          break;
+        }
+        if (last_array && f.value->kind == AstKind::ExprCall) {
+          Expdesc v;
+          expr(fs, v, *f.value);
+          patch_last_call_results(fs, -1);
+          arr_multret = true;
+          break;
+        }
         Expdesc v;
         expr(fs, v, *f.value);
         int rv = exp2reg(fs, v);
+        if (rv != dest)
+          fs.code_abc(OpCode::MOVE, dest, rv, 0);
         ++arr;
-        fs.code_abc(OpCode::SETI, r, static_cast<uint8_t>(arr), rv);
-        fs.freereg = r + 1;
+        fs.freereg = dest + 1;
       }
     }
+    if (arr > 0 || arr_multret) {
+      int b = arr_multret ? 0 : arr;
+      // C=1 => flush block starting at index 1
+      fs.code_abc(OpCode::SETLIST, r, static_cast<uint8_t>(b), 1);
+    }
+    fs.freereg = r + 1;
     e.kind = Expdesc::Nonrelocable;
     e.reg = r;
     break;
@@ -590,22 +640,19 @@ void statement(FuncState& fs, AstNode& node) {
     for (size_t i = 0; i < n.values.size(); ++i) {
       bool is_last = (i + 1 == n.values.size());
       int dest = base + static_cast<int>(i);
-      fs.freereg = std::max(fs.freereg, dest + 1);
-      Expdesc e;
-      expr(fs, e, *n.values[i]);
-      if (is_last && e.kind == Expdesc::Call) {
-        int need = nnames - static_cast<int>(i);
-        auto& code = fs.proto->code;
-        uint8_t ca = 0;
-        for (int pi = static_cast<int>(code.size()) - 1; pi >= 0; --pi) {
-          if (static_cast<OpCode>(op_get(code[static_cast<size_t>(pi)])) == OpCode::CALL) {
-            ca = op_a(code[static_cast<size_t>(pi)]);
-            uint8_t cb = op_b(code[static_cast<size_t>(pi)]);
-            code[static_cast<size_t>(pi)] =
-                encode_abc(OpCode::CALL, ca, cb, static_cast<uint8_t>(need + 1));
-            break;
-          }
-        }
+      int need = nnames - static_cast<int>(i);
+      if (is_last && n.values[i]->kind == AstKind::ExprVararg) {
+        fs.freereg = dest;
+        fs.code_abc(OpCode::VARARG, dest, static_cast<uint8_t>(need + 1), 0);
+        filled = static_cast<int>(i) + need;
+        fs.freereg = base + nnames;
+        break;
+      }
+      if (is_last && n.values[i]->kind == AstKind::ExprCall) {
+        fs.freereg = dest;
+        Expdesc e;
+        expr(fs, e, *n.values[i]);
+        uint8_t ca = patch_last_call_results(fs, need);
         for (int j = 0; j < need; ++j) {
           int from = static_cast<int>(ca) + j;
           int to = dest + j;
@@ -614,12 +661,15 @@ void statement(FuncState& fs, AstNode& node) {
         }
         filled = static_cast<int>(i) + need;
         fs.freereg = base + nnames;
-      } else {
-        int er = exp2reg(fs, e);
-        if (er != dest)
-          fs.code_abc(OpCode::MOVE, dest, er, 0);
-        filled = static_cast<int>(i) + 1;
+        break;
       }
+      fs.freereg = std::max(fs.freereg, dest + 1);
+      Expdesc e;
+      expr(fs, e, *n.values[i]);
+      int er = exp2reg(fs, e);
+      if (er != dest)
+        fs.code_abc(OpCode::MOVE, dest, er, 0);
+      filled = static_cast<int>(i) + 1;
     }
     for (int i = filled; i < nnames; ++i)
       fs.code_abc(OpCode::LOADNIL, base + i, 0, 0);
@@ -643,22 +693,19 @@ void statement(FuncState& fs, AstNode& node) {
     for (size_t i = 0; i < n.values.size(); ++i) {
       bool is_last = (i + 1 == n.values.size());
       int dest = base + static_cast<int>(i);
-      fs.freereg = std::max(fs.freereg, dest + 1);
-      Expdesc e;
-      expr(fs, e, *n.values[i]);
-      if (is_last && e.kind == Expdesc::Call) {
-        int need = nvars - static_cast<int>(i);
-        auto& code = fs.proto->code;
-        uint8_t ca = 0;
-        for (int pi = static_cast<int>(code.size()) - 1; pi >= 0; --pi) {
-          if (static_cast<OpCode>(op_get(code[static_cast<size_t>(pi)])) == OpCode::CALL) {
-            ca = op_a(code[static_cast<size_t>(pi)]);
-            uint8_t cb = op_b(code[static_cast<size_t>(pi)]);
-            code[static_cast<size_t>(pi)] =
-                encode_abc(OpCode::CALL, ca, cb, static_cast<uint8_t>(need + 1));
-            break;
-          }
-        }
+      int need = nvars - static_cast<int>(i);
+      if (is_last && n.values[i]->kind == AstKind::ExprVararg) {
+        fs.freereg = dest;
+        fs.code_abc(OpCode::VARARG, dest, static_cast<uint8_t>(need + 1), 0);
+        filled = static_cast<int>(i) + need;
+        fs.freereg = base + nvars;
+        break;
+      }
+      if (is_last && n.values[i]->kind == AstKind::ExprCall) {
+        fs.freereg = dest;
+        Expdesc e;
+        expr(fs, e, *n.values[i]);
+        uint8_t ca = patch_last_call_results(fs, need);
         for (int j = 0; j < need; ++j) {
           int from = static_cast<int>(ca) + j;
           int to = dest + j;
@@ -667,12 +714,15 @@ void statement(FuncState& fs, AstNode& node) {
         }
         filled = static_cast<int>(i) + need;
         fs.freereg = base + nvars;
-      } else {
-        int er = exp2reg(fs, e);
-        if (er != dest)
-          fs.code_abc(OpCode::MOVE, dest, er, 0);
-        filled = static_cast<int>(i) + 1;
+        break;
       }
+      fs.freereg = std::max(fs.freereg, dest + 1);
+      Expdesc e;
+      expr(fs, e, *n.values[i]);
+      int er = exp2reg(fs, e);
+      if (er != dest)
+        fs.code_abc(OpCode::MOVE, dest, er, 0);
+      filled = static_cast<int>(i) + 1;
     }
     for (int i = filled; i < nvars; ++i)
       fs.code_abc(OpCode::LOADNIL, base + i, 0, 0);
@@ -696,8 +746,25 @@ void statement(FuncState& fs, AstNode& node) {
       fs.code_abc(OpCode::RETURN, 0, 1, 0);
     } else {
       int base = fs.freereg;
+      bool multret = false;
       for (size_t i = 0; i < n.values.size(); ++i) {
         int dest = base + static_cast<int>(i);
+        bool is_last = (i + 1 == n.values.size());
+        if (is_last && n.values[i]->kind == AstKind::ExprVararg) {
+          fs.freereg = dest;
+          fs.reserve(1);
+          fs.code_abc(OpCode::VARARG, dest, 0, 0);
+          multret = true;
+          break;
+        }
+        if (is_last && n.values[i]->kind == AstKind::ExprCall) {
+          fs.freereg = dest;
+          Expdesc e;
+          expr(fs, e, *n.values[i]);
+          patch_last_call_results(fs, -1);
+          multret = true;
+          break;
+        }
         if (fs.freereg <= dest)
           fs.reserve(dest - fs.freereg + 1);
         int hold = fs.freereg;
@@ -708,8 +775,12 @@ void statement(FuncState& fs, AstNode& node) {
           fs.code_abc(OpCode::MOVE, dest, r, 0);
         fs.freereg = std::max(hold, dest + 1);
       }
-      int nret = static_cast<int>(n.values.size());
-      fs.code_abc(OpCode::RETURN, base, nret + 1, 0);
+      if (multret)
+        fs.code_abc(OpCode::RETURN, base, 0, 0);
+      else {
+        int nret = static_cast<int>(n.values.size());
+        fs.code_abc(OpCode::RETURN, base, nret + 1, 0);
+      }
     }
     break;
   }

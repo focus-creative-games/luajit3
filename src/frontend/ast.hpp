@@ -39,6 +39,7 @@ enum class AstKind {
   ExprUn,
   ExprCall,
   ExprMethodCall,
+  ExprParen,
   ExprTable,
   ExprFunction,
 };
@@ -144,6 +145,12 @@ struct ExprCall final : Expr {
   bool is_method = false;
   std::string method;
   ExprCall() { kind = AstKind::ExprCall; }
+};
+// Parentheses truncate multiple results: (f()) keeps only the first value.
+struct ExprParen final : Expr {
+  ExprPtr inner;
+  ExprParen() { kind = AstKind::ExprParen; }
+  explicit ExprParen(ExprPtr e) : inner(std::move(e)) { kind = AstKind::ExprParen; }
 };
 struct ExprTable final : Expr {
   struct Field {

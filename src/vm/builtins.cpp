@@ -56,10 +56,7 @@ static int base_error(State* L) {
 
 static int base_assert(State* L) {
   if (!L->at(1)->is_truthy()) {
-    const char* msg = "assertion failed!";
-    if (L->gettop() >= 2)
-      msg = value_to_string(*L->at(2)).c_str();
-    // copy to stable storage
+    // copy to stable storage (panic may not copy)
     static thread_local std::string hold;
     hold = (L->gettop() >= 2) ? value_to_string(*L->at(2)) : "assertion failed!";
     panic(hold);

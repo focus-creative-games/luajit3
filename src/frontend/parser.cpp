@@ -498,7 +498,7 @@ ExprPtr Parser::parse_primary() {
   if (match(TokenKind::LParen)) {
     auto e = parse_expr();
     expect(TokenKind::RParen, "expected ')'");
-    return e;
+    return std::make_unique<ExprParen>(std::move(e));
   }
   if (check(TokenKind::LBrace))
     return parse_table();
