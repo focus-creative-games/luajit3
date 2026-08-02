@@ -1,0 +1,19 @@
+# clangd for Cursor. Includes match CMake: include/ + src/
+# Database: build-clangd/compile_commands.json (generated; VS build/ has none).
+
+CompileFlags:
+  Add:
+    - -std=c++17
+    - -xc++
+    - -Iinclude
+    - -Isrc
+    - -D_CRT_SECURE_NO_WARNINGS
+
+CompilationDatabase: build-clangd
+
+Index:
+  Background: Build
+
+Diagnostics:
+  UnusedIncludes: None
+  MissingIncludes: None
