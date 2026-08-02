@@ -34,6 +34,8 @@ struct Proto : GcObject {
   std::vector<int> lineinfo;
   std::vector<LocVar> locvars;
   std::string source;
+  int linedefined = 0;
+  int lastlinedefined = 0;
   int maxstack = 0;
   int numparams = 0;
   bool is_vararg = false;

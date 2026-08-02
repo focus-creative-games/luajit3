@@ -26,8 +26,8 @@ int test_lang53_types_coercion() {
   f += expect_int(G, "return 10//-3", -4);
   f += expect_int(G, "return -10//3", -4);
 
-  // String→number arithmetic coercion: not wired yet (PHASE1 GAP) — must error
-  f += expect_error(G, "return '10'+2");
+  // String→number arithmetic coercion (Lua 5.3)
+  f += expect_int(G, "return '10'+2", 12);
   f += expect_error(G, "return 'x'+1");
   f += expect_error(G, "return {}+1");
 

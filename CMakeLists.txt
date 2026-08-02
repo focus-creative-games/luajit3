@@ -31,6 +31,7 @@ set(LJ3_SOURCES
   src/runtime/table.cpp
   src/runtime/closure.cpp
   src/runtime/upvalue.cpp
+  src/runtime/userdata.cpp
   src/gc/gc.cpp
   src/frontend/lexer.cpp
   src/frontend/parser.cpp
@@ -40,6 +41,18 @@ set(LJ3_SOURCES
   src/vm/interpreter.cpp
   src/vm/state.cpp
   src/vm/builtins.cpp
+  src/lib/linit.cpp
+  src/lib/lbaselib.cpp
+  src/lib/lcorolib.cpp
+  src/lib/lpackagelib.cpp
+  src/lib/lstrlib.cpp
+  src/lib/ltablib.cpp
+  src/lib/lmathlib.cpp
+  src/lib/lutf8lib.cpp
+  src/lib/liolib.cpp
+  src/lib/loslib.cpp
+  src/lib/ldblib.cpp
+  src/lib/ldump.cpp
   src/vm/meta.cpp
   src/api/lua_api.cpp
   src/jit/hotness.cpp

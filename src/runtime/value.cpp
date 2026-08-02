@@ -3,8 +3,37 @@
 #include "runtime/string.hpp"
 
 #include <sstream>
+#include <string>
 
 namespace lj3 {
+
+bool try_to_number(const TValue& v, TValue* out) {
+  if (v.is_number()) {
+    *out = v;
+    return true;
+  }
+  if (!v.is_string())
+    return false;
+  try {
+    std::string s(v.as_string()->view());
+    size_t idx = 0;
+    if (s.find('.') == std::string::npos && s.find('e') == std::string::npos &&
+        s.find('E') == std::string::npos) {
+      long long n = std::stoll(s, &idx, 0);
+      if (idx == s.size()) {
+        *out = TValue::integer(static_cast<int64_t>(n));
+        return true;
+      }
+    }
+    double d = std::stod(s, &idx);
+    if (idx == s.size()) {
+      *out = TValue::number(d);
+      return true;
+    }
+  } catch (...) {
+  }
+  return false;
+}
 
 bool values_equal(const TValue& a, const TValue& b) {
   if (a.tag() != b.tag()) {

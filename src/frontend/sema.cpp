@@ -1,11 +1,46 @@
 #include "frontend/sema.hpp"
 
+#include <set>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
 namespace lj3 {
 
 namespace {
 
+struct LocalScope {
+  std::string name;
+};
+
 struct Ctx {
   int loop_depth = 0;
+  std::vector<LocalScope> locals;
+  std::unordered_map<std::string, std::set<std::string>> labels;
+  struct PendingGoto {
+    std::string label;
+    std::set<std::string> visible;
+  };
+  std::vector<PendingGoto> gotos;
+
+  std::set<std::string> visible_locals() const {
+    std::set<std::string> s;
+    for (auto& l : locals)
+      s.insert(l.name);
+    return s;
+  }
+
+  void check_gotos() {
+    for (auto& g : gotos) {
+      auto it = labels.find(g.label);
+      if (it == labels.end())
+        panic("no visible label '" + g.label + "' for goto");
+      for (auto& name : it->second) {
+        if (!g.visible.count(name))
+          panic("goto jumps into the scope of local '" + name + "'");
+      }
+    }
+  }
 };
 
 void walk_block(Block& b, Ctx& ctx);
@@ -58,7 +93,10 @@ void walk_expr(Expr& e, Ctx& ctx) {
   case AstKind::ExprFunction: {
     auto& n = static_cast<ExprFunction&>(e);
     Ctx nested;
+    for (auto& p : n.params)
+      nested.locals.push_back({p});
     walk_block(*n.body, nested);
+    nested.check_gotos();
     break;
   }
   default:
@@ -72,6 +110,18 @@ void walk_stmt(AstNode& s, Ctx& ctx) {
     if (ctx.loop_depth <= 0)
       panic("break outside loop");
     break;
+  case AstKind::Goto: {
+    auto& n = static_cast<GotoStmt&>(s);
+    ctx.gotos.push_back({n.label, ctx.visible_locals()});
+    break;
+  }
+  case AstKind::Label: {
+    auto& n = static_cast<LabelStmt&>(s);
+    if (ctx.labels.count(n.name))
+      panic("label '" + n.name + "' already defined");
+    ctx.labels[n.name] = ctx.visible_locals();
+    break;
+  }
   case AstKind::While: {
     auto& n = static_cast<WhileStmt&>(s);
     walk_expr(*n.cond, ctx);
@@ -83,9 +133,12 @@ void walk_stmt(AstNode& s, Ctx& ctx) {
   case AstKind::Repeat: {
     auto& n = static_cast<RepeatStmt&>(s);
     ctx.loop_depth++;
-    walk_block(*n.body, ctx);
-    ctx.loop_depth--;
+    size_t before = ctx.locals.size();
+    for (auto& st : n.body->stmts)
+      walk_stmt(*st, ctx);
     walk_expr(*n.cond, ctx);
+    ctx.locals.resize(before);
+    ctx.loop_depth--;
     break;
   }
   case AstKind::ForNum: {
@@ -95,7 +148,10 @@ void walk_stmt(AstNode& s, Ctx& ctx) {
     if (n.step)
       walk_expr(*n.step, ctx);
     ctx.loop_depth++;
+    size_t before = ctx.locals.size();
+    ctx.locals.push_back({n.name});
     walk_block(*n.body, ctx);
+    ctx.locals.resize(before);
     ctx.loop_depth--;
     break;
   }
@@ -104,7 +160,11 @@ void walk_stmt(AstNode& s, Ctx& ctx) {
     for (auto& i : n.iters)
       walk_expr(*i, ctx);
     ctx.loop_depth++;
+    size_t before = ctx.locals.size();
+    for (auto& name : n.names)
+      ctx.locals.push_back({name});
     walk_block(*n.body, ctx);
+    ctx.locals.resize(before);
     ctx.loop_depth--;
     break;
   }
@@ -122,6 +182,8 @@ void walk_stmt(AstNode& s, Ctx& ctx) {
     auto& n = static_cast<LocalDecl&>(s);
     for (auto& v : n.values)
       walk_expr(*v, ctx);
+    for (auto& name : n.names)
+      ctx.locals.push_back({name});
     break;
   }
   case AstKind::Assign: {
@@ -145,14 +207,22 @@ void walk_stmt(AstNode& s, Ctx& ctx) {
   }
   case AstKind::LocalFunction: {
     auto& n = static_cast<LocalFunction&>(s);
+    ctx.locals.push_back({n.name});
     Ctx nested;
     walk_block(*n.fn->body, nested);
+    nested.check_gotos();
     break;
   }
   case AstKind::FunctionDecl: {
     auto& n = static_cast<FunctionDecl&>(s);
     Ctx nested;
     walk_block(*n.fn->body, nested);
+    nested.check_gotos();
+    break;
+  }
+  case AstKind::DoBlock: {
+    auto& n = static_cast<DoBlock&>(s);
+    walk_block(*n.body, ctx);
     break;
   }
   default:
@@ -161,8 +231,10 @@ void walk_stmt(AstNode& s, Ctx& ctx) {
 }
 
 void walk_block(Block& b, Ctx& ctx) {
+  size_t before = ctx.locals.size();
   for (auto& s : b.stmts)
     walk_stmt(*s, ctx);
+  ctx.locals.resize(before);
 }
 
 } // namespace
@@ -170,6 +242,7 @@ void walk_block(Block& b, Ctx& ctx) {
 void sema_analyze(Chunk& chunk) {
   Ctx ctx;
   walk_block(*chunk.body, ctx);
+  ctx.check_gotos();
 }
 
 } // namespace lj3

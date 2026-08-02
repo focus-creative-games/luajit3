@@ -1,5 +1,6 @@
 #include "tools/dump.hpp"
 
+#include "runtime/value.hpp"
 #include "vm/bytecode.hpp"
 
 #include <iostream>
@@ -11,6 +12,12 @@ std::string dump_proto(const Proto* p) {
   std::ostringstream os;
   os << ".proto source=" << p->source << " maxstack=" << p->maxstack
      << " params=" << p->numparams << "\n";
+  for (size_t i = 0; i < p->upvalues.size(); ++i)
+    os << "  upvalue[" << i << "] " << p->upvalues[i].name
+       << " instack=" << p->upvalues[i].instack << " idx=" << static_cast<int>(p->upvalues[i].idx)
+       << "\n";
+  for (size_t i = 0; i < p->constants.size(); ++i)
+    os << "  k[" << i << "] " << value_to_string(p->constants[i]) << "\n";
   for (size_t i = 0; i < p->code.size(); ++i)
     os << "  [" << i << "] " << disassemble_ins(p->code[i]) << "\n";
   for (auto* ch : p->protos)

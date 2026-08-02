@@ -1,6 +1,7 @@
 #include "frontend/lexer.hpp"
 
 #include <cctype>
+#include <string>
 #include <unordered_map>
 
 namespace lj3 {
@@ -16,7 +17,18 @@ const char* token_name(TokenKind k) {
   }
 }
 
-Lexer::Lexer(std::string_view src, std::string name) : src_(src), name_(std::move(name)) {}
+Lexer::Lexer(std::string_view src, std::string name) : src_(src), name_(std::move(name)) {
+  // Skip first-line # comment (shebang #!../lua or # testing... per Lua 5.3).
+  if (!src_.empty() && src_[0] == '#') {
+    while (pos_ < src_.size() && src_[pos_] != '\n')
+      ++pos_;
+    if (pos_ < src_.size() && src_[pos_] == '\n') {
+      ++pos_;
+      line_ = 2;
+      col_ = 1;
+    }
+  }
+}
 
 Token Lexer::next() {
   if (has_peek_) {
@@ -180,6 +192,55 @@ Token Lexer::lex_string(char quote) {
       case '\'': out.push_back('\''); break;
       case '"': out.push_back('"'); break;
       case '\n': out.push_back('\n'); break;
+      case 'x': {
+        char hi = get();
+        char lo = get();
+        if (!std::isxdigit(static_cast<unsigned char>(hi)) ||
+            !std::isxdigit(static_cast<unsigned char>(lo)))
+          panic("hex escape too short");
+        auto hex = [](char c) -> int {
+          if (std::isdigit(static_cast<unsigned char>(c)))
+            return c - '0';
+          if (c >= 'a' && c <= 'f')
+            return c - 'a' + 10;
+          return c - 'A' + 10;
+        };
+        out.push_back(static_cast<char>((hex(hi) << 4) | hex(lo)));
+        break;
+      }
+      case 'u': {
+        if (!match('{'))
+          panic("missing '{' after '\\u'");
+        std::string hex;
+        while (std::isxdigit(static_cast<unsigned char>(peek_char())))
+          hex.push_back(get());
+        if (!match('}') || hex.empty())
+          panic("missing '}' after '\\u{'");
+        unsigned long cp = std::stoul(hex, nullptr, 16);
+        if (cp <= 0x7F)
+          out.push_back(static_cast<char>(cp));
+        else if (cp <= 0x7FF) {
+          out.push_back(static_cast<char>(0xC0 | ((cp >> 6) & 0x1F)));
+          out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else if (cp <= 0xFFFF) {
+          out.push_back(static_cast<char>(0xE0 | ((cp >> 12) & 0x0F)));
+          out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+          out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else if (cp <= 0x10FFFF) {
+          out.push_back(static_cast<char>(0xF0 | ((cp >> 18) & 0x07)));
+          out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+          out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+          out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else {
+          panic("UTF-8 value out of range");
+        }
+        break;
+      }
+      case 'z':
+        while (peek_char() == ' ' || peek_char() == '\t' || peek_char() == '\r' ||
+               peek_char() == '\n' || peek_char() == '\f' || peek_char() == '\v')
+          get();
+        break;
       default: out.push_back(e); break;
       }
     } else {

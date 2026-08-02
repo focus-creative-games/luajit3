@@ -12,7 +12,7 @@ Status legend: **Done** | **GAP** (documented latitude / out of Phase-1 scope) |
 |-------------|--------|
 | `type()` for nil/boolean/number/string/table/function/thread | Done |
 | int vs float still `type` number; arithmetic int/float paths | Done |
-| string↔number coercion in arith (not wired → error); invalid coercion errors | Done |
+| string↔number coercion in arith/comparisons; invalid coercion errors | Done |
 | NaN inequality; inf observable via compare | Done |
 | `//` toward -∞ boundaries | Done |
 
@@ -34,7 +34,7 @@ Status legend: **Done** | **GAP** (documented latitude / out of Phase-1 scope) |
 | `do`/`local` block scope | Done |
 | Assignment adjustment (pad/drop); table field multi-assign | Done |
 | if / while / repeat | Done |
-| repeat-until visibility of body locals | GAP |
+| repeat-until visibility of body locals | Done |
 | Numeric for +/− step, empty range, break | Done |
 | Generic for ipairs/pairs/custom; multi vars | Done |
 | Call-as-statement discards results | Done |
@@ -63,7 +63,7 @@ Status legend: **Done** | **GAP** (documented latitude / out of Phase-1 scope) |
 |-------------|--------|
 | Forward/backward goto | Done |
 | Duplicate label error | Done |
-| Jump into local scope rejected by sema | GAP |
+| Jump into local scope rejected by sema | Done |
 | Closure capture after local declaration | Done |
 
 ## G. Metatables (§2.4) — `test_tables_meta.cpp`
@@ -74,7 +74,7 @@ Status legend: **Done** | **GAP** (documented latitude / out of Phase-1 scope) |
 | Arith / `__len` / `__concat` / cmp / `__call` | Done |
 | `__metatable` protect; raw* bypass | Done |
 | Registry metatables for non-table types | GAP |
-| Weak tables / `__gc` | GAP |
+| Weak tables / `__gc` | Done |
 
 ## H. Errors (§2.3) — `test_errors_coro.cpp`
 
@@ -109,7 +109,7 @@ Status legend: **Done** | **GAP** (documented latitude / out of Phase-1 scope) |
 |------|--------|
 | Full `math`/`string`/`table`/`io`/`os`/`utf8`/`package` | OUT |
 | Debug library / hooks | OUT |
-| String escapes `\x` / `\u{}` / `\z` | GAP |
+| String escapes `\x` / `\u{}` / `\z` | Done |
 | To-be-closed variables (5.4+) | OUT |
 | Official PUC-Rio test suite submodule | OUT (see test-plan.md) |
 

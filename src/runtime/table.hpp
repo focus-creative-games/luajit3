@@ -20,6 +20,11 @@ struct Table : GcObject {
   Table* metatable = nullptr;
   uint32_t structure_version = 1;
   uint32_t opt_flags = 0;
+  uint8_t weak_mode = 0; // bit0 weak keys, bit1 weak values
+
+  void update_weak_mode(State* L);
+  // mask: bit0 clear weak keys, bit1 clear weak values (same as weak_mode bits).
+  void clear_weak_entries(uint8_t white, uint8_t mask = 3);
 
   TValue get(const TValue& key) const;
   void set(State* L, const TValue& key, const TValue& value);

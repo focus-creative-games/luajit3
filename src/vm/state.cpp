@@ -3,7 +3,7 @@
 #include "frontend/lowering.hpp"
 #include "frontend/parser.hpp"
 #include "frontend/sema.hpp"
-#include "vm/builtins.hpp"
+#include "lib/libs.hpp"
 #include "vm/interpreter.hpp"
 
 #include <cstdlib>
@@ -37,7 +37,7 @@ State::State() : gc(this) {
   // _G
   globals->set(this, TValue::obj(ValueTag::String, intern("_G")),
                TValue::obj(ValueTag::Table, globals));
-  open_base(this);
+  open_libs(this);
   const char* deopt = std::getenv("LJ3_STRESS_FORCE_DEOPT");
   force_deopt = deopt && deopt[0] == '1';
   const char* ic = std::getenv("LJ3_STRESS_DISABLE_IC");
@@ -55,17 +55,28 @@ void State::ensure_stack(int n) {
     current->stack.resize(static_cast<size_t>(n) + 64, TValue::nil());
 }
 
-int State::gettop() const { return current->top; }
+int State::gettop() const { return current->top - current->stack_base; }
+
+void State::set_abs_top(int abs_idx) {
+  if (abs_idx < 0)
+    abs_idx = 0;
+  ensure_stack(abs_idx);
+  if (abs_idx > current->top) {
+    for (int i = current->top; i < abs_idx; ++i)
+      current->stack[static_cast<size_t>(i)] = TValue::nil();
+  } else if (abs_idx < current->top) {
+    for (int i = abs_idx; i < current->top; ++i)
+      current->stack[static_cast<size_t>(i)] = TValue::nil();
+  }
+  current->top = abs_idx;
+}
 
 void State::settop(int idx) {
   if (idx < 0)
-    idx = current->top + idx + 1;
-  ensure_stack(idx);
-  if (idx < current->top) {
-    for (int i = idx; i < current->top; ++i)
-      current->stack[static_cast<size_t>(i)] = TValue::nil();
-  }
-  current->top = idx;
+    idx = gettop() + idx + 1;
+  if (idx < 0)
+    idx = 0;
+  set_abs_top(current->stack_base + idx);
 }
 
 void State::push(const TValue& v) {
@@ -74,27 +85,31 @@ void State::push(const TValue& v) {
 }
 
 TValue State::pop() {
-  if (current->top <= 0)
+  if (current->top <= current->stack_base)
     return TValue::nil();
   return current->stack[static_cast<size_t>(--current->top)];
 }
 
 TValue& State::top_ref() {
-  ensure_stack(1);
+  ensure_stack(current->stack_base + 1);
+  if (current->top <= current->stack_base)
+    panic("top_ref on empty stack");
   return current->stack[static_cast<size_t>(current->top - 1)];
 }
 
 int State::absindex(int idx) const {
-  if (idx >= 0)
+  if (idx > 0)
     return idx;
-  return current->top + idx + 1;
+  if (idx == 0)
+    return 0;
+  return gettop() + idx + 1;
 }
 
 TValue* State::at(int idx) {
   idx = absindex(idx);
-  if (idx <= 0 || idx > current->top)
+  if (idx <= 0 || idx > gettop())
     panic("invalid stack index");
-  return &current->stack[static_cast<size_t>(idx - 1)];
+  return &current->stack[static_cast<size_t>(current->stack_base + idx - 1)];
 }
 
 void State::close_upvals(Thread* th, int level) {

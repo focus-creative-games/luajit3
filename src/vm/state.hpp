@@ -40,7 +40,9 @@ struct Thread : GcObject {
   std::vector<TValue> stack;
   std::vector<CallFrame> frames;
   UpVal* open_upvals = nullptr;
-  int top = 0; // stack top (absolute count of used slots) — per-thread
+  int top = 0; // absolute index one past last used slot
+  // C-call window: Lua API indices are relative to stack_base (at(1) == stack[stack_base]).
+  int stack_base = 0;
   enum class Status { Fresh, Running, Suspended, Dead, Error } status = Status::Fresh;
   std::string error;
   // After yield: values returned to resume; resume args fill CALL at yield_func_idx.
@@ -77,6 +79,9 @@ struct State {
   TValue& top_ref();
   int gettop() const;
   void settop(int idx);
+  // Absolute stack top (ignores C-call stack_base). For the interpreter / VM.
+  int abs_top() const { return current->top; }
+  void set_abs_top(int abs_idx);
 
   LjString* intern(std::string_view s);
   void close_upvals(Thread* th, int level);

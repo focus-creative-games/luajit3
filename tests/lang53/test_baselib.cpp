@@ -25,8 +25,8 @@ int test_lang53_baselib() {
                   "local t={a=1,b=2}; local n=0; for k,v in pairs(t) do n=n+1 end; return n",
                   2);
 
-  // math lib not required
-  f += expect_int(G, "return math and 0 or 1", 1);
+  // math library is part of full 5.3 stdlib
+  f += expect_int(G, "return type(math)=='table' and math.floor(3.7) or 0", 3);
 
   return f ? 1 : 0;
 }

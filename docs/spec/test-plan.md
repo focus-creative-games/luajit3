@@ -1,7 +1,7 @@
 # Test and Validation Plan
 
-**Status:** Phase 0 freeze  
-**Related:** [PROPOSAL.md](../../PROPOSAL.md) §26
+**Status:** Phase 1 active — full Lua 5.3 + official suite  
+**Related:** [PROPOSAL.md](../../PROPOSAL.md) §26, [puc53-status.md](puc53-status.md)
 
 ## Layers
 
@@ -13,11 +13,15 @@
 - LBC encoder/verifier
 - table insert/get/rehash
 - GC mark/sweep stress on synthetic graphs
+- `tests/lang53/*` language oracles
 
-### B. Conformance
+### B. Conformance (Phase 1 hard gate)
 
-- Vendor or submodule official Lua test suites (5.3.x first)
-- Track pass rate in CI; Phase 1 gate = broad pass without JIT
+- Vendor: `tests/lua-5.3.4-tests/` (sha256 `b80771238271c72565e5a1183292ef31bd7166414cd0d43a8eb79845fa7f599f`)
+- **Gate:** `luajit3 -e"_U=true" all.lua` prints `final OK`
+- Track per-file pass rate in [puc53-status.md](puc53-status.md)
+- Scripts: `scripts/run_puc_tests.sh`, `scripts/run_puc_tests.ps1`
+- After basic gate: chase complete suite (no `_U`) with `package.loadlib` + suite `libs/`
 
 ### C. Differential testing
 
@@ -30,7 +34,7 @@ Run the same chunk under:
 
 Compare stdout, exit status, error messages (normalized), and selected debug traces.
 
-Harness: `tests/differential/` + CMake `ctest` fixture.
+Harness: expand beyond `tests/test_differential.cpp` oracles as needed.
 
 ### D. Fuzzing
 
@@ -67,3 +71,4 @@ Performance never gates Phase 1. Phase 2+ require no semantic regressions vs int
 - Linux x86-64 (gcc or clang)
 - Debug + Release
 - ASan/UBSan on Linux Debug when available
+- Official basic suite (`_U=true`) once the interpreter can host `all.lua`

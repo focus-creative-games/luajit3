@@ -1,8 +1,73 @@
 #include "runtime/table.hpp"
 
+#include "runtime/string.hpp"
 #include "vm/state.hpp"
 
+#include <cmath>
+#include <cstdint>
+
 namespace lj3 {
+
+static bool is_gc_key(const TValue& k) {
+  switch (k.tag()) {
+  case ValueTag::String:
+  case ValueTag::Table:
+  case ValueTag::Function:
+  case ValueTag::Userdata:
+  case ValueTag::Thread:
+    return true;
+  default:
+    return false;
+  }
+}
+
+void Table::update_weak_mode(State* L) {
+  weak_mode = 0;
+  if (!metatable)
+    return;
+  TValue mode = metatable->get(TValue::obj(ValueTag::String, L->intern("__mode")));
+  if (!mode.is_string())
+    return;
+  std::string_view s = mode.as_string()->view();
+  if (s.find('k') != std::string_view::npos)
+    weak_mode |= 1;
+  if (s.find('v') != std::string_view::npos)
+    weak_mode |= 2;
+}
+
+void Table::clear_weak_entries(uint8_t white, uint8_t mask) {
+  uint8_t mode = static_cast<uint8_t>(weak_mode & mask);
+  if (!mode)
+    return;
+  auto dead = [&](const TValue& v) {
+    if (!is_gc_key(v))
+      return false;
+    GcObject* o = v.as_gc();
+    // Objects already separated for finalization keep their mark as the
+    // "other" color; treat them as alive for weak-key retention.
+    return o && o->mark == white;
+  };
+  if (mode & 2) {
+    for (auto& v : array) {
+      if (dead(v))
+        v = TValue::nil();
+    }
+  }
+  for (auto& n : hash) {
+    if (!n.used)
+      continue;
+    if ((mode & 1) && dead(n.key)) {
+      // Tombstone: keep `used` so open-addressing probe chains stay intact.
+      // (Hard-clearing used broke s[obj] lookups in gc.lua after a prior
+      // cycle left finalized keys in a weak-key table.)
+      n.key = TValue::nil();
+      n.value = TValue::nil();
+      continue;
+    }
+    if ((mode & 2) && dead(n.value))
+      n.value = TValue::nil();
+  }
+}
 
 static size_t hash_key(const TValue& k, size_t mod) {
   if (mod == 0)
@@ -31,21 +96,38 @@ TValue Table::get_int(int64_t i) const {
   return get(TValue::integer(i));
 }
 
-TValue Table::get(const TValue& key) const {
+static bool key_as_array_index(const TValue& key, int64_t* out) {
   if (key.is_int()) {
-    int64_t i = key.as_int();
+    *out = key.as_int();
+    return true;
+  }
+  if (key.is_float()) {
+    double d = key.as_float();
+    if (d >= 1.0 && d == std::floor(d) && d <= static_cast<double>(INT64_MAX)) {
+      *out = static_cast<int64_t>(d);
+      return true;
+    }
+  }
+  return false;
+}
+
+TValue Table::get(const TValue& key) const {
+  TValue lookup = key;
+  int64_t i = 0;
+  if (key_as_array_index(key, &i)) {
+    lookup = TValue::integer(i);
     if (i >= 1 && static_cast<size_t>(i) <= array.size())
       return array[static_cast<size_t>(i - 1)];
   }
   if (hash.empty())
     return TValue::nil();
-  size_t idx = hash_key(key, hash.size());
+  size_t idx = hash_key(lookup, hash.size());
   for (size_t probe = 0; probe < hash.size(); ++probe) {
-    size_t i = (idx + probe) % hash.size();
-    if (!hash[i].used)
+    size_t slot = (idx + probe) % hash.size();
+    if (!hash[slot].used)
       return TValue::nil();
-    if (values_equal(hash[i].key, key))
-      return hash[i].value;
+    if (values_equal(hash[slot].key, lookup))
+      return hash[slot].value; // may be nil (tombstone / deleted)
   }
   return TValue::nil();
 }
@@ -91,8 +173,16 @@ void Table::set_int(State* L, int64_t i, const TValue& value) {
 void Table::set(State* L, const TValue& key, const TValue& value) {
   if (key.is_nil())
     panic("table index is nil");
-  if (key.is_int()) {
-    int64_t i = key.as_int();
+  TValue lookup = key;
+  int64_t i = 0;
+  if (key_as_array_index(key, &i)) {
+    // Prefer the array part for integer keys (including integer-valued floats
+    // from numeric for), growing it via set_int when needed.
+    if (i >= 1 && i <= 64) {
+      set_int(L, i, value);
+      return;
+    }
+    lookup = TValue::integer(i);
     if (i >= 1 && static_cast<size_t>(i) <= array.size()) {
       array[static_cast<size_t>(i - 1)] = value;
       L->gc.barrier(this, value);
@@ -102,38 +192,49 @@ void Table::set(State* L, const TValue& key, const TValue& value) {
   if (hash.empty())
     hash.resize(8);
 
-  size_t idx = hash_key(key, hash.size());
-  size_t first_free = static_cast<size_t>(-1);
+  size_t idx = hash_key(lookup, hash.size());
+  size_t first_tomb = static_cast<size_t>(-1);
   for (size_t probe = 0; probe < hash.size(); ++probe) {
-    size_t i = (idx + probe) % hash.size();
-    if (!hash[i].used) {
+    size_t slot = (idx + probe) % hash.size();
+    if (!hash[slot].used) {
       if (value.is_nil())
         return;
-      first_free = i;
-      break;
-    }
-    if (values_equal(hash[i].key, key)) {
-      hash[i].value = value;
-      if (value.is_nil())
-        hash[i].used = false;
+      size_t dest = (first_tomb != static_cast<size_t>(-1)) ? first_tomb : slot;
+      hash[dest].used = true;
+      hash[dest].key = lookup;
+      hash[dest].value = value;
+      hash[dest].next = nullptr;
+      structure_version++;
+      L->gc.barrier(this, lookup);
       L->gc.barrier(this, value);
       return;
     }
+    if (values_equal(hash[slot].key, lookup)) {
+      // Keep the slot occupied when assigning nil so open-addressing probe
+      // chains remain intact (tombstone). next()/get ignore nil values.
+      hash[slot].value = value;
+      if (!value.is_nil())
+        L->gc.barrier(this, value);
+      return;
+    }
+    // Reuse deleted (nil-valued) slots for new keys after the probe finishes.
+    if (first_tomb == static_cast<size_t>(-1) && hash[slot].value.is_nil())
+      first_tomb = slot;
   }
   if (value.is_nil())
     return;
-  if (first_free == static_cast<size_t>(-1)) {
-    rehash(L, array.size(), hash.size() * 2);
-    set(L, key, value);
+  if (first_tomb != static_cast<size_t>(-1)) {
+    hash[first_tomb].used = true;
+    hash[first_tomb].key = lookup;
+    hash[first_tomb].value = value;
+    hash[first_tomb].next = nullptr;
+    structure_version++;
+    L->gc.barrier(this, lookup);
+    L->gc.barrier(this, value);
     return;
   }
-  hash[first_free].used = true;
-  hash[first_free].key = key;
-  hash[first_free].value = value;
-  hash[first_free].next = nullptr;
-  structure_version++;
-  L->gc.barrier(this, key);
-  L->gc.barrier(this, value);
+  rehash(L, array.size(), hash.size() * 2);
+  set(L, key, value);
 }
 
 } // namespace lj3

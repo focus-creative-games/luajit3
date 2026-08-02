@@ -23,8 +23,9 @@ int test_lang53_statements() {
   f += expect_int(G, "if true then return 7 end", 7);
   f += expect_int(G, "local x=0; while x<5 do x=x+1 end; return x", 5);
   f += expect_int(G, "local x=0; repeat x=x+1 until x==4; return x", 4);
-  // Note: Lua 5.3 until-scope sees repeat locals; our lowering scopes them inside
-  // the body only — covered as GAP in test-coverage-lang53.md (avoid hang).
+  f += expect_int(G,
+                  "local x; repeat local y=1; x=y until x; return x",
+                  1);
 
   // Numeric for
   f += expect_int(G, "local s=0; for i=1,10 do s=s+i end; return s", 55);

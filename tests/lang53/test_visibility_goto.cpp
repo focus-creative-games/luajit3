@@ -12,6 +12,7 @@ int test_lang53_visibility_goto() {
                   3);
   // Jump into scope of a local: Lua 5.3 forbids this; if sema is lax, still must not hang.
   f += expect_int(G, "goto L; ::L:: return 1", 1);
+  f += expect_error(G, "goto L; local a=1; ::L:: return a");
   f += expect_error(G, "::L:: ::L:: return 1");
 
   // Closure visibility: capture after assignment visible

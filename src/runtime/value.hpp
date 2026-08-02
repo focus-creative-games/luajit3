@@ -28,6 +28,7 @@ struct Closure;
 struct UpVal;
 struct Proto;
 struct Thread;
+struct Userdata;
 
 struct TValue {
   uint64_t payload = 0;
@@ -43,6 +44,8 @@ struct TValue {
   bool is_string() const { return tag() == ValueTag::String; }
   bool is_table() const { return tag() == ValueTag::Table; }
   bool is_function() const { return tag() == ValueTag::Function; }
+  bool is_userdata() const { return tag() == ValueTag::Userdata; }
+  bool is_thread() const { return tag() == ValueTag::Thread; }
   bool is_truthy() const { return !(is_nil() || (is_bool() && payload == 0)); }
 
   static TValue nil() { return {}; }
@@ -93,9 +96,13 @@ struct TValue {
   Table* as_table() const { return reinterpret_cast<Table*>(payload); }
   Closure* as_closure() const { return reinterpret_cast<Closure*>(payload); }
   Thread* as_thread() const { return reinterpret_cast<Thread*>(payload); }
+  Userdata* as_userdata() const { return reinterpret_cast<Userdata*>(payload); }
 };
 
 bool values_equal(const TValue& a, const TValue& b);
 std::string value_to_string(const TValue& v);
+
+// Parse strings the same way as tonumber; returns false for non-number strings.
+bool try_to_number(const TValue& v, TValue* out);
 
 } // namespace lj3

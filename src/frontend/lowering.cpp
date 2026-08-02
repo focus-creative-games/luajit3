@@ -15,6 +15,7 @@ struct Local {
   int reg = 0;
   int startpc = 0;
   bool active = true;
+  bool captured = false;
 };
 
 struct FuncState {
@@ -25,26 +26,30 @@ struct FuncState {
   int nactvar = 0;
   int freereg = 0;
   int maxstack = 0;
+  int reg_hwm = 0; // high-water mark; never reuse regs below this after captures
   std::vector<int> break_list;
   std::unordered_map<std::string, int> labels;      // name -> pc
   std::vector<std::pair<std::string, int>> pending_gotos; // name, jmp_pc
   bool vararg = false;
+  int lastline = 1;
 
   int pc() const { return static_cast<int>(proto->code.size()); }
-  void emit(Instruction i, int line = 1) {
+  void emit(Instruction i, int line = -1) {
+    if (line < 0)
+      line = lastline;
     proto->code.push_back(i);
     proto->lineinfo.push_back(line);
   }
-  int code_abc(OpCode op, int a, int b, int c, int line = 1) {
+  int code_abc(OpCode op, int a, int b, int c, int line = -1) {
     emit(encode_abc(op, static_cast<uint8_t>(a), static_cast<uint8_t>(b), static_cast<uint8_t>(c)),
          line);
     return pc() - 1;
   }
-  int code_abx(OpCode op, int a, int bx, int line = 1) {
+  int code_abx(OpCode op, int a, int bx, int line = -1) {
     emit(encode_abx(op, static_cast<uint8_t>(a), static_cast<uint16_t>(bx)), line);
     return pc() - 1;
   }
-  int code_asbx(OpCode op, int a, int sbx, int line = 1) {
+  int code_asbx(OpCode op, int a, int sbx, int line = -1) {
     emit(encode_asbx(op, static_cast<uint8_t>(a), sbx), line);
     return pc() - 1;
   }
@@ -55,6 +60,7 @@ struct FuncState {
   }
   void reserve(int n) {
     freereg += n;
+    reg_hwm = std::max(reg_hwm, freereg);
     maxstack = std::max(maxstack, freereg);
   }
   int new_reg() {
@@ -83,13 +89,29 @@ struct FuncState {
     loc.reg = reg;
     loc.startpc = pc();
     locals.push_back(loc);
-    nactvar = freereg;
+    nactvar = std::max(nactvar, reg + 1);
+    freereg = std::max(freereg, nactvar);
     (void)line;
     return static_cast<int>(locals.size() - 1);
   }
   void leave_block(int nlocals_before) {
+    int close_level = -1;
+    int nil_from = -1;
+    int nil_to = -1;
     while (static_cast<int>(locals.size()) > nlocals_before) {
       auto& loc = locals.back();
+      if (loc.captured) {
+        // Close from the lowest captured register upward (Lua: close >= level).
+        if (close_level < 0 || loc.reg < close_level)
+          close_level = loc.reg;
+      } else {
+        // Clear non-captured locals so they do not keep objects alive after the
+        // scope ends (needed for weak-table / __gc tests).
+        if (nil_from < 0 || loc.reg < nil_from)
+          nil_from = loc.reg;
+        if (nil_to < 0 || loc.reg > nil_to)
+          nil_to = loc.reg;
+      }
       LocVar lv;
       lv.name = loc.name;
       lv.startpc = loc.startpc;
@@ -97,11 +119,26 @@ struct FuncState {
       proto->locvars.push_back(lv);
       locals.pop_back();
     }
+    if (nil_from >= 0 && close_level < 0) {
+      // Clear through the high-water mark of temporaries used in this block.
+      // freereg may already have been rewound to nactvar, leaving dirty temps.
+      int clear_to = std::max(nil_to, reg_hwm - 1);
+      if (clear_to >= nil_from)
+        code_abc(OpCode::LOADNIL, nil_from, clear_to - nil_from, 0);
+    }
     nactvar = 0;
     for (auto& l : locals)
       if (l.active)
         nactvar = std::max(nactvar, l.reg + 1);
-    freereg = nactvar;
+    // Never reuse register slots for the rest of this function once any
+    // captured local has lived there (closed upvalues must not alias new locals).
+    if (close_level >= 0) {
+      code_asbx(OpCode::JMP, close_level + 1, 0);
+      freereg = std::max(reg_hwm, nactvar);
+    } else {
+      freereg = nactvar;
+    }
+    reg_hwm = std::max(reg_hwm, freereg);
   }
   int find_local(const std::string& name) {
     for (int i = static_cast<int>(locals.size()) - 1; i >= 0; --i)
@@ -143,10 +180,20 @@ uint8_t patch_last_call_results(FuncState& fs, int nresults) {
   return 0;
 }
 
+void mark_local_captured(FuncState& fs, int reg) {
+  for (auto& l : fs.locals)
+    if (l.active && l.reg == reg)
+      l.captured = true;
+}
+
 int add_upval(FuncState& fs, const std::string& name, bool instack, int idx) {
-  for (size_t i = 0; i < fs.proto->upvalues.size(); ++i)
-    if (fs.proto->upvalues[i].name == name)
+  for (size_t i = 0; i < fs.proto->upvalues.size(); ++i) {
+    auto& u = fs.proto->upvalues[i];
+    if (u.instack == instack && u.idx == static_cast<uint8_t>(idx))
       return static_cast<int>(i);
+  }
+  if (instack && fs.prev)
+    mark_local_captured(*fs.prev, idx);
   UpvalDesc u;
   u.name = name;
   u.instack = instack;
@@ -161,6 +208,14 @@ int search_var(FuncState& fs, const std::string& name, Expdesc& e) {
     e.kind = Expdesc::Local;
     e.info = reg;
     return 0;
+  }
+  // Already an upvalue of this function (main chunk's _ENV, or prior captures).
+  for (size_t i = 0; i < fs.proto->upvalues.size(); ++i) {
+    if (fs.proto->upvalues[i].name == name) {
+      e.kind = Expdesc::Upval;
+      e.info = static_cast<int>(i);
+      return 0;
+    }
   }
   if (fs.prev) {
     Expdesc pe;
@@ -355,17 +410,23 @@ void expr(FuncState& fs, Expdesc& e, Expr& node) {
       break;
     }
     if (n.op == BinOp::Concat) {
+      // Place operands in consecutive temps and write the result to a fresh
+      // register — never CONCAT in-place over the LHS (can clobber CALL base).
       Expdesc l, r;
       expr(fs, l, *n.lhs);
-      int a = exp2reg(fs, l);
+      int lr = exp2reg(fs, l);
       expr(fs, r, *n.rhs);
-      int b = exp2reg(fs, r);
-      if (b != a + 1) {
-        fs.code_abc(OpCode::MOVE, a + 1, b, 0);
-        if (fs.freereg < a + 2)
-          fs.reserve(a + 2 - fs.freereg);
-      }
-      fs.code_abc(OpCode::CONCAT, a, a, a + 1);
+      int rr = exp2reg(fs, r);
+      int a = fs.new_reg();
+      int bslot = a;
+      int cslot = a + 1;
+      if (fs.freereg < a + 2)
+        fs.reserve(a + 2 - fs.freereg);
+      if (lr != bslot)
+        fs.code_abc(OpCode::MOVE, bslot, lr, 0);
+      if (rr != cslot)
+        fs.code_abc(OpCode::MOVE, cslot, rr, 0);
+      fs.code_abc(OpCode::CONCAT, a, bslot, cslot);
       fs.freereg = a + 1;
       e.kind = Expdesc::Nonrelocable;
       e.reg = a;
@@ -453,9 +514,21 @@ void expr(FuncState& fs, Expdesc& e, Expr& node) {
   }
   case AstKind::ExprCall: {
     auto& n = static_cast<ExprCall&>(node);
+    // Emit callee so the CALL lands at current freereg (needed for multret arg slots).
+    // Never place a call frame over active locals — CALL/C-API windows can clobber them.
+    if (fs.freereg < fs.nactvar)
+      fs.freereg = fs.nactvar;
+    int base = fs.freereg;
+    fs.reserve(1);
     Expdesc c;
     expr(fs, c, *n.callee);
-    int base = exp2reg(fs, c);
+    if (c.kind == Expdesc::Indexed) {
+      fs.code_abc(OpCode::GETTABLE, base, c.table, c.key);
+    } else {
+      int cr = exp2reg(fs, c);
+      if (cr != base)
+        fs.code_abc(OpCode::MOVE, base, cr, 0);
+    }
     // Never call in-place over a live local — CALL writes results onto R[base].
     if (base < fs.nactvar) {
       int nb = fs.new_reg();
@@ -583,10 +656,12 @@ void expr(FuncState& fs, Expdesc& e, Expr& node) {
     child.L = fs.L;
     child.prev = &fs;
     child.proto = p;
+    child.lastline = node.line;
     child.vararg = n.is_vararg;
     p->is_vararg = n.is_vararg;
     p->numparams = static_cast<int>(n.params.size());
     p->source = fs.proto->source;
+    p->linedefined = node.line;
     // _ENV upvalue
     add_upval(child, "_ENV", false, 0);
     child.freereg = 0;
@@ -595,7 +670,12 @@ void expr(FuncState& fs, Expdesc& e, Expr& node) {
       child.push_local(param, reg, node.line);
     }
     block(child, *n.body);
-    child.code_abc(OpCode::RETURN, 0, 1, 0);
+    child.lastline = n.lastline > 0 ? n.lastline : child.lastline;
+    child.code_abc(OpCode::RETURN, 0, 1, 0, child.lastline);
+    p->lastlinedefined = n.lastline > 0 ? n.lastline : node.line;
+    for (int li : p->lineinfo)
+      if (li > p->lastlinedefined)
+        p->lastlinedefined = li;
     p->maxstack = std::max(child.maxstack, 2);
     int dest = fs.new_reg();
     fs.code_abx(OpCode::CLOSURE, dest, static_cast<int>(fs.proto->protos.size() - 1));
@@ -630,8 +710,10 @@ void block(FuncState& fs, Block& b) {
 }
 
 void statement(FuncState& fs, AstNode& node) {
+  fs.lastline = node.line;
   switch (node.kind) {
   case AstKind::LocalDecl: {
+    fs.freereg = fs.nactvar;
     auto& n = static_cast<LocalDecl&>(node);
     int nnames = static_cast<int>(n.names.size());
     int base = fs.freereg;
@@ -826,9 +908,11 @@ void statement(FuncState& fs, AstNode& node) {
   }
   case AstKind::Repeat: {
     auto& n = static_cast<RepeatStmt&>(node);
+    int saved = static_cast<int>(fs.locals.size());
     int loop = fs.pc();
     int breaks_before = static_cast<int>(fs.break_list.size());
-    block(fs, *n.body);
+    for (auto& s : n.body->stmts)
+      statement(fs, *s);
     Expdesc c;
     expr(fs, c, *n.cond);
     int cr = exp2reg(fs, c);
@@ -840,6 +924,7 @@ void statement(FuncState& fs, AstNode& node) {
       fs.fix_sbx(fs.break_list.back(), fs.pc());
       fs.break_list.pop_back();
     }
+    fs.leave_block(saved);
     break;
   }
   case AstKind::Break: {

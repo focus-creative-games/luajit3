@@ -52,11 +52,23 @@ bool to_integer(const TValue& v, int64_t* out) {
       *out = static_cast<int64_t>(d);
       return true;
     }
+    return false;
   }
   return false;
 }
 
-TValue arith_raw(OpCode op, const TValue& a, const TValue& b) {
+TValue coerce_number(const TValue& v) {
+  TValue n;
+  if (try_to_number(v, &n))
+    return n;
+  if (v.is_string())
+    panic("attempt to perform arithmetic on a string value");
+  panic("attempt to perform arithmetic on non-number");
+}
+
+TValue arith_raw(OpCode op, const TValue& a_in, const TValue& b_in) {
+  TValue a = coerce_number(a_in);
+  TValue b = coerce_number(b_in);
   if (op == OpCode::BAND || op == OpCode::BOR || op == OpCode::BXOR || op == OpCode::SHL ||
       op == OpCode::SHR) {
     int64_t x, y;
@@ -101,11 +113,9 @@ TValue arith_raw(OpCode op, const TValue& a, const TValue& b) {
 }
 
 TValue do_arith(State* L, OpCode op, const TValue& a, const TValue& b) {
-  try {
-    if (a.is_number() && b.is_number())
-      return arith_raw(op, a, b);
-  } catch (...) {
-  }
+  TValue na, nb;
+  if (try_to_number(a, &na) && try_to_number(b, &nb))
+    return arith_raw(op, na, nb);
   if (!(a.is_number() && b.is_number())) {
     TValue out;
     const char* mt = arith_mt(op);
@@ -169,49 +179,61 @@ int run_c_call(State* L, Closure* cl, int func_idx, int nargs, int nresults) {
     panic("run_c_call: bad func_idx/nargs");
   if (static_cast<int>(th->stack.size()) < func_idx + 1 + nargs)
     panic("run_c_call: stack underflow");
-  std::vector<TValue> saved(th->stack.begin(), th->stack.begin() + static_cast<size_t>(func_idx));
-  std::vector<TValue> args(static_cast<size_t>(nargs));
-  for (int i = 0; i < nargs; ++i)
-    args[static_cast<size_t>(i)] = th->stack[static_cast<size_t>(func_idx + 1 + i)];
-  th->stack = std::move(args);
-  L->current->top = nargs;
+
+  // Keep the full Lua stack intact so open upvalues remain valid. Expose a
+  // C API window where at(1) is the first argument (slot func_idx+1).
+  const int prev_base = th->stack_base;
+  const int prev_top = th->top;
+  th->stack_base = func_idx + 1;
+  th->top = func_idx + 1 + nargs;
   L->yield_pending = false;
   int nret = 0;
   try {
     nret = cl->cfunc(L);
   } catch (const Lj3Error&) {
-    th->stack = std::move(saved);
-    L->current->top = func_idx;
+    th->stack_base = prev_base;
+    th->top = func_idx;
+    // Clear the call frame slot area.
+    for (int i = func_idx; i < prev_top; ++i)
+      th->stack[static_cast<size_t>(i)] = TValue::nil();
     throw;
   }
+
+  // Lua C API: the `nret` results are the topmost values in the C window.
+  if (nret < 0)
+    nret = 0;
+  int ctop = L->gettop();
+  if (nret > ctop)
+    nret = ctop;
+  std::vector<TValue> results(static_cast<size_t>(nret));
+  for (int i = 0; i < nret; ++i)
+    results[static_cast<size_t>(i)] = *L->at(ctop - nret + i + 1);
+
   if (L->yield_pending) {
-    if (nret < 0)
-      nret = 0;
-    if (static_cast<int>(th->stack.size()) < nret)
-      nret = static_cast<int>(th->stack.size());
-    th->yield_vals.assign(th->stack.begin(), th->stack.begin() + static_cast<size_t>(nret));
+    th->yield_vals = std::move(results);
     th->yield_func_idx = func_idx;
     th->yield_nresults = nresults;
-    th->stack = std::move(saved);
-    // Keep frame slots alive; CALL result area starts at func_idx.
-    L->ensure_stack(func_idx + (nresults == LUA_MULTRET ? 0 : nresults) + 8);
-    L->current->top = func_idx;
+    th->stack_base = prev_base;
+    L->ensure_stack(func_idx + 8);
+    th->top = func_idx;
     L->yield_pending = false;
     return LUA_YIELD;
   }
-  if (nret < 0)
-    nret = 0;
-  std::vector<TValue> results(static_cast<size_t>(nret));
-  for (int i = 0; i < nret; ++i)
-    results[static_cast<size_t>(i)] = th->stack[static_cast<size_t>(i)];
-  th->stack = std::move(saved);
-  L->current->top = func_idx;
+
+  th->stack_base = prev_base;
   int want = (nresults == LUA_MULTRET) ? nret : nresults;
-  L->ensure_stack(func_idx + want);
+  if (want < 0)
+    want = 0;
+  L->ensure_stack(func_idx + want + 8);
   for (int i = 0; i < want; ++i)
     th->stack[static_cast<size_t>(func_idx + i)] =
         (i < nret) ? results[static_cast<size_t>(i)] : TValue::nil();
-  L->settop(func_idx + want);
+  // Clear any leftover C-window slots above the results so stale values cannot
+  // be mistaken for live registers on subsequent instructions.
+  int clear_to = std::max(prev_top, func_idx + 1 + nargs);
+  for (int i = func_idx + want; i < clear_to; ++i)
+    th->stack[static_cast<size_t>(i)] = TValue::nil();
+  th->top = func_idx + want;
   return LUA_OK;
 }
 
@@ -256,6 +278,8 @@ int interpret(State* L) {
       cl = fr.cl;
       p = fr.proto;
       L->ensure_stack(fr.base + p->maxstack + fr.nvarargs + 8);
+      // Do not raise th->top to maxstack here: CALL/RETURN MULTRET rely on top
+      // marking the end of the variable result range. GC uses thread_live_top().
       return th->stack.data() + fr.base;
     };
     auto fbase = [&]() -> int { return th->frames[fi].base; };
@@ -263,6 +287,8 @@ int interpret(State* L) {
 
     TValue* base = reload();
     L->gc.safepoint();
+    // Finalizers / nested calls during GC may reallocate the stack.
+    base = reload();
     runtime_profile().opcodes++;
 
     switch (op) {
@@ -383,11 +409,12 @@ int interpret(State* L) {
       break;
     }
     case OpCode::UNM: {
-      if (base[b].is_number()) {
-        if (base[b].is_int())
-          base[a] = TValue::integer(-base[b].as_int());
+      TValue nb;
+      if (try_to_number(base[b], &nb)) {
+        if (nb.is_int())
+          base[a] = TValue::integer(-nb.as_int());
         else
-          base[a] = TValue::number(-base[b].as_float());
+          base[a] = TValue::number(-nb.as_float());
       } else {
         TValue out;
         if (!meta_unary(L, "__unm", base[b], &out))
@@ -476,21 +503,40 @@ int interpret(State* L) {
     case OpCode::FORPREP: {
       if (!base[a].is_number() || !base[a + 1].is_number() || !base[a + 2].is_number())
         panic("'for' initial/limit/step must be a number");
-      double idx = base[a].to_number();
-      double step = base[a + 2].to_number();
-      base[a] = TValue::number(idx - step);
+      // Lua 5.3: if all of init/limit/step are integers, the loop uses integers.
+      if (base[a].is_int() && base[a + 1].is_int() && base[a + 2].is_int()) {
+        int64_t idx = base[a].as_int();
+        int64_t step = base[a + 2].as_int();
+        base[a] = TValue::integer(idx - step);
+      } else {
+        double idx = base[a].to_number();
+        double step = base[a + 2].to_number();
+        base[a] = TValue::number(idx - step);
+      }
       pc() += op_sbx(ins);
       break;
     }
     case OpCode::FORLOOP: {
-      double step = base[a + 2].to_number();
-      double idx = base[a].to_number() + step;
-      double limit = base[a + 1].to_number();
-      if ((step > 0) ? (idx <= limit) : (idx >= limit)) {
-        pc() += op_sbx(ins);
-        base[a] = TValue::number(idx);
-        base[a + 3] = TValue::number(idx);
-        hotness_on_loop(p);
+      if (base[a].is_int() && base[a + 1].is_int() && base[a + 2].is_int()) {
+        int64_t step = base[a + 2].as_int();
+        int64_t idx = base[a].as_int() + step;
+        int64_t limit = base[a + 1].as_int();
+        if ((step > 0) ? (idx <= limit) : (idx >= limit)) {
+          pc() += op_sbx(ins);
+          base[a] = TValue::integer(idx);
+          base[a + 3] = TValue::integer(idx);
+          hotness_on_loop(p);
+        }
+      } else {
+        double step = base[a + 2].to_number();
+        double idx = base[a].to_number() + step;
+        double limit = base[a + 1].to_number();
+        if ((step > 0) ? (idx <= limit) : (idx >= limit)) {
+          pc() += op_sbx(ins);
+          base[a] = TValue::number(idx);
+          base[a + 3] = TValue::number(idx);
+          hotness_on_loop(p);
+        }
       }
       break;
     }
@@ -526,7 +572,7 @@ int interpret(State* L) {
       int n = b;
       // B==0: values occupy R[A+1]..R[top-1] (same top convention as CALL B==0).
       if (n == 0)
-        n = L->gettop() - (fbase() + a) - 1;
+        n = L->abs_top() - (fbase() + a) - 1;
       int offset = (c - 1) * 50;
       if (!base[a].is_table())
         panic("SETLIST on non-table");
@@ -557,6 +603,7 @@ int interpret(State* L) {
     case OpCode::VARARG: {
       auto& fr = th->frames[fi];
       int nwant = (b == 0) ? fr.nvarargs : (b - 1);
+      L->ensure_stack(fr.base + a + nwant + 8);
       for (int i = 0; i < nwant; ++i) {
         if (i < fr.nvarargs)
           base[a + i] = th->stack[static_cast<size_t>(fr.vararg_base + i)];
@@ -564,16 +611,19 @@ int interpret(State* L) {
           base[a + i] = TValue::nil();
       }
       if (b == 0)
-        L->current->top = fr.base + a + nwant;
+        th->top = fr.base + a + nwant; // no nil-fill; slots already written
       break;
     }
     case OpCode::CALL: {
-      int nargs = (b == 0) ? (L->gettop() - (fbase() + a) - 1) : (b - 1);
+      int nargs = (b == 0) ? (L->abs_top() - (fbase() + a) - 1) : (b - 1);
       if (nargs < 0)
         nargs = 0;
       int nret = (c == 0) ? LUA_MULTRET : (c - 1);
       int call_base = fbase() + a;
-      L->current->top = call_base + 1 + nargs;
+      // Raise top without nil-filling: args are already in R[A+1..] (nil-fill would wipe them).
+      L->ensure_stack(call_base + 1 + nargs + 8);
+      th->top = call_base + 1 + nargs;
+      base = reload();
       TValue f = base[a];
       if (f.is_function()) {
         if (f.as_closure()->is_c) {
@@ -589,7 +639,7 @@ int interpret(State* L) {
       break;
     }
     case OpCode::TAILCALL: {
-      int nargs = (b == 0) ? (L->gettop() - (fbase() + a) - 1) : (b - 1);
+      int nargs = (b == 0) ? (L->abs_top() - (fbase() + a) - 1) : (b - 1);
       if (nargs < 0)
         nargs = 0;
       int nresults = th->frames[fi].expected_results;
@@ -597,7 +647,8 @@ int interpret(State* L) {
       TValue f = base[a];
       for (int i = 0; i <= nargs; ++i)
         th->stack[static_cast<size_t>(dest + i)] = base[a + i];
-      L->current->top = dest + 1 + nargs;
+      L->ensure_stack(dest + 1 + nargs + 8);
+      th->top = dest + 1 + nargs;
       L->close_upvals(th, dest);
       th->frames.pop_back();
       if (f.is_function()) {
@@ -619,7 +670,7 @@ int interpret(State* L) {
     }
     case OpCode::RETURN: {
       auto& fr = th->frames[fi];
-      int nret = (b == 0) ? (L->gettop() - (fr.base + a)) : (b - 1);
+      int nret = (b == 0) ? (L->abs_top() - (fr.base + a)) : (b - 1);
       if (nret < 0)
         nret = 0;
       L->close_upvals(th, fr.base);
@@ -632,12 +683,12 @@ int interpret(State* L) {
       if (want == LUA_MULTRET) {
         for (int i = 0; i < nret; ++i)
           th->stack[static_cast<size_t>(dest + i)] = results[static_cast<size_t>(i)];
-        L->settop(dest + nret);
+        L->set_abs_top(dest + nret);
       } else {
         for (int i = 0; i < want; ++i)
           th->stack[static_cast<size_t>(dest + i)] =
               (i < nret) ? results[static_cast<size_t>(i)] : TValue::nil();
-        L->settop(dest + want);
+        L->set_abs_top(dest + want);
       }
       if (static_cast<int>(th->frames.size()) < entry_depth)
         return LUA_OK;

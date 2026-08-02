@@ -53,5 +53,42 @@ int test_lang53_functions() {
                   "return g(f(),1)",
                   3); // only first of f() kept when not last
 
+  // Upvalue capture across block boundaries (PUC all.lua showmem pattern)
+  f += expect_int(G,
+                  "local showmem "
+                  "do "
+                  "  local max = 0 "
+                  "  showmem = function () "
+                  "    local m = 100 "
+                  "    max = (m > max) and m or max "
+                  "    return max "
+                  "  end "
+                  "end "
+                  "return showmem()",
+                  100);
+
+  // Inner locals must shadow outer params, not alias wrong upvalue slots
+  f += expect_int(G,
+                  "local function F(m) "
+                  "  local function round(m) return m end "
+                  "  if m < 1000 then return round(m) end "
+                  "  return round(m) "
+                  "end "
+                  "return F(42)",
+                  42);
+
+  // string.dump / load roundtrip
+  f += expect_int(G,
+                  "local f = load('return 1+2') "
+                  "local b = string.dump(f) "
+                  "local g = load(b) "
+                  "return g()",
+                  3);
+  f += expect_int(G,
+                  "local function mk(x) return function() return x end end "
+                  "local g = load(string.dump(mk))(7) "
+                  "return g()",
+                  7);
+
   return f ? 1 : 0;
 }

@@ -2,6 +2,7 @@
 
 #include "runtime/string.hpp"
 #include "runtime/table.hpp"
+#include "runtime/userdata.hpp"
 #include "vm/interpreter.hpp"
 #include "vm/state.hpp"
 
@@ -12,6 +13,8 @@ namespace lj3 {
 Table* get_metatable(const TValue& v) {
   if (v.is_table())
     return v.as_table()->metatable;
+  if (v.is_userdata())
+    return v.as_userdata()->metatable;
   return nullptr;
 }
 
@@ -19,6 +22,7 @@ void set_metatable(State* L, TValue& v, Table* mt) {
   if (!v.is_table())
     panic("setmetatable: value is not a table");
   v.as_table()->metatable = mt;
+  v.as_table()->update_weak_mode(L);
   if (mt)
     L->gc.barrier(v.as_gc(), TValue::obj(ValueTag::Table, mt));
 }
@@ -166,8 +170,9 @@ bool meta_eq(State* L, const TValue& a, const TValue& b, bool* out_eq) {
 }
 
 bool meta_lt(State* L, const TValue& a, const TValue& b, bool* out_lt) {
-  if (a.is_number() && b.is_number()) {
-    *out_lt = a.to_number() < b.to_number();
+  TValue na, nb;
+  if (try_to_number(a, &na) && try_to_number(b, &nb)) {
+    *out_lt = na.to_number() < nb.to_number();
     return true;
   }
   if (a.is_string() && b.is_string()) {
@@ -187,8 +192,9 @@ bool meta_lt(State* L, const TValue& a, const TValue& b, bool* out_lt) {
 }
 
 bool meta_le(State* L, const TValue& a, const TValue& b, bool* out_le) {
-  if (a.is_number() && b.is_number()) {
-    *out_le = a.to_number() <= b.to_number();
+  TValue na, nb;
+  if (try_to_number(a, &na) && try_to_number(b, &nb)) {
+    *out_le = na.to_number() <= nb.to_number();
     return true;
   }
   if (a.is_string() && b.is_string()) {

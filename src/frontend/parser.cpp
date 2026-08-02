@@ -4,8 +4,24 @@ namespace lj3 {
 
 Parser::Parser(Lexer lex) : lex_(std::move(lex)) {}
 
-Token Parser::peek() { return lex_.peek(); }
-Token Parser::next() { return lex_.next(); }
+Token Parser::peek() {
+  if (has_unget_)
+    return unget_;
+  return lex_.peek();
+}
+Token Parser::next() {
+  if (has_unget_) {
+    has_unget_ = false;
+    return unget_;
+  }
+  return lex_.next();
+}
+void Parser::unget(Token t) {
+  if (has_unget_)
+    panic("parser unget overflow");
+  unget_ = t;
+  has_unget_ = true;
+}
 bool Parser::check(TokenKind k) { return peek().kind == k; }
 bool Parser::match(TokenKind k) {
   if (check(k)) {
@@ -45,6 +61,10 @@ std::unique_ptr<Block> Parser::parse_block() {
     if (k == TokenKind::KwEnd || k == TokenKind::KwElse || k == TokenKind::KwElseif ||
         k == TokenKind::KwUntil || k == TokenKind::End)
       break;
+    if (k == TokenKind::Semi) {
+      next();
+      continue;
+    }
     if (k == TokenKind::KwReturn) {
       block->stmts.push_back(parse_stmt());
       match(TokenKind::Semi);
@@ -169,7 +189,7 @@ AstPtr Parser::parse_stmt() {
       s->is_method = true;
       s->name_path.push_back(expect(TokenKind::Identifier, "expected method").text);
     }
-    s->fn = parse_function_body();
+    s->fn = parse_function_body(s->line);
     if (s->is_method)
       s->fn->params.insert(s->fn->params.begin(), "self");
     return s;
@@ -179,7 +199,7 @@ AstPtr Parser::parse_stmt() {
       auto s = std::make_unique<LocalFunction>();
       s->line = line;
       s->name = expect(TokenKind::Identifier, "expected name").text;
-      s->fn = parse_function_body();
+      s->fn = parse_function_body(s->line);
       return s;
     }
     auto s = std::make_unique<LocalDecl>();
@@ -212,8 +232,9 @@ AstPtr Parser::parse_stmt() {
   return s;
 }
 
-std::unique_ptr<ExprFunction> Parser::parse_function_body() {
+std::unique_ptr<ExprFunction> Parser::parse_function_body(int defline) {
   auto fn = std::make_unique<ExprFunction>();
+  fn->line = defline;
   expect(TokenKind::LParen, "expected '('");
   if (!check(TokenKind::RParen)) {
     if (match(TokenKind::DotDotDot)) {
@@ -231,7 +252,7 @@ std::unique_ptr<ExprFunction> Parser::parse_function_body() {
   }
   expect(TokenKind::RParen, "expected ')'");
   fn->body = parse_block();
-  expect(TokenKind::KwEnd, "expected 'end'");
+  fn->lastline = expect(TokenKind::KwEnd, "expected 'end'").line;
   return fn;
 }
 
@@ -441,10 +462,18 @@ ExprPtr Parser::parse_suffix(ExprPtr e) {
       n->is_method = true;
       n->method = expect(TokenKind::Identifier, "expected method").text;
       n->callee = std::move(e);
-      expect(TokenKind::LParen, "expected '('");
-      if (!check(TokenKind::RParen))
-        n->args = parse_expr_list();
-      expect(TokenKind::RParen, "expected ')'");
+      if (match(TokenKind::LParen)) {
+        if (!check(TokenKind::RParen))
+          n->args = parse_expr_list();
+        expect(TokenKind::RParen, "expected ')'");
+      } else if (check(TokenKind::String)) {
+        auto t = next();
+        n->args.push_back(std::make_unique<ExprString>(t.text));
+      } else if (check(TokenKind::LBrace)) {
+        n->args.push_back(parse_table());
+      } else {
+        error("expected method arguments");
+      }
       e = std::move(n);
     } else if (match(TokenKind::LParen)) {
       auto n = std::make_unique<ExprCall>();
@@ -502,8 +531,11 @@ ExprPtr Parser::parse_primary() {
   }
   if (check(TokenKind::LBrace))
     return parse_table();
-  if (match(TokenKind::KwFunction))
-    return parse_function_body();
+  if (check(TokenKind::KwFunction)) {
+    int fl = peek().line;
+    match(TokenKind::KwFunction);
+    return parse_function_body(fl);
+  }
   error("unexpected token in expression");
 }
 
@@ -523,8 +555,9 @@ ExprPtr Parser::parse_table() {
         f.name = saved.text;
         f.value = parse_expr();
       } else {
-        auto name = std::make_unique<ExprName>(saved.text);
-        f.value = parse_suffix(std::move(name));
+        // Expression starting with this name (may include .., calls, etc.)
+        unget(saved);
+        f.value = parse_expr();
       }
     } else {
       f.value = parse_expr();

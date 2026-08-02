@@ -34,5 +34,12 @@ int test_parser_sema() {
   } catch (const Lj3Error& e) {
     f += lj3test::fail("parser-longstr", e.what());
   }
+  // empty statement
+  try {
+    auto c = parse("do ; end");
+    sema_analyze(*c);
+  } catch (const Lj3Error& e) {
+    f += lj3test::fail("parser-semi", e.what());
+  }
   return f ? 1 : 0;
 }

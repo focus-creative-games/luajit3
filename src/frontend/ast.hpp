@@ -165,6 +165,7 @@ struct ExprFunction final : Expr {
   std::vector<std::string> params;
   bool is_vararg = false;
   std::unique_ptr<Block> body;
+  int lastline = 0;
   ExprFunction() { kind = AstKind::ExprFunction; }
 };
 

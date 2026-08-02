@@ -1,5 +1,6 @@
 #include "runtime/value.hpp"
 #include "vm/state.hpp"
+#include "test_harness.hpp"
 
 #include <iostream>
 
@@ -24,5 +25,11 @@ int test_value() {
     std::cerr << "value FAIL: table\n";
     f = 1;
   }
+  if (t->get(TValue::number(1.0)).as_int() != 42) {
+    std::cerr << "value FAIL: table float index\n";
+    f = 1;
+  }
+  f += lj3test::expect_num("value", "local t={0,2}; return rawget(t,1.0)", 0);
+  f += lj3test::expect_num("value", "local t={0,2}; for i=1,2 do return t[i] end", 0);
   return f;
 }

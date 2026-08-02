@@ -13,6 +13,7 @@ public:
 private:
   Token peek();
   Token next();
+  void unget(Token t);
   bool check(TokenKind k);
   bool match(TokenKind k);
   Token expect(TokenKind k, const char* msg);
@@ -36,10 +37,12 @@ private:
   ExprPtr parse_suffix(ExprPtr e);
   ExprPtr parse_primary();
   ExprPtr parse_table();
-  std::unique_ptr<ExprFunction> parse_function_body();
+  std::unique_ptr<ExprFunction> parse_function_body(int defline);
   std::vector<ExprPtr> parse_expr_list();
 
   Lexer lex_;
+  bool has_unget_ = false;
+  Token unget_{};
 };
 
 std::unique_ptr<Chunk> parse(std::string_view src, const std::string& name = "chunk");

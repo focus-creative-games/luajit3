@@ -4,6 +4,7 @@
 
 namespace lj3 {
 
+void open_libs(State* L);
 void open_base(State* L);
 
 } // namespace lj3

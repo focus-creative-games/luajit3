@@ -16,6 +16,11 @@ jobs:
         run: cmake --build build -j
       - name: Test
         run: ctest --test-dir build --output-on-failure
+      - name: PUC Lua 5.3.4 basic suite
+        continue-on-error: true
+        run: |
+          chmod +x scripts/run_puc_tests.sh
+          scripts/run_puc_tests.sh || true
 
   build-windows:
     runs-on: windows-latest
@@ -27,3 +32,8 @@ jobs:
         run: cmake --build build --config Release -j
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
+      - name: PUC Lua 5.3.4 basic suite
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          try { ./scripts/run_puc_tests.ps1 } catch { Write-Host $_; exit 0 }
