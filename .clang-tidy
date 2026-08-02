@@ -1,0 +1,12 @@
+Checks: >
+  clang-diagnostic-*,
+  clang-analyzer-*,
+  modernize-*,
+  performance-*,
+  readability-*,
+  -modernize-use-trailing-return-type,
+  -readability-magic-numbers,
+  -readability-identifier-length
+WarningsAsErrors: ''
+HeaderFilterRegex: '.*(include|src)/.*'
+FormatStyle: file

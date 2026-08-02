@@ -1,0 +1,656 @@
+#include "vm/interpreter.hpp"
+
+#include "jit/hotness.hpp"
+#include "runtime/string.hpp"
+#include "tools/profile.hpp"
+#include "vm/meta.hpp"
+
+#include <cmath>
+#include <cstring>
+
+#ifndef LUA_MULTRET
+#define LUA_MULTRET (-1)
+#endif
+#ifndef LUA_OK
+#define LUA_OK 0
+#endif
+#ifndef LUA_YIELD
+#define LUA_YIELD 1
+#endif
+
+namespace lj3 {
+
+namespace {
+
+const char* arith_mt(OpCode op) {
+  switch (op) {
+  case OpCode::ADD: return "__add";
+  case OpCode::SUB: return "__sub";
+  case OpCode::MUL: return "__mul";
+  case OpCode::DIV: return "__div";
+  case OpCode::IDIV: return "__idiv";
+  case OpCode::MOD: return "__mod";
+  case OpCode::POW: return "__pow";
+  case OpCode::BAND: return "__band";
+  case OpCode::BOR: return "__bor";
+  case OpCode::BXOR: return "__bxor";
+  case OpCode::SHL: return "__shl";
+  case OpCode::SHR: return "__shr";
+  default: return nullptr;
+  }
+}
+
+bool to_integer(const TValue& v, int64_t* out) {
+  if (v.is_int()) {
+    *out = v.as_int();
+    return true;
+  }
+  if (v.is_float()) {
+    double d = v.as_float();
+    if (std::floor(d) == d && d >= static_cast<double>(INT64_MIN) &&
+        d <= static_cast<double>(INT64_MAX)) {
+      *out = static_cast<int64_t>(d);
+      return true;
+    }
+  }
+  return false;
+}
+
+TValue arith_raw(OpCode op, const TValue& a, const TValue& b) {
+  if (op == OpCode::BAND || op == OpCode::BOR || op == OpCode::BXOR || op == OpCode::SHL ||
+      op == OpCode::SHR) {
+    int64_t x, y;
+    if (!to_integer(a, &x) || !to_integer(b, &y))
+      panic("number has no integer representation");
+    int64_t r = 0;
+    switch (op) {
+    case OpCode::BAND: r = x & y; break;
+    case OpCode::BOR: r = x | y; break;
+    case OpCode::BXOR: r = x ^ y; break;
+    case OpCode::SHL: r = x << (y & 63); break;
+    case OpCode::SHR: r = static_cast<int64_t>(static_cast<uint64_t>(x) >> (y & 63)); break;
+    default: break;
+    }
+    return TValue::integer(r);
+  }
+  if ((op == OpCode::ADD || op == OpCode::SUB || op == OpCode::MUL) && a.is_int() && b.is_int()) {
+    int64_t x = a.as_int(), y = b.as_int();
+    switch (op) {
+    case OpCode::ADD: return TValue::integer(x + y);
+    case OpCode::SUB: return TValue::integer(x - y);
+    case OpCode::MUL: return TValue::integer(x * y);
+    default: break;
+    }
+  }
+  if (!a.is_number() || !b.is_number())
+    panic("attempt to perform arithmetic on non-number");
+  double x = a.to_number(), y = b.to_number(), r = 0;
+  switch (op) {
+  case OpCode::ADD: r = x + y; break;
+  case OpCode::SUB: r = x - y; break;
+  case OpCode::MUL: r = x * y; break;
+  case OpCode::DIV: r = x / y; break;
+  case OpCode::IDIV: r = std::floor(x / y); break;
+  case OpCode::MOD: r = x - std::floor(x / y) * y; break;
+  case OpCode::POW: r = std::pow(x, y); break;
+  default: panic("bad arith");
+  }
+  if (op == OpCode::IDIV && a.is_int() && b.is_int())
+    return TValue::integer(static_cast<int64_t>(r));
+  return TValue::number(r);
+}
+
+TValue do_arith(State* L, OpCode op, const TValue& a, const TValue& b) {
+  try {
+    if (a.is_number() && b.is_number())
+      return arith_raw(op, a, b);
+  } catch (...) {
+  }
+  if (!(a.is_number() && b.is_number())) {
+    TValue out;
+    const char* mt = arith_mt(op);
+    if (mt && meta_arith(L, mt, a, b, &out))
+      return out;
+  }
+  return arith_raw(op, a, b);
+}
+
+void push_lua_frame(State* L, Closure* cl, int func_idx, int nargs, int nresults) {
+  Thread* th = L->current;
+  Proto* p = cl->proto;
+  hotness_on_entry(p);
+  CallFrame fr;
+  fr.cl = cl;
+  fr.proto = p;
+  fr.base = func_idx;
+  fr.expected_results = nresults;
+  fr.saved_pc = 0;
+  fr.kind = FrameKind::InterpLua;
+  fr.nvarargs = 0;
+  fr.vararg_base = -1;
+
+  int nfixed = p->numparams;
+  int nvar = 0;
+  if (p->is_vararg && nargs > nfixed)
+    nvar = nargs - nfixed;
+
+  std::vector<TValue> saved_varargs(static_cast<size_t>(nvar));
+  for (int i = 0; i < nvar; ++i)
+    saved_varargs[static_cast<size_t>(i)] =
+        th->stack[static_cast<size_t>(func_idx + 1 + nfixed + i)];
+
+  for (int i = 0; i < nfixed; ++i) {
+    if (i < nargs)
+      th->stack[static_cast<size_t>(fr.base + i)] =
+          th->stack[static_cast<size_t>(func_idx + 1 + i)];
+    else
+      th->stack[static_cast<size_t>(fr.base + i)] = TValue::nil();
+  }
+
+  int want = std::max(p->maxstack, nfixed);
+  L->ensure_stack(fr.base + want + nvar + 8);
+  for (int i = nfixed; i < want; ++i)
+    th->stack[static_cast<size_t>(fr.base + i)] = TValue::nil();
+
+  if (nvar > 0) {
+    fr.vararg_base = fr.base + want;
+    fr.nvarargs = nvar;
+    for (int i = 0; i < nvar; ++i)
+      th->stack[static_cast<size_t>(fr.vararg_base + i)] = saved_varargs[static_cast<size_t>(i)];
+  }
+
+  L->current->top = fr.base + want;
+  th->frames.push_back(fr);
+}
+
+int run_c_call(State* L, Closure* cl, int func_idx, int nargs, int nresults) {
+  Thread* th = L->current;
+  if (func_idx < 0 || nargs < 0)
+    panic("run_c_call: bad func_idx/nargs");
+  if (static_cast<int>(th->stack.size()) < func_idx + 1 + nargs)
+    panic("run_c_call: stack underflow");
+  std::vector<TValue> saved(th->stack.begin(), th->stack.begin() + static_cast<size_t>(func_idx));
+  std::vector<TValue> args(static_cast<size_t>(nargs));
+  for (int i = 0; i < nargs; ++i)
+    args[static_cast<size_t>(i)] = th->stack[static_cast<size_t>(func_idx + 1 + i)];
+  th->stack = std::move(args);
+  L->current->top = nargs;
+  L->yield_pending = false;
+  int nret = 0;
+  try {
+    nret = cl->cfunc(L);
+  } catch (const Lj3Error&) {
+    th->stack = std::move(saved);
+    L->current->top = func_idx;
+    throw;
+  }
+  if (L->yield_pending) {
+    if (nret < 0)
+      nret = 0;
+    if (static_cast<int>(th->stack.size()) < nret)
+      nret = static_cast<int>(th->stack.size());
+    th->yield_vals.assign(th->stack.begin(), th->stack.begin() + static_cast<size_t>(nret));
+    th->yield_func_idx = func_idx;
+    th->yield_nresults = nresults;
+    th->stack = std::move(saved);
+    // Keep frame slots alive; CALL result area starts at func_idx.
+    L->ensure_stack(func_idx + (nresults == LUA_MULTRET ? 0 : nresults) + 8);
+    L->current->top = func_idx;
+    L->yield_pending = false;
+    return LUA_YIELD;
+  }
+  if (nret < 0)
+    nret = 0;
+  std::vector<TValue> results(static_cast<size_t>(nret));
+  for (int i = 0; i < nret; ++i)
+    results[static_cast<size_t>(i)] = th->stack[static_cast<size_t>(i)];
+  th->stack = std::move(saved);
+  L->current->top = func_idx;
+  int want = (nresults == LUA_MULTRET) ? nret : nresults;
+  L->ensure_stack(func_idx + want);
+  for (int i = 0; i < want; ++i)
+    th->stack[static_cast<size_t>(func_idx + i)] =
+        (i < nret) ? results[static_cast<size_t>(i)] : TValue::nil();
+  L->settop(func_idx + want);
+  return LUA_OK;
+}
+
+} // namespace
+
+int call_closure(State* L, Closure* cl, int nargs, int nresults) {
+  int func_idx = L->current->top - nargs - 1;
+  if (func_idx < 0)
+    panic("call_closure stack underflow");
+  if (cl->is_c)
+    return run_c_call(L, cl, func_idx, nargs, nresults);
+  push_lua_frame(L, cl, func_idx, nargs, nresults);
+  return interpret(L);
+}
+
+int interpret(State* L) {
+  Thread* th = L->current;
+  const int entry_depth = static_cast<int>(th->frames.size());
+
+  // Use frame index (not CallFrame&) so reentrant call_closure / meta calls that
+  // push_back on th->frames cannot leave a dangling reference after reallocation.
+  while (static_cast<int>(th->frames.size()) >= entry_depth && !th->frames.empty()) {
+    const size_t fi = th->frames.size() - 1;
+    auto& fr0 = th->frames[fi];
+    Closure* cl = fr0.cl;
+    Proto* p = fr0.proto;
+    if (fr0.saved_pc >= static_cast<int>(p->code.size())) {
+      th->frames.pop_back();
+      if (static_cast<int>(th->frames.size()) < entry_depth)
+        return LUA_OK;
+      continue;
+    }
+
+    Instruction ins = p->code[static_cast<size_t>(fr0.saved_pc++)];
+    OpCode op = static_cast<OpCode>(op_get(ins));
+    int a = op_a(ins);
+    int b = op_b(ins);
+    int c = op_c(ins);
+
+    auto reload = [&]() -> TValue* {
+      auto& fr = th->frames[fi];
+      cl = fr.cl;
+      p = fr.proto;
+      L->ensure_stack(fr.base + p->maxstack + fr.nvarargs + 8);
+      return th->stack.data() + fr.base;
+    };
+    auto fbase = [&]() -> int { return th->frames[fi].base; };
+    auto pc = [&]() -> int& { return th->frames[fi].saved_pc; };
+
+    TValue* base = reload();
+    L->gc.safepoint();
+    runtime_profile().opcodes++;
+
+    switch (op) {
+    case OpCode::MOVE:
+      base[a] = base[b];
+      break;
+    case OpCode::LOADNIL:
+      for (int r = a; r <= a + b; ++r)
+        base[r] = TValue::nil();
+      break;
+    case OpCode::LOADBOOL:
+      base[a] = TValue::boolean(b != 0);
+      if (c)
+        pc()++;
+      break;
+    case OpCode::LOADINT:
+      base[a] = TValue::integer(op_sbx(ins));
+      break;
+    case OpCode::LOADK:
+    case OpCode::LOADFLOAT:
+      base[a] = p->constants[op_bx(ins)];
+      break;
+    case OpCode::GETUPVAL:
+      if (static_cast<size_t>(b) >= cl->upvals.size() || !cl->upvals[static_cast<size_t>(b)])
+        panic("GETUPVAL: bad upvalue");
+      base[a] = cl->upvals[static_cast<size_t>(b)]->get();
+      break;
+    case OpCode::SETUPVAL:
+      if (static_cast<size_t>(b) >= cl->upvals.size() || !cl->upvals[static_cast<size_t>(b)])
+        panic("SETUPVAL: bad upvalue");
+      cl->upvals[static_cast<size_t>(b)]->set(L, base[a]);
+      break;
+    case OpCode::GETTABUP: {
+      if (static_cast<size_t>(b) >= cl->upvals.size() || !cl->upvals[static_cast<size_t>(b)])
+        panic("GETTABUP: bad upvalue");
+      if (static_cast<size_t>(c) >= p->constants.size())
+        panic("GETTABUP: bad constant");
+      TValue t = cl->upvals[static_cast<size_t>(b)]->get();
+      TValue key = p->constants[static_cast<size_t>(c)];
+      TValue v = meta_index(L, t, key);
+      base = reload();
+      base[a] = v;
+      break;
+    }
+    case OpCode::SETTABUP: {
+      TValue t = cl->upvals[static_cast<size_t>(a)]->get();
+      TValue key = p->constants[static_cast<size_t>(b)];
+      TValue val = base[c];
+      meta_newindex(L, t, key, val);
+      (void)reload();
+      break;
+    }
+    case OpCode::GETTABLE: {
+      TValue v = meta_index(L, base[b], base[c]);
+      base = reload();
+      base[a] = v;
+      break;
+    }
+    case OpCode::SETTABLE: {
+      TValue t = base[a], key = base[b], val = base[c];
+      meta_newindex(L, t, key, val);
+      (void)reload();
+      break;
+    }
+    case OpCode::GETI: {
+      TValue v = meta_index(L, base[b], TValue::integer(c));
+      base = reload();
+      base[a] = v;
+      break;
+    }
+    case OpCode::SETI: {
+      TValue t = base[a], val = base[c];
+      meta_newindex(L, t, TValue::integer(b), val);
+      (void)reload();
+      break;
+    }
+    case OpCode::GETFIELD: {
+      TValue v = meta_index(L, base[b], p->constants[static_cast<size_t>(c)]);
+      base = reload();
+      base[a] = v;
+      break;
+    }
+    case OpCode::SETFIELD: {
+      TValue t = base[a], val = base[c];
+      meta_newindex(L, t, p->constants[static_cast<size_t>(b)], val);
+      (void)reload();
+      break;
+    }
+    case OpCode::NEWTABLE:
+      base[a] = TValue::obj(ValueTag::Table, table_new(L, b ? (1u << b) : 0, c ? (1u << c) : 0));
+      break;
+    case OpCode::SELF: {
+      TValue t = base[b];
+      TValue key = base[c];
+      base[a + 1] = t;
+      TValue m = meta_index(L, t, key);
+      base = reload();
+      base[a + 1] = t;
+      base[a] = m;
+      break;
+    }
+    case OpCode::ADD:
+    case OpCode::SUB:
+    case OpCode::MUL:
+    case OpCode::DIV:
+    case OpCode::IDIV:
+    case OpCode::MOD:
+    case OpCode::POW:
+    case OpCode::BAND:
+    case OpCode::BOR:
+    case OpCode::BXOR:
+    case OpCode::SHL:
+    case OpCode::SHR: {
+      TValue lhs = base[b], rhs = base[c];
+      TValue r = do_arith(L, op, lhs, rhs);
+      base = reload();
+      base[a] = r;
+      break;
+    }
+    case OpCode::UNM: {
+      if (base[b].is_number()) {
+        if (base[b].is_int())
+          base[a] = TValue::integer(-base[b].as_int());
+        else
+          base[a] = TValue::number(-base[b].as_float());
+      } else {
+        TValue out;
+        if (!meta_unary(L, "__unm", base[b], &out))
+          panic("attempt to perform arithmetic on non-number");
+        base = reload();
+        base[a] = out;
+      }
+      break;
+    }
+    case OpCode::BNOT: {
+      int64_t x;
+      if (to_integer(base[b], &x))
+        base[a] = TValue::integer(~x);
+      else {
+        TValue out;
+        if (!meta_unary(L, "__bnot", base[b], &out))
+          panic("number has no integer representation");
+        base = reload();
+        base[a] = out;
+      }
+      break;
+    }
+    case OpCode::NOT:
+      base[a] = TValue::boolean(!base[b].is_truthy());
+      break;
+    case OpCode::LEN: {
+      TValue out;
+      meta_len(L, base[b], &out);
+      base = reload();
+      base[a] = out;
+      break;
+    }
+    case OpCode::CONCAT: {
+      TValue acc = base[b];
+      for (int r = b + 1; r <= c; ++r) {
+        base = reload();
+        TValue out;
+        meta_concat(L, acc, base[r], &out);
+        acc = out;
+      }
+      base = reload();
+      base[a] = acc;
+      break;
+    }
+    case OpCode::EQ: {
+      bool eq = false;
+      meta_eq(L, base[b], base[c], &eq);
+      (void)reload();
+      if (eq != (a != 0))
+        pc()++;
+      break;
+    }
+    case OpCode::LT: {
+      bool lt = false;
+      meta_lt(L, base[b], base[c], &lt);
+      (void)reload();
+      if (lt != (a != 0))
+        pc()++;
+      break;
+    }
+    case OpCode::LE: {
+      bool le = false;
+      meta_le(L, base[b], base[c], &le);
+      (void)reload();
+      if (le != (a != 0))
+        pc()++;
+      break;
+    }
+    case OpCode::TEST:
+      if (base[a].is_truthy() != (c != 0))
+        pc()++;
+      break;
+    case OpCode::TESTSET:
+      if (base[b].is_truthy() != (c != 0))
+        pc()++;
+      else
+        base[a] = base[b];
+      break;
+    case OpCode::JMP: {
+      if (a != 0)
+        L->close_upvals(th, fbase() + (a - 1));
+      pc() += op_sbx(ins);
+      hotness_on_loop(p);
+      break;
+    }
+    case OpCode::FORPREP: {
+      if (!base[a].is_number() || !base[a + 1].is_number() || !base[a + 2].is_number())
+        panic("'for' initial/limit/step must be a number");
+      double idx = base[a].to_number();
+      double step = base[a + 2].to_number();
+      base[a] = TValue::number(idx - step);
+      pc() += op_sbx(ins);
+      break;
+    }
+    case OpCode::FORLOOP: {
+      double step = base[a + 2].to_number();
+      double idx = base[a].to_number() + step;
+      double limit = base[a + 1].to_number();
+      if ((step > 0) ? (idx <= limit) : (idx >= limit)) {
+        pc() += op_sbx(ins);
+        base[a] = TValue::number(idx);
+        base[a + 3] = TValue::number(idx);
+        hotness_on_loop(p);
+      }
+      break;
+    }
+    case OpCode::TFORCALL: {
+      // Lua 5.3: call at R[A+3] so R[A..A+2] (generator/state/control) stay intact.
+      // R[A+3], ... ,R[A+2+C] := R[A](R[A+1], R[A+2])
+      int cb = fbase() + a + 3;
+      L->ensure_stack(cb + 3 + c);
+      TValue f = base[a];
+      th->stack[static_cast<size_t>(cb)] = f;
+      th->stack[static_cast<size_t>(cb + 1)] = base[a + 1];
+      th->stack[static_cast<size_t>(cb + 2)] = base[a + 2];
+      L->current->top = cb + 3;
+      if (!f.is_function())
+        meta_call(L, cb, 2, c);
+      else
+        call_closure(L, f.as_closure(), 2, c);
+      // Results already land at cb == base+a+3; reload only for safety.
+      (void)reload();
+      break;
+    }
+    case OpCode::TFORLOOP: {
+      // Lua 5.3: A is the control-variable register (typically generator_base+2).
+      // if R[A+1] ~= nil then { R[A]=R[A+1]; pc += sBx }
+      if (!base[a + 1].is_nil()) {
+        base[a] = base[a + 1];
+        pc() += op_sbx(ins);
+        hotness_on_loop(p);
+      }
+      break;
+    }
+    case OpCode::SETLIST: {
+      int n = b;
+      if (n == 0)
+        n = L->gettop() - (fbase() + a);
+      int offset = (c - 1) * 50;
+      if (!base[a].is_table())
+        panic("SETLIST on non-table");
+      for (int i = 1; i <= n; ++i)
+        base[a].as_table()->set_int(L, offset + i, base[a + i]);
+      break;
+    }
+    case OpCode::CLOSURE: {
+      unsigned bx = op_bx(ins);
+      if (bx >= p->protos.size())
+        panic("CLOSURE: bad proto index");
+      Proto* np = p->protos[bx];
+      Closure* ncl = closure_new_lua(L, np);
+      for (size_t uv = 0; uv < np->upvalues.size(); ++uv) {
+        auto& d = np->upvalues[uv];
+        if (d.instack)
+          ncl->upvals[uv] = L->find_upval(th, fbase() + d.idx);
+        else {
+          if (d.idx >= cl->upvals.size() || !cl->upvals[d.idx])
+            panic("CLOSURE: bad parent upvalue");
+          ncl->upvals[uv] = cl->upvals[d.idx];
+        }
+      }
+      base = reload();
+      base[a] = TValue::obj(ValueTag::Function, ncl);
+      break;
+    }
+    case OpCode::VARARG: {
+      auto& fr = th->frames[fi];
+      int nwant = (b == 0) ? fr.nvarargs : (b - 1);
+      for (int i = 0; i < nwant; ++i) {
+        if (i < fr.nvarargs)
+          base[a + i] = th->stack[static_cast<size_t>(fr.vararg_base + i)];
+        else
+          base[a + i] = TValue::nil();
+      }
+      if (b == 0)
+        L->current->top = fr.base + a + nwant;
+      break;
+    }
+    case OpCode::CALL: {
+      int nargs = (b == 0) ? (L->gettop() - (fbase() + a) - 1) : (b - 1);
+      if (nargs < 0)
+        nargs = 0;
+      int nret = (c == 0) ? LUA_MULTRET : (c - 1);
+      int call_base = fbase() + a;
+      L->current->top = call_base + 1 + nargs;
+      TValue f = base[a];
+      if (f.is_function()) {
+        if (f.as_closure()->is_c) {
+          int st = run_c_call(L, f.as_closure(), call_base, nargs, nret);
+          if (st == LUA_YIELD)
+            return LUA_YIELD;
+        } else {
+          push_lua_frame(L, f.as_closure(), call_base, nargs, nret);
+        }
+      } else {
+        meta_call(L, call_base, nargs, nret == LUA_MULTRET ? 1 : nret);
+      }
+      break;
+    }
+    case OpCode::TAILCALL: {
+      int nargs = (b == 0) ? (L->gettop() - (fbase() + a) - 1) : (b - 1);
+      if (nargs < 0)
+        nargs = 0;
+      int nresults = th->frames[fi].expected_results;
+      int dest = fbase();
+      TValue f = base[a];
+      for (int i = 0; i <= nargs; ++i)
+        th->stack[static_cast<size_t>(dest + i)] = base[a + i];
+      L->current->top = dest + 1 + nargs;
+      L->close_upvals(th, dest);
+      th->frames.pop_back();
+      if (f.is_function()) {
+        if (f.as_closure()->is_c) {
+          int st = run_c_call(L, f.as_closure(), dest, nargs, nresults);
+          if (st == LUA_YIELD)
+            return LUA_YIELD;
+          if (static_cast<int>(th->frames.size()) < entry_depth)
+            return LUA_OK;
+        } else {
+          push_lua_frame(L, f.as_closure(), dest, nargs, nresults);
+        }
+      } else {
+        meta_call(L, dest, nargs, nresults == LUA_MULTRET ? 1 : nresults);
+        if (static_cast<int>(th->frames.size()) < entry_depth)
+          return LUA_OK;
+      }
+      break;
+    }
+    case OpCode::RETURN: {
+      auto& fr = th->frames[fi];
+      int nret = (b == 0) ? (L->gettop() - (fr.base + a)) : (b - 1);
+      if (nret < 0)
+        nret = 0;
+      L->close_upvals(th, fr.base);
+      int dest = fr.base;
+      int want = fr.expected_results;
+      std::vector<TValue> results(static_cast<size_t>(nret));
+      for (int i = 0; i < nret; ++i)
+        results[static_cast<size_t>(i)] = base[a + i];
+      th->frames.pop_back();
+      if (want == LUA_MULTRET) {
+        for (int i = 0; i < nret; ++i)
+          th->stack[static_cast<size_t>(dest + i)] = results[static_cast<size_t>(i)];
+        L->settop(dest + nret);
+      } else {
+        for (int i = 0; i < want; ++i)
+          th->stack[static_cast<size_t>(dest + i)] =
+              (i < nret) ? results[static_cast<size_t>(i)] : TValue::nil();
+        L->settop(dest + want);
+      }
+      if (static_cast<int>(th->frames.size()) < entry_depth)
+        return LUA_OK;
+      break;
+    }
+    case OpCode::CHECKGC:
+    case OpCode::SAFEPOINT:
+      L->gc.safepoint();
+      break;
+    default:
+      panic(std::string("unimplemented opcode ") + opcode_name(op));
+    }
+  }
+  return LUA_OK;
+}
+
+} // namespace lj3
