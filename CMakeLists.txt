@@ -111,7 +111,11 @@ if(LUATIER_BUILD_TESTS)
     target_link_options(luatier_tests PRIVATE /STACK:8388608)
   endif()
   add_test(NAME luatier_tests COMMAND luatier_tests)
-  add_test(NAME luatier_cli_version COMMAND luatier_cli --version)
+  # PUC-compatible CLI: version is `-v` (not `--version`).
+  add_test(NAME luatier_cli_version COMMAND luatier_cli -v)
+  set_tests_properties(luatier_cli_version PROPERTIES
+    PASS_REGULAR_EXPRESSION "Lua 5\\.3\\.4.*PUC-Rio"
+  )
 endif()
 
 install(TARGETS luatier luatier_cli

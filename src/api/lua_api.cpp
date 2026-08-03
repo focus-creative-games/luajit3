@@ -7,6 +7,7 @@
 #include "vm/state.hpp"
 
 #include <cstdlib>
+#include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -170,17 +171,26 @@ void lua_pushvalue(lua_State* L, int idx) { L->st->push(*L->st->at(idx)); }
 
 void lua_remove(lua_State* L, int idx) {
   idx = L->st->absindex(idx);
-  for (int i = idx; i < L->st->gettop(); ++i)
-    L->st->current->stack[static_cast<size_t>(i - 1)] = *L->st->at(i + 1);
-  L->st->settop(L->st->gettop() - 1);
+  int top = L->st->gettop();
+  int base = L->st->current->stack_base;
+  auto& stack = L->st->current->stack;
+  // Shift [idx+1 .. top] down onto [idx .. top-1] (PUC lua_remove).
+  for (int i = idx; i < top; ++i)
+    stack[static_cast<size_t>(base + i - 1)] = stack[static_cast<size_t>(base + i)];
+  L->st->settop(top - 1);
 }
 
 void lua_insert(lua_State* L, int idx) {
+  // PUC: #define lua_insert(L,idx) lua_rotate(L, (idx), 1)
+  // Rotate [idx .. top] up by one: top moves to idx, rest shift up.
   idx = L->st->absindex(idx);
-  TValue v = *L->st->at(L->st->gettop());
-  for (int i = L->st->gettop(); i > idx; --i)
-    L->st->current->stack[static_cast<size_t>(i)] = *L->st->at(i - 1);
-  L->st->current->stack[static_cast<size_t>(idx - 1)] = v;
+  int top = L->st->gettop();
+  int base = L->st->current->stack_base;
+  auto& stack = L->st->current->stack;
+  TValue v = stack[static_cast<size_t>(base + top - 1)];
+  for (int i = top; i > idx; --i)
+    stack[static_cast<size_t>(base + i - 1)] = stack[static_cast<size_t>(base + i - 2)];
+  stack[static_cast<size_t>(base + idx - 1)] = v;
 }
 
 void lua_pushnil(lua_State* L) { L->st->push(TValue::nil()); }
@@ -281,13 +291,18 @@ size_t lua_rawlen(lua_State* L, int idx) {
 }
 
 int lua_type(lua_State* L, int idx) {
+  // Pseudo-indices (registry / globals) are always tables.
   if (idx == LUA_REGISTRYINDEX)
     return LUA_TTABLE;
   if (idx == LUA_GLOBALSINDEX)
     return LUA_TTABLE;
-  if (idx > L->st->gettop() || idx == 0)
+  // PUC index2addr: invalid / acceptable-but-empty slots → LUA_TNONE (no panic).
+  if (idx == 0)
     return LUA_TNONE;
-  switch (L->st->at(idx)->tag()) {
+  int abs = (idx > 0) ? idx : (L->st->gettop() + idx + 1);
+  if (abs <= 0 || abs > L->st->gettop())
+    return LUA_TNONE;
+  switch (L->st->at(abs)->tag()) {
   case ValueTag::Nil: return LUA_TNIL;
   case ValueTag::Bool: return LUA_TBOOLEAN;
   case ValueTag::Int:
@@ -319,4 +334,15 @@ const char* lua_typename(lua_State*, int tp) {
 int lua_error(lua_State* L) {
   const char* msg = lua_tostring(L, -1);
   panic(msg ? msg : "lua error");
+}
+
+void luaL_checktype(lua_State* L, int arg, int t) {
+  if (lua_type(L, arg) != t) {
+    // Match PUC tagerror / luaL_argerror message shape (simplified, no arg index).
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "%s expected, got %s", lua_typename(L, t),
+                  lua_typename(L, lua_type(L, arg)));
+    lua_pushstring(L, buf);
+    lua_error(L);
+  }
 }

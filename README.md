@@ -15,7 +15,7 @@ ctest --test-dir build --output-on-failure
 ## Run
 
 ```bash
-./build/luatier --version
+./build/luatier -v
 ./build/luatier -e "print(1+2)"
 ```
 

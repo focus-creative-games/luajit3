@@ -25,7 +25,7 @@ void lua_rawseti(lua_State* L, int idx, long long n);
 #define luaL_optstring(L, n, d) (lua_type(L, n) == LUA_TSTRING ? lua_tostring(L, n) : (d))
 #define luaL_checkinteger(L, n) lua_tointeger(L, n)
 #define luaL_checknumber(L, n) lua_tonumber(L, n)
-#define luaL_checktype(L, n, t) ((void)((lua_type(L, n) == (t)) ? 0 : 0))
+void luaL_checktype(lua_State* L, int arg, int t);
 #define luaL_error(L, fmt) (lua_pushstring(L, fmt), lua_error(L))
 int lua_error(lua_State* L);
 
