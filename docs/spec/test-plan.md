@@ -18,7 +18,7 @@
 ### B. Conformance (Phase 1 hard gate)
 
 - Vendor: `tests/lua-5.3.4-tests/` (sha256 `b80771238271c72565e5a1183292ef31bd7166414cd0d43a8eb79845fa7f599f`)
-- **Gate:** `luajit3 -e"_U=true" all.lua` prints `final OK`
+- **Gate:** `luatier -e"_U=true" all.lua` prints `final OK`
 - Track per-file pass rate in [puc53-status.md](puc53-status.md)
 - Scripts: `scripts/run_puc_tests.sh`, `scripts/run_puc_tests.ps1`
 - After basic gate: chase complete suite (no `_U`) with `package.loadlib` + suite `libs/`
@@ -28,7 +28,7 @@
 Run the same chunk under:
 
 1. reference Lua (PUC-Rio)
-2. LuaJIT3 interpreter
+2. LuaTier interpreter
 3. baseline JIT (Phase 2+)
 4. optimizing JIT (Phase 3+)
 
@@ -51,11 +51,11 @@ Targets:
 
 | Env / flag | Effect |
 |------------|--------|
-| `LJ3_STRESS_GC_EVERY_SAFEPOINT` | GC at every safepoint |
-| `LJ3_STRESS_FORCE_DEOPT` | frequent deopt (Phase 2+) |
-| `LJ3_STRESS_DISABLE_IC` | random/generic IC path |
-| `LJ3_STRESS_TIER_THRASH` | aggressive tier up/down |
-| `LJ3_STRESS_POISON_ALLOC` | allocator poison in Debug |
+| `LUATIER_STRESS_GC_EVERY_SAFEPOINT` | GC at every safepoint |
+| `LUATIER_STRESS_FORCE_DEOPT` | frequent deopt (Phase 2+) |
+| `LUATIER_STRESS_DISABLE_IC` | random/generic IC path |
+| `LUATIER_STRESS_TIER_THRASH` | aggressive tier up/down |
+| `LUATIER_STRESS_POISON_ALLOC` | allocator poison in Debug |
 
 ## Benchmarks (post Phase 1)
 

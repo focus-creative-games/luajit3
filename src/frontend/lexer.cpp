@@ -7,7 +7,7 @@
 #include <string>
 #include <unordered_map>
 
-namespace lj3 {
+namespace luatier {
 
 // Source numerals always use '.'; strtod would honor LC_NUMERIC otherwise.
 static double c_strtod(const char* s, char** end) {
@@ -542,4 +542,4 @@ Token Lexer::lex_one() {
   return t;
 }
 
-} // namespace lj3
+} // namespace luatier

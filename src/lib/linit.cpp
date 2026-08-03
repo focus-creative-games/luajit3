@@ -2,7 +2,7 @@
 
 #include "runtime/value.hpp"
 
-namespace lj3 {
+namespace luatier {
 
 static void mark_loaded_global(State* L, const char* name) {
   TValue v = L->globals->get(TValue::obj(ValueTag::String, L->intern(name)));
@@ -38,4 +38,4 @@ void open_libs(State* L) {
   L->gc.set_running(was_running);
 }
 
-} // namespace lj3
+} // namespace luatier

@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-namespace lj3 {
+namespace luatier {
 
 enum class AstKind {
   Chunk,
@@ -253,4 +253,4 @@ struct LocalFunction final : AstNode {
   LocalFunction() { kind = AstKind::LocalFunction; }
 };
 
-} // namespace lj3
+} // namespace luatier

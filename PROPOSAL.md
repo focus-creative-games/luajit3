@@ -1,14 +1,14 @@
-# New LuaJIT Architecture Proposal v0.1
+# LuaTier Architecture Proposal v0.1
 
 **Status:** Draft  
 **Audience:** Language runtime architects, compiler engineers, GC/runtime engineers, tooling engineers, performance engineers  
-**Scope:** A new-from-scratch LuaJIT implementation targeting **Lua 5.3.0 and later** language semantics, with no code or design dependency on existing LuaJIT implementations.
+**Scope:** A new-from-scratch **LuaTier** (`luatier`) implementation targeting **Lua 5.3.0 and later** language semantics, with no code or design dependency on existing LuaJIT implementations.
 
 ---
 
 # 1. Executive Summary
 
-This document proposes the architecture for a new Just-In-Time compiled Lua runtime, hereafter **New LuaJIT**, designed from first principles to support **Lua 5.3.0+** semantics while achieving high performance, strong correctness guarantees, and long-term maintainability.
+This document proposes the architecture for a new Just-In-Time compiled Lua runtime, hereafter **LuaTier**, designed from first principles to support **Lua 5.3.0+** semantics while achieving high performance, strong correctness guarantees, and long-term maintainability.
 
 The design explicitly avoids inheriting historical constraints from prior LuaJIT implementations. Instead, it adopts a modern, layered execution architecture built around:
 
@@ -28,7 +28,7 @@ The proposal prioritizes **semantic fidelity first**, **performance second**, an
 
 ## 2.1 Goals
 
-New LuaJIT shall:
+LuaTier shall:
 
 1. **Implement Lua 5.3.0+ language semantics**
    - Target language behavior aligned with official Lua releases at or above 5.3.0.
@@ -57,7 +57,7 @@ New LuaJIT shall:
 
 ## 2.2 Non-Goals
 
-New LuaJIT does **not** initially aim to:
+LuaTier does **not** initially aim to:
 
 1. Be a drop-in ABI-compatible replacement for existing LuaJIT.
 2. Reuse old trace compiler architecture.
@@ -112,7 +112,7 @@ Deliver cold correctness first, then warm performance, then hot optimization, th
 Compatibility is divided into three separate commitments:
 
 ### A. Language Compatibility
-Highest priority. New LuaJIT shall aim to match Lua 5.3.0+ language semantics.
+Highest priority. LuaTier shall aim to match Lua 5.3.0+ language semantics.
 
 ### B. C API Semantic Compatibility
 Important but secondary. The runtime should support the official Lua C API behavior as closely as practical.
@@ -472,7 +472,7 @@ Tables are the most performance-critical runtime structure.
 - support for weak semantics.
 
 ### Table Shape / Version Metadata
-New LuaJIT introduces shape-like metadata to aid optimization without turning tables into JS-style objects.
+LuaTier introduces shape-like metadata to aid optimization without turning tables into JS-style objects.
 
 Possible metadata:
 - metatable pointer/version,
@@ -641,7 +641,7 @@ Interpreter mode should expose:
 
 ## 12.1 Tiering Overview
 
-New LuaJIT uses multiple execution tiers:
+LuaTier uses multiple execution tiers:
 
 1. Interpreter
 2. Baseline JIT
@@ -720,7 +720,7 @@ Any speculation may be invalidated by:
 
 ## 14.1 Tiered JIT Structure
 
-New LuaJIT shall implement:
+LuaTier shall implement:
 - **Baseline JIT** for fast compilation and moderate speedup,
 - **Optimizing JIT** for hot stable code.
 
@@ -1124,7 +1124,7 @@ Each target backend must implement:
 
 ## 23.1 Compatibility Position
 
-New LuaJIT should provide a Lua-compatible embedding API where practical, but not promise ABI compatibility with existing implementations.
+LuaTier should provide a Lua-compatible embedding API where practical, but not promise ABI compatibility with existing implementations.
 
 ## 23.2 API Layers
 
@@ -1231,9 +1231,9 @@ Against official Lua test suites and language behavior references.
 ### B. Differential Testing
 Execute the same programs under:
 - official Lua,
-- New LuaJIT interpreter,
-- New LuaJIT baseline JIT,
-- New LuaJIT optimizing JIT.
+- LuaTier interpreter,
+- LuaTier baseline JIT,
+- LuaTier optimizing JIT.
 
 Compare:
 - outputs,
@@ -1485,7 +1485,7 @@ For clarity, v0.1 recommends the following concrete initial defaults:
 
 # 33. Conclusion
 
-New LuaJIT should be built as a modern language runtime platform rather than a narrowly optimized benchmark engine. The recommended architecture emphasizes:
+LuaTier should be built as a modern language runtime platform rather than a narrowly optimized benchmark engine. The recommended architecture emphasizes:
 
 - faithful Lua semantics,
 - strong interpreter foundation,
@@ -1500,12 +1500,12 @@ This architecture is designed to support both near-term delivery and long-term e
 
 如果你愿意，我下一步可以继续补下面这些配套文档之一：
 
-1. **《New LuaJIT Bytecode Specification v0.1》**
-2. **《New LuaJIT IR Design: HIR / MIR / LIR v0.1》**
-3. **《New LuaJIT GC & Memory Management Design v0.1》**
-4. **《New LuaJIT Table/Object Model Design v0.1》**
-5. **《New LuaJIT Deoptimization & Safepoint Design v0.1》**
-6. **《New LuaJIT 12-Month Execution Plan》**
-7. **《New LuaJIT Risk Register and Technical Milestones》**
+1. **《LuaTier Bytecode Specification v0.1》**
+2. **《LuaTier IR Design: HIR / MIR / LIR v0.1》**
+3. **《LuaTier GC & Memory Management Design v0.1》**
+4. **《LuaTier Table/Object Model Design v0.1》**
+5. **《LuaTier Deoptimization & Safepoint Design v0.1》**
+6. **《LuaTier 12-Month Execution Plan》**
+7. **《LuaTier Risk Register and Technical Milestones》**
 
 如果你要，我建议下一份先写 **Bytecode Specification**，因为它会把前端、解释器、JIT、deopt 的接口统一下来。

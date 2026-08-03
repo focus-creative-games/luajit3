@@ -2,7 +2,7 @@
 
 #include <iostream>
 
-namespace lj3 {
+namespace luatier {
 
 RuntimeProfile& runtime_profile() {
   static RuntimeProfile p;
@@ -11,9 +11,9 @@ RuntimeProfile& runtime_profile() {
 
 void profile_dump_stderr() {
   auto& p = runtime_profile();
-  std::cerr << "[lj3 profile] opcodes=" << p.opcodes << " calls=" << p.calls
+  std::cerr << "[luatier profile] opcodes=" << p.opcodes << " calls=" << p.calls
             << " allocs=" << p.allocations << " gc_steps=" << p.gc_steps
             << " deopts=" << p.deopts << "\n";
 }
 
-} // namespace lj3
+} // namespace luatier

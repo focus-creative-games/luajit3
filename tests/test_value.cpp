@@ -4,7 +4,7 @@
 
 #include <iostream>
 
-using namespace lj3;
+using namespace luatier;
 
 int test_value() {
   int f = 0;
@@ -29,7 +29,7 @@ int test_value() {
     std::cerr << "value FAIL: table float index\n";
     f = 1;
   }
-  f += lj3test::expect_num("value", "local t={0,2}; return rawget(t,1.0)", 0);
-  f += lj3test::expect_num("value", "local t={0,2}; for i=1,2 do return t[i] end", 0);
+  f += luatiertest::expect_num("value", "local t={0,2}; return rawget(t,1.0)", 0);
+  f += luatiertest::expect_num("value", "local t={0,2}; for i=1,2 do return t[i] end", 0);
   return f;
 }

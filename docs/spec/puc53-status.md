@@ -2,7 +2,7 @@
 
 **Suite:** `tests/lua-5.3.4-tests/`  
 **Tarball sha256:** `b80771238271c72565e5a1183292ef31bd7166414cd0c43a8eb79845fa7f599f`  
-**Hard gate:** `luajit3 -e "_U=true" all.lua` → `final OK`
+**Hard gate:** `luatier -e "_U=true" all.lua` → `final OK`
 
 | File | Basic `_U` | Notes |
 |------|------------|-------|
@@ -53,7 +53,7 @@
 
 ### Tooling
 - Vendor suite under `tests/lua-5.3.4-tests/`; `scripts/run_puc_tests.{ps1,sh}`.
-- MSBuild may leave a stale `luajit3.exe`; delete and rebuild `luajit3_cli` if behavior looks old.
+- MSBuild may leave a stale `luatier.exe`; delete and rebuild `luatier_cli` if behavior looks old.
 
 ## Known issues
 

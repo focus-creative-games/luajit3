@@ -116,6 +116,6 @@ Status legend: **Done** | **GAP** (documented latitude / out of Phase-1 scope) |
 ## How to run
 
 ```bat
-cmake --build build --config Debug --target lj3_tests
-build\Debug\lj3_tests.exe
+cmake --build build --config Debug --target luatier_tests
+build\Debug\luatier_tests.exe
 ```

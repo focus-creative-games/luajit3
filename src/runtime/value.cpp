@@ -13,7 +13,7 @@
 #include <sstream>
 #include <string>
 
-namespace lj3 {
+namespace luatier {
 
 static bool is_nan_or_inf_token(const std::string& s) {
   size_t i = 0;
@@ -234,4 +234,4 @@ std::string value_to_string(const TValue& v) {
   }
 }
 
-} // namespace lj3
+} // namespace luatier

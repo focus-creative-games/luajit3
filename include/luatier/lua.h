@@ -11,7 +11,7 @@ extern "C" {
 #define LUA_VERSION_RELEASE "4"
 #define LUA_VERSION_NUM 503
 #define LUA_VERSION "Lua 5.3"
-#define LJ3_VERSION "0.1.0"
+#define LUATIER_VERSION "0.1.0"
 
 #define LUA_MULTRET (-1)
 #define LUA_OK 0

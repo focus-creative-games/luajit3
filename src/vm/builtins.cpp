@@ -2,8 +2,8 @@
 
 #include "lib/libs.hpp"
 
-namespace lj3 {
+namespace luatier {
 
 void open_base(State* L) { open_libs(L); }
 
-} // namespace lj3
+} // namespace luatier

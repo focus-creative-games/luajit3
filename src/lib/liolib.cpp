@@ -6,7 +6,7 @@
 #include <cstdio>
 #include <cstring>
 
-namespace lj3 {
+namespace luatier {
 using namespace lib;
 
 struct LFile {
@@ -15,7 +15,7 @@ struct LFile {
   bool is_std = false;
 };
 
-static const char* kFileMeta = "LJ3_FILE*";
+static const char* kFileMeta = "LUATIER_FILE*";
 
 static Table* file_metatable(State* L) {
   TValue mt = L->registry->get(TValue::obj(ValueTag::String, L->intern(kFileMeta)));
@@ -231,4 +231,4 @@ void open_io_lib(State* L) {
   set_global_value(L, "io", TValue::obj(ValueTag::Table, io));
 }
 
-} // namespace lj3
+} // namespace luatier

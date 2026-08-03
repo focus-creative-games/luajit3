@@ -81,7 +81,7 @@ GC work is polled at:
 - call boundaries
 - JIT safepoint polls
 
-Stress mode: `LJ3_STRESS_GC_EVERY_SAFEPOINT=1` forces a full incremental step (or full collect in debug) at every safepoint.
+Stress mode: `LUATIER_STRESS_GC_EVERY_SAFEPOINT=1` forces a full incremental step (or full collect in debug) at every safepoint.
 
 ## Precision
 

@@ -1,6 +1,6 @@
 #include "vm/bytecode.hpp"
 
-namespace lj3 {
+namespace luatier {
 
 const char* opcode_name(OpCode op) {
   switch (op) {
@@ -57,4 +57,4 @@ std::string disassemble_ins(Instruction i) {
          std::to_string(op_b(i)) + " " + std::to_string(op_c(i));
 }
 
-} // namespace lj3
+} // namespace luatier

@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <string>
 
-namespace lj3 {
+namespace luatier {
 
 using Instruction = uint32_t;
 
@@ -98,4 +98,4 @@ struct UpvalDesc {
 const char* opcode_name(OpCode op);
 std::string disassemble_ins(Instruction i);
 
-} // namespace lj3
+} // namespace luatier

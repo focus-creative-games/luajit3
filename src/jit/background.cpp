@@ -1,8 +1,8 @@
 #include "jit/background.hpp"
 
-namespace lj3 {
+namespace luatier {
 
 void jit_background_enqueue(void*) {}
 void jit_background_shutdown() {}
 
-} // namespace lj3
+} // namespace luatier

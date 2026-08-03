@@ -2,7 +2,7 @@
 
 #include <iostream>
 
-using namespace lj3;
+using namespace luatier;
 
 static int expect(bool cond, const char* msg) {
   if (!cond) {

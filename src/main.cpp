@@ -1,5 +1,5 @@
-#include "luajit3/lua.h"
-#include "luajit3/lauxlib.h"
+#include "luatier/lua.h"
+#include "luatier/lauxlib.h"
 
 #include "frontend/lowering.hpp"
 #include "frontend/parser.hpp"
@@ -18,9 +18,9 @@
 #endif
 
 static void usage() {
-  std::cout << "luajit3 " << LJ3_VERSION << " — Lua 5.3+ runtime (from-scratch)\n"
+  std::cout << "luatier " << LUATIER_VERSION << " — Lua 5.3+ runtime (from-scratch)\n"
             << "Usage:\n"
-            << "  luajit3 [options] [script [args]]\n"
+            << "  luatier [options] [script [args]]\n"
             << "Options:\n"
             << "  -e <chunk>   execute string (repeatable)\n"
             << "  -l <mod>     require library\n"
@@ -100,7 +100,7 @@ int main(int argc, char** argv) {
       break;
     }
     if (a == "--version" || a == "-v") {
-      std::cout << "LuaJIT3 " << LJ3_VERSION << " (" << LUA_VERSION << "."
+      std::cout << "LuaTier " << LUATIER_VERSION << " (" << LUA_VERSION << "."
                 << LUA_VERSION_RELEASE << ")\n";
       return 0;
     }
@@ -169,11 +169,11 @@ int main(int argc, char** argv) {
     } else {
       if (dump_bc) {
         try {
-          auto st2 = lj3::new_state();
-          auto chunk = lj3::parse(op.second, "=(command line)");
-          lj3::sema_analyze(*chunk);
-          auto* p = lj3::lower_chunk(st2.get(), *chunk, "=(command line)");
-          lj3::dump_proto_to_stderr(p);
+          auto st2 = luatier::new_state();
+          auto chunk = luatier::parse(op.second, "=(command line)");
+          luatier::sema_analyze(*chunk);
+          auto* p = luatier::lower_chunk(st2.get(), *chunk, "=(command line)");
+          luatier::dump_proto_to_stderr(p);
         } catch (const std::exception& e) {
           std::cerr << "dump failed: " << e.what() << "\n";
         }
@@ -192,11 +192,11 @@ int main(int argc, char** argv) {
         std::ifstream in(argv[script]);
         std::ostringstream ss;
         ss << in.rdbuf();
-        auto st2 = lj3::new_state();
-        auto chunk = lj3::parse(ss.str(), argv[script]);
-        lj3::sema_analyze(*chunk);
-        auto* p = lj3::lower_chunk(st2.get(), *chunk, argv[script]);
-        lj3::dump_proto_to_stderr(p);
+        auto st2 = luatier::new_state();
+        auto chunk = luatier::parse(ss.str(), argv[script]);
+        luatier::sema_analyze(*chunk);
+        auto* p = luatier::lower_chunk(st2.get(), *chunk, argv[script]);
+        luatier::dump_proto_to_stderr(p);
       } catch (const std::exception& e) {
         std::cerr << "dump failed: " << e.what() << "\n";
       }

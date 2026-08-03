@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace lj3 {
+namespace luatier {
 
 struct RuntimeProfile {
   uint64_t opcodes = 0;
@@ -15,4 +15,4 @@ struct RuntimeProfile {
 RuntimeProfile& runtime_profile();
 void profile_dump_stderr();
 
-} // namespace lj3
+} // namespace luatier

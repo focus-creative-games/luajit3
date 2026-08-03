@@ -7,7 +7,7 @@
 #include <algorithm>
 #include <vector>
 
-namespace lj3 {
+namespace luatier {
 using namespace lib;
 
 static int64_t aux_getn(State* L, const TValue& t) {
@@ -63,9 +63,11 @@ static int tab_concat(State* L) {
   TValue t = *L->at(1);
   if (!t.is_table())
     panic("table expected");
-  std::string sep = L->gettop() >= 2 ? std::string(check_string(L, 2)->view()) : "";
-  int64_t i = L->gettop() >= 3 ? check_int(L, 3) : 1;
-  int64_t last = L->gettop() >= 4 ? check_int(L, 4) : aux_getn(L, t);
+  std::string sep = (L->gettop() >= 2 && !L->at(2)->is_nil())
+                        ? std::string(check_string(L, 2)->view())
+                        : "";
+  int64_t i = opt_int(L, 3, 1);
+  int64_t last = opt_int(L, 4, aux_getn(L, t));
   std::string out;
   for (; i < last; ++i) {
     concat_addfield(L, t, i, out);
@@ -160,9 +162,11 @@ static int tab_unpack(State* L) {
   TValue t = *L->at(1);
   if (!t.is_table())
     panic("table expected");
-  int64_t i = L->gettop() >= 2 ? check_int(L, 2) : 1;
-  int64_t j = L->gettop() >= 3 ? check_int(L, 3) : aux_getn(L, t);
+  int64_t i = opt_int(L, 2, 1);
+  int64_t j = opt_int(L, 3, aux_getn(L, t));
   L->settop(0);
+  if (j < i)
+    return 0;
   for (int64_t k = i; k <= j; ++k)
     L->push(geti(L, t, k));
   return static_cast<int>(j - i + 1);
@@ -218,4 +222,4 @@ void open_table_lib(State* L) {
   set_global_value(L, "table", TValue::obj(ValueTag::Table, tab));
 }
 
-} // namespace lj3
+} // namespace luatier

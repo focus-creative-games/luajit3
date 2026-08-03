@@ -4,7 +4,7 @@
 
 #include <algorithm>
 
-namespace lj3 {
+namespace luatier {
 
 void debug_sethook_thread(Thread* th, Closure* f, int mask, int count) {
   th->hook.func = f;
@@ -129,4 +129,4 @@ void debug_on_return(State* L, Thread* th) {
     th->hook.oldpc = 0;
 }
 
-} // namespace lj3
+} // namespace luatier

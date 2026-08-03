@@ -13,10 +13,10 @@
 #include <cstring>
 #include <algorithm>
 
-namespace lj3 {
+namespace luatier {
 
 GC::GC(State* L) : L_(L) {
-  const char* stress = std::getenv("LJ3_STRESS_GC_EVERY_SAFEPOINT");
+  const char* stress = std::getenv("LUATIER_STRESS_GC_EVERY_SAFEPOINT");
   stress_every_safepoint = stress && stress[0] == '1';
 }
 
@@ -194,6 +194,9 @@ void GC::propagate_one() {
   }
   case GcKind::Proto: {
     auto* p = static_cast<Proto*>(o);
+    // PUC traverseproto: a white cache must not keep the closure alive.
+    if (p->cache && p->cache->mark == white_)
+      p->cache = nullptr;
     for (auto& k : p->constants)
       mark_value(k);
     for (auto* ch : p->protos)
@@ -211,6 +214,9 @@ void GC::propagate_one() {
   case GcKind::UpVal: {
     auto* uv = static_cast<UpVal*>(o);
     mark_value(uv->get());
+    // Open upvalues pin their thread (PUC traverseuv).
+    if (uv->open && uv->thread)
+      mark_object(uv->thread);
     break;
   }
   case GcKind::Thread: {
@@ -371,7 +377,7 @@ void GC::run_finalizers() {
         if (marked_fin && !th->frames.empty())
           th->frames.back().finalizer = false;
         L_->set_abs_top(saved_top);
-      } catch (const Lj3Error& e) {
+      } catch (const LuatierError& e) {
         if (L_->current)
           L_->set_abs_top(thread_live_top(L_->current));
         if (first_error.empty()) {
@@ -563,4 +569,4 @@ void GC::safepoint() {
 void GC::set_running(bool running) { gc_isrunning_ = running; }
 bool GC::is_running() const { return gc_isrunning_; }
 
-} // namespace lj3
+} // namespace luatier

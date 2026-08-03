@@ -5,7 +5,7 @@
 #include <cmath>
 #include <cstring>
 
-namespace lj3 {
+namespace luatier {
 
 enum class ValueTag : uint32_t {
   Nil = 0,
@@ -105,4 +105,4 @@ std::string value_to_string(const TValue& v);
 // Parse strings the same way as tonumber; returns false for non-number strings.
 bool try_to_number(const TValue& v, TValue* out);
 
-} // namespace lj3
+} // namespace luatier

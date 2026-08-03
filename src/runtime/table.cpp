@@ -6,7 +6,7 @@
 #include <cmath>
 #include <cstdint>
 
-namespace lj3 {
+namespace luatier {
 
 static bool is_gc_key(const TValue& k) {
   switch (k.tag()) {
@@ -247,4 +247,4 @@ void Table::set(State* L, const TValue& key, const TValue& value) {
   set(L, key, value);
 }
 
-} // namespace lj3
+} // namespace luatier

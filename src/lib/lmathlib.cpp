@@ -8,7 +8,7 @@
 #include <limits>
 #include <random>
 
-namespace lj3 {
+namespace luatier {
 using namespace lib;
 
 static std::mt19937& rng() {
@@ -302,4 +302,4 @@ void open_math_lib(State* L) {
   set_global_value(L, "math", TValue::obj(ValueTag::Table, m));
 }
 
-} // namespace lj3
+} // namespace luatier

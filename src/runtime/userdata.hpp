@@ -5,7 +5,7 @@
 
 #include <vector>
 
-namespace lj3 {
+namespace luatier {
 
 struct State;
 struct Table;
@@ -19,4 +19,4 @@ Userdata* userdata_new(State* L, size_t size, Table* mt = nullptr);
 void* userdata_data(Userdata* u);
 const void* userdata_data(const Userdata* u);
 
-} // namespace lj3
+} // namespace luatier

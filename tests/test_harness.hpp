@@ -1,12 +1,12 @@
 #pragma once
 
-#include "luajit3/lua.h"
+#include "luatier/lua.h"
 
 #include <cmath>
 #include <iostream>
 #include <string>
 
-namespace lj3test {
+namespace luatiertest {
 
 inline int fail(const char* group, const std::string& msg) {
   std::cerr << group << " FAIL: " << msg << "\n";
@@ -97,4 +97,4 @@ inline int expect_error(const char* group, const char* src) {
   return 0;
 }
 
-} // namespace lj3test
+} // namespace luatiertest

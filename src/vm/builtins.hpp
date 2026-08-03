@@ -2,9 +2,9 @@
 
 #include "vm/state.hpp"
 
-namespace lj3 {
+namespace luatier {
 
 void open_libs(State* L);
 void open_base(State* L);
 
-} // namespace lj3
+} // namespace luatier

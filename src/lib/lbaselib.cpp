@@ -28,7 +28,7 @@
 #define LUA_ERRSYNTAX 3
 #endif
 
-namespace lj3 {
+namespace luatier {
 using namespace lib;
 
 static Closure* bind_env_closure(State* L, Proto* p, const TValue* env) {
@@ -90,7 +90,7 @@ static std::string read_via_function(State* L, Closure* reader) {
     th->top = call_base + 1;
     try {
       call_closure(L, reader, 0, 1);
-    } catch (const Lj3Error&) {
+    } catch (const LuatierError&) {
       while (static_cast<int>(th->frames.size()) > protect_frames) {
         L->close_upvals(th, th->frames.back().base);
         th->frames.pop_back();
@@ -173,8 +173,18 @@ static int base_type(State* L) {
 }
 
 static int base_error(State* L) {
-  std::string msg = L->gettop() >= 1 ? value_to_string(*L->at(1)) : "error";
-  panic(msg);
+  TValue obj = L->gettop() >= 1 ? *L->at(1) : TValue::obj(ValueTag::String, L->intern("error"));
+  L->current->err_obj = obj;
+  L->current->err_obj_set = true;
+  panic(value_to_string(obj));
+}
+
+static TValue take_error_object(State* L, const char* fallback) {
+  if (L->current->err_obj_set) {
+    L->current->err_obj_set = false;
+    return L->current->err_obj;
+  }
+  return TValue::obj(ValueTag::String, L->intern(fallback ? fallback : ""));
 }
 
 static int base_assert(State* L) {
@@ -248,6 +258,16 @@ static int base_select(State* L) {
   return n;
 }
 
+static int propagate_yieldable(State* L, CallFrame::ContKind kind, TValue ctx, int res_base) {
+  L->yield_pending = true;
+  L->yield_continue = true;
+  L->yield_cont_kind = kind;
+  L->yield_cont_ctx = ctx;
+  L->yield_cont_res_base = res_base;
+  // run_c_call will keep this frame; return values are unused when continuing.
+  return 0;
+}
+
 static int base_pcall(State* L) {
   if (L->gettop() < 1)
     panic("bad argument to pcall");
@@ -264,7 +284,20 @@ static int base_pcall(State* L) {
       L->push(a);
     if (!f.is_function())
       panic("attempt to call a non-function value");
-    call_closure(L, f.as_closure(), nargs, LUA_MULTRET);
+    // Absolute index of the protected function slot (C window at(1)).
+    const int res_base = L->current->stack_base;
+    // pcall is yieldable: drop our nny for the protected body (PUC lua_pcallk).
+    L->current->nny--;
+    int st = LUA_OK;
+    try {
+      st = call_closure(L, f.as_closure(), nargs, LUA_MULTRET);
+    } catch (...) {
+      L->current->nny++;
+      throw;
+    }
+    if (st == LUA_YIELD)
+      return propagate_yieldable(L, CallFrame::ContKind::PCall, TValue::nil(), res_base);
+    L->current->nny++;
     int nret = L->gettop();
     std::vector<TValue> results(static_cast<size_t>(nret));
     for (int i = 0; i < nret; ++i)
@@ -274,14 +307,15 @@ static int base_pcall(State* L) {
     for (auto& r : results)
       L->push(r);
     return 1 + nret;
-  } catch (const Lj3Error& e) {
+  } catch (const LuatierError& e) {
     while (static_cast<int>(L->current->frames.size()) > protect_frames) {
       L->close_upvals(L->current, L->current->frames.back().base);
       L->current->frames.pop_back();
     }
+    TValue emsg = take_error_object(L, e.what());
     L->settop(0);
     L->push(TValue::boolean(false));
-    push_string(L, e.what());
+    L->push(emsg);
     return 2;
   }
 }
@@ -291,13 +325,31 @@ static int base_xpcall(State* L) {
     panic("bad argument to xpcall");
   TValue f = *L->at(1);
   TValue msgh = *L->at(2);
+  // Lua 5.2+: xpcall(f, msgh, ...) passes extra args to f.
+  int nargs = L->gettop() - 2;
+  std::vector<TValue> args(static_cast<size_t>(nargs));
+  for (int i = 0; i < nargs; ++i)
+    args[static_cast<size_t>(i)] = *L->at(3 + i);
   const int protect_frames = static_cast<int>(L->current->frames.size());
   try {
     L->settop(0);
     L->push(f);
+    for (auto& a : args)
+      L->push(a);
     if (!f.is_function())
       panic("attempt to call a non-function value");
-    call_closure(L, f.as_closure(), 0, LUA_MULTRET);
+    const int res_base = L->current->stack_base;
+    L->current->nny--;
+    int st = LUA_OK;
+    try {
+      st = call_closure(L, f.as_closure(), nargs, LUA_MULTRET);
+    } catch (...) {
+      L->current->nny++;
+      throw;
+    }
+    if (st == LUA_YIELD)
+      return propagate_yieldable(L, CallFrame::ContKind::XPCall, msgh, res_base);
+    L->current->nny++;
     int nret = L->gettop();
     std::vector<TValue> results(static_cast<size_t>(nret));
     for (int i = 0; i < nret; ++i)
@@ -307,18 +359,21 @@ static int base_xpcall(State* L) {
     for (auto& r : results)
       L->push(r);
     return 1 + nret;
-  } catch (const Lj3Error& e) {
+  } catch (const LuatierError& e) {
     while (static_cast<int>(L->current->frames.size()) > protect_frames) {
       L->close_upvals(L->current, L->current->frames.back().base);
       L->current->frames.pop_back();
     }
-    std::string emsg = e.what();
+    TValue emsg = take_error_object(L, e.what());
     L->settop(0);
     if (msgh.is_function()) {
       try {
         L->push(msgh);
-        push_string(L, emsg);
-        call_closure(L, msgh.as_closure(), 1, 1);
+        L->push(emsg);
+        int st = call_closure(L, msgh.as_closure(), 1, 1);
+        if (st == LUA_YIELD)
+          return propagate_yieldable(L, CallFrame::ContKind::XPCall, msgh,
+                                     L->current->stack_base);
         TValue m = L->gettop() >= 1 ? *L->at(1) : TValue::nil();
         L->settop(0);
         L->push(TValue::boolean(false));
@@ -333,7 +388,7 @@ static int base_xpcall(State* L) {
       }
     }
     L->push(TValue::boolean(false));
-    push_string(L, emsg);
+    L->push(emsg);
     return 2;
   }
 }
@@ -567,7 +622,7 @@ static int base_load(State* L) {
     }
     try {
       source = read_via_function(L, reader);
-    } catch (const Lj3Error& e) {
+    } catch (const LuatierError& e) {
       L->settop(0);
       L->push(TValue::nil());
       push_string(L, e.what());
@@ -601,7 +656,7 @@ static int base_load(State* L) {
       return 2;
     }
     return 1;
-  } catch (const Lj3Error& e) {
+  } catch (const LuatierError& e) {
     L->settop(0);
     L->push(TValue::nil());
     push_string(L, e.what());
@@ -646,7 +701,7 @@ static int base_loadfile(State* L) {
       return 2;
     }
     return 1;
-  } catch (const Lj3Error& e) {
+  } catch (const LuatierError& e) {
     L->settop(0);
     L->push(TValue::nil());
     push_string(L, e.what());
@@ -792,4 +847,4 @@ void open_base_lib(State* L) {
   set_global_value(L, "_VERSION", TValue::obj(ValueTag::String, L->intern("Lua 5.3")));
 }
 
-} // namespace lj3
+} // namespace luatier

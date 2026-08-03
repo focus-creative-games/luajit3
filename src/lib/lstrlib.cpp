@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-namespace lj3 {
+namespace luatier {
 using namespace lib;
 
 static int str_len(State* L) {
@@ -440,12 +440,27 @@ static int str_dump(State* L) {
 static constexpr size_t kCapUnfinished = static_cast<size_t>(-1);
 static constexpr size_t kCapPosition = static_cast<size_t>(-2);
 
+// PUC MAXCCALLS: recursion budget for match(); prevents C-stack overflow.
+constexpr int kMaxMatchDepth = 200;
+
 struct MatchState {
   std::string_view s;
   std::string_view p;
   size_t match_start = 0;
   size_t match_end = 0;
+  int matchdepth = kMaxMatchDepth;
   std::vector<std::pair<size_t, size_t>> captures;
+};
+
+struct MatchDepthGuard {
+  MatchState& ms;
+  explicit MatchDepthGuard(MatchState& m) : ms(m) {
+    if (ms.matchdepth-- == 0)
+      panic("pattern too complex");
+  }
+  ~MatchDepthGuard() { ++ms.matchdepth; }
+  MatchDepthGuard(const MatchDepthGuard&) = delete;
+  MatchDepthGuard& operator=(const MatchDepthGuard&) = delete;
 };
 
 static bool match_class(char ch, char clas) {
@@ -467,7 +482,44 @@ static bool match_class(char ch, char clas) {
   return std::islower(static_cast<unsigned char>(clas)) ? res : !res;
 }
 
-// Advance past one pattern item; returns whether char `c` matches. `pi` is the
+// Bracket class at `pi` (`[` ...); sets *out_ep to index after `]`.
+// `c` may be the virtual '\0' used at string frontiers (PUC src_init/src_end).
+static bool match_bracket_class(MatchState& ms, char c, size_t pi, size_t* out_ep) {
+  if (pi >= ms.p.size() || ms.p[pi] != '[')
+    return false;
+  size_t j = pi + 1;
+  bool negate = j < ms.p.size() && ms.p[j] == '^';
+  if (negate)
+    ++j;
+  // PUC: first ']' after '[' / '[^' is a literal member, not the closer.
+  bool found = false;
+  size_t k = j;
+  do {
+    if (k >= ms.p.size())
+      return false;
+    if (ms.p[k] == '%' && k + 1 < ms.p.size()) {
+      if (match_class(c, ms.p[k + 1]))
+        found = true;
+      k += 2;
+    } else {
+      char lo = ms.p[k++];
+      char hi = lo;
+      if (k < ms.p.size() && ms.p[k] == '-' && k + 1 < ms.p.size() && ms.p[k + 1] != ']') {
+        hi = ms.p[k + 1];
+        k += 2;
+      }
+      if (static_cast<unsigned char>(lo) <= static_cast<unsigned char>(c) &&
+          static_cast<unsigned char>(c) <= static_cast<unsigned char>(hi))
+        found = true;
+    }
+  } while (k < ms.p.size() && ms.p[k] != ']');
+  if (k >= ms.p.size() || ms.p[k] != ']')
+    panic("malformed pattern (missing ']')");
+  *out_ep = k + 1;
+  return negate ? !found : found;
+}
+
+// Advance past one pattern item; returns whether char at `si` matches. `pi` is the
 // start of the item; on return `*out_pi` is the index after the item.
 static bool single_match(MatchState& ms, size_t si, size_t pi, size_t* out_pi) {
   if (pi >= ms.p.size())
@@ -486,50 +538,14 @@ static bool single_match(MatchState& ms, size_t si, size_t pi, size_t* out_pi) {
     return match_class(ms.s[si], ms.p[pi + 1]);
   }
   if (p0 == '[') {
-    size_t j = pi + 1;
-    bool negate = j < ms.p.size() && ms.p[j] == '^';
-    if (negate)
-      ++j;
-    // PUC: first ']' after '[' / '[^' is a literal member, not the closer.
-    bool found = false;
-    if (si < ms.s.size()) {
-      char c = ms.s[si];
-      size_t k = j;
-      do {
-        if (k >= ms.p.size())
-          return false;
-        if (ms.p[k] == '%' && k + 1 < ms.p.size()) {
-          if (match_class(c, ms.p[k + 1]))
-            found = true;
-          k += 2;
-        } else {
-          char lo = ms.p[k++];
-          char hi = lo;
-          if (k < ms.p.size() && ms.p[k] == '-' && k + 1 < ms.p.size() && ms.p[k + 1] != ']') {
-            hi = ms.p[k + 1];
-            k += 2;
-          }
-          if (static_cast<unsigned char>(lo) <= static_cast<unsigned char>(c) &&
-              static_cast<unsigned char>(c) <= static_cast<unsigned char>(hi))
-            found = true;
-        }
-      } while (k < ms.p.size() && ms.p[k] != ']');
-      j = k;
-    } else {
-      // Still need to locate the closing ']' for out_pi.
-      do {
-        if (j >= ms.p.size())
-          return false;
-        if (ms.p[j] == '%' && j + 1 < ms.p.size())
-          j += 2;
-        else
-          ++j;
-      } while (j < ms.p.size() && ms.p[j] != ']');
-    }
-    if (j >= ms.p.size() || ms.p[j] != ']')
+    if (si >= ms.s.size()) {
+      // Still need out_pi for callers that only care about class end.
+      size_t ep = 0;
+      match_bracket_class(ms, '\0', pi, &ep);
+      *out_pi = ep ? ep : pi;
       return false;
-    *out_pi = j + 1;
-    return si < ms.s.size() && (negate ? !found : found);
+    }
+    return match_bracket_class(ms, ms.s[si], pi, out_pi);
   }
   *out_pi = pi + 1;
   return si < ms.s.size() && ms.s[si] == p0;
@@ -579,6 +595,8 @@ static size_t class_end(MatchState& ms, size_t pi) {
       else
         ++pi;
     } while (pi < ms.p.size() && ms.p[pi] != ']');
+    if (pi >= ms.p.size() || ms.p[pi] != ']')
+      panic("malformed pattern (missing ']')");
     return pi + 1;
   default:
     return pi;
@@ -603,15 +621,15 @@ static bool end_capture(MatchState& ms, size_t si, size_t pi) {
       return ok;
     }
   }
-  return false;
+  panic("invalid pattern capture");
 }
 
 static bool match_capture(MatchState& ms, size_t si, int cap) {
   if (cap < 0 || cap >= static_cast<int>(ms.captures.size()))
-    return false;
+    panic("invalid capture index %" + std::to_string(cap + 1));
   auto [a, b] = ms.captures[static_cast<size_t>(cap)];
   if (b == kCapUnfinished || b == kCapPosition)
-    return false;
+    panic("invalid capture index %" + std::to_string(cap + 1));
   size_t len = b - a;
   if (si + len > ms.s.size())
     return false;
@@ -620,7 +638,7 @@ static bool match_capture(MatchState& ms, size_t si, int cap) {
 
 static bool match_balance(MatchState& ms, size_t si, size_t pi) {
   if (pi + 1 >= ms.p.size())
-    return false;
+    panic("malformed pattern (missing arguments to '%b')");
   char open = ms.p[pi];
   char close = ms.p[pi + 1];
   if (si >= ms.s.size() || ms.s[si] != open)
@@ -640,6 +658,7 @@ static bool match_balance(MatchState& ms, size_t si, size_t pi) {
 }
 
 static bool match(MatchState& ms, size_t si, size_t pi) {
+  MatchDepthGuard depth(ms);
   init:
   if (pi >= ms.p.size()) {
     ms.match_end = si;
@@ -658,18 +677,20 @@ static bool match(MatchState& ms, size_t si, size_t pi) {
     break;
   case '%': {
     if (pi + 1 >= ms.p.size())
-      return false;
+      panic("malformed pattern (ends with '%')");
     char spec = ms.p[pi + 1];
     if (spec == 'b')
       return match_balance(ms, si, pi + 2);
     if (spec == 'f') {
       if (pi + 2 >= ms.p.size() || ms.p[pi + 2] != '[')
-        return false;
+        panic("missing '[' after '%f' in pattern");
+      // PUC: virtual '\0' before src_init and at src_end.
+      char previous = (si == 0) ? '\0' : ms.s[si - 1];
+      char current = (si >= ms.s.size()) ? '\0' : ms.s[si];
       size_t ep = 0;
-      // frontier: previous char not in class, current in class
-      bool prev = si > 0 && single_match(ms, si - 1, pi + 2, &ep);
-      bool cur = single_match(ms, si, pi + 2, &ep);
-      if (!cur || prev)
+      bool prev_in = match_bracket_class(ms, previous, pi + 2, &ep);
+      bool cur_in = match_bracket_class(ms, current, pi + 2, &ep);
+      if (prev_in || !cur_in)
         return false;
       pi = ep;
       goto init;
@@ -684,6 +705,8 @@ static bool match(MatchState& ms, size_t si, size_t pi) {
       pi += 2;
       goto init;
     }
+    if (spec == '0')
+      panic("invalid capture index %0");
     break;
   }
   default:
@@ -739,7 +762,9 @@ static std::string capture_string(const MatchState& ms, size_t idx) {
   auto [a, b] = ms.captures[idx];
   if (b == kCapPosition)
     return std::to_string(static_cast<long long>(a + 1));
-  if (b == kCapUnfinished || a > b)
+  if (b == kCapUnfinished)
+    panic("unfinished capture");
+  if (a > b)
     return "";
   return std::string(ms.s.substr(a, b - a));
 }
@@ -764,7 +789,9 @@ static int str_find(State* L) {
     }
     return L->gettop();
   }
-  MatchState ms{s, p, 0, 0, {}};
+  MatchState ms;
+  ms.s = s;
+  ms.p = p;
   if (match_search(ms, start, false)) {
     L->push(TValue::integer(static_cast<int64_t>(ms.match_start + 1)));
     L->push(TValue::integer(static_cast<int64_t>(ms.match_end)));
@@ -788,7 +815,9 @@ static int str_match(State* L) {
   if (init < 0)
     init = static_cast<int64_t>(s.size()) + init + 1;
   init = std::max<int64_t>(1, init);
-  MatchState ms{s, p, 0, 0, {}};
+  MatchState ms;
+  ms.s = s;
+  ms.p = p;
   L->settop(0);
   if (match_search(ms, static_cast<size_t>(init - 1), false)) {
     if (ms.captures.empty()) {
@@ -830,9 +859,10 @@ static std::string gsub_expand_repl(const std::string& repl, const MatchState& m
         else
           panic("invalid capture index %" + std::to_string(idx + 1));
       } else {
-        out += '%';
-        out += c;
+        panic("invalid use of '%' in replacement string");
       }
+    } else if (repl[i] == '%' && i + 1 >= repl.size()) {
+      panic("invalid use of '%' in replacement string");
     } else {
       out += repl[i];
     }
@@ -875,16 +905,44 @@ static int str_gsub(State* L) {
       }
       call_closure(L, repl_v.as_closure(), nargs, 1);
       TValue r = *L->at(base + 1);
-      if (!r.is_nil())
+      // PUC: nil/false keeps the original match text.
+      if (r.is_nil() || (r.is_bool() && !r.payload))
+        out.append(ms.s.substr(ms.match_start, ms.match_end - ms.match_start));
+      else
         out += value_to_string(r);
       L->settop(base);
     } else if (repl_v.is_table()) {
-      std::string key = ms.captures.empty()
-                            ? std::string(ms.s.substr(ms.match_start, ms.match_end - ms.match_start))
-                            : capture_string(ms, 0);
-      TValue v = repl_v.as_table()->get(TValue::obj(ValueTag::String, L->intern(key)));
-      if (!v.is_nil())
+      // PUC add_value: key is whole match, or first capture (position → integer).
+      TValue key;
+      if (ms.captures.empty()) {
+        key = TValue::obj(ValueTag::String,
+                          L->intern(std::string(ms.s.substr(ms.match_start, ms.match_end - ms.match_start))));
+      } else {
+        auto [a, b] = ms.captures[0];
+        if (b == kCapPosition)
+          key = TValue::integer(static_cast<int64_t>(a + 1));
+        else
+          key = TValue::obj(ValueTag::String, L->intern(capture_string(ms, 0)));
+      }
+      TValue v = meta_index(L, repl_v, key);
+      if (v.is_nil() || (v.is_bool() && !v.payload)) {
+        out.append(ms.s.substr(ms.match_start, ms.match_end - ms.match_start));
+      } else if (v.is_string() || v.is_number()) {
         out += value_to_string(v);
+      } else {
+        const char* tn = "nil";
+        if (v.is_bool())
+          tn = "boolean";
+        else if (v.is_table())
+          tn = "table";
+        else if (v.is_function())
+          tn = "function";
+        else if (v.is_userdata())
+          tn = "userdata";
+        else if (v.is_thread())
+          tn = "thread";
+        panic(std::string("invalid replacement value (a ") + tn + ")");
+      }
     } else {
       out += gsub_expand_repl(std::string(repl_v.is_string() ? repl_v.as_string()->view()
                                                              : value_to_string(repl_v)),
@@ -893,7 +951,9 @@ static int str_gsub(State* L) {
   };
 
   while (count < max_s) {
-    MatchState ms{s, pat_body, 0, 0, {}};
+    MatchState ms;
+    ms.s = s;
+    ms.p = pat_body;
     bool matched = match(ms, src, 0);
     // Anchor patterns only try once at the original start (handled by match on '^' skip).
     if (matched)
@@ -954,7 +1014,9 @@ static int gmatch_iter(State* L) {
       (lv.is_int() && lv.as_int() < 0) ? static_cast<size_t>(-1) : static_cast<size_t>(lv.to_number());
 
   for (; src <= s.size(); ++src) {
-    MatchState ms{s, pat, 0, 0, {}};
+    MatchState ms;
+    ms.s = s;
+    ms.p = pat;
     ms.match_start = src;
     if (!match(ms, src, 0))
       continue;
@@ -1378,4 +1440,4 @@ void open_string_lib(State* L) {
   L->type_mt[static_cast<size_t>(ValueTag::String)] = mt;
 }
 
-} // namespace lj3
+} // namespace luatier

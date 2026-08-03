@@ -5,7 +5,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace lj3 {
+namespace luatier {
 
 namespace {
 
@@ -115,13 +115,9 @@ void walk_stmt(AstNode& s, Ctx& ctx) {
     ctx.gotos.push_back({n.label, ctx.visible_locals()});
     break;
   }
-  case AstKind::Label: {
-    auto& n = static_cast<LabelStmt&>(s);
-    if (ctx.labels.count(n.name))
-      panic("label '" + n.name + "' already defined");
-    ctx.labels[n.name] = ctx.visible_locals();
+  case AstKind::Label:
+    // Labels are registered in walk_block (need lookahead for "last label" rule).
     break;
-  }
   case AstKind::While: {
     auto& n = static_cast<WhileStmt&>(s);
     walk_expr(*n.cond, ctx);
@@ -232,8 +228,33 @@ void walk_stmt(AstNode& s, Ctx& ctx) {
 
 void walk_block(Block& b, Ctx& ctx) {
   size_t before = ctx.locals.size();
-  for (auto& s : b.stmts)
-    walk_stmt(*s, ctx);
+  for (size_t i = 0; i < b.stmts.size(); ++i) {
+    AstNode& s = *b.stmts[i];
+    if (s.kind == AstKind::Label) {
+      auto& n = static_cast<LabelStmt&>(s);
+      if (ctx.labels.count(n.name))
+        panic("label '" + n.name + "' already defined");
+      // PUC: if label is the last non-void statement in the block (only labels
+      // follow), gotos may target it without entering this block's locals.
+      bool last = true;
+      for (size_t j = i + 1; j < b.stmts.size(); ++j) {
+        if (b.stmts[j]->kind != AstKind::Label) {
+          last = false;
+          break;
+        }
+      }
+      if (last) {
+        std::set<std::string> outer;
+        for (size_t k = 0; k < before; ++k)
+          outer.insert(ctx.locals[k].name);
+        ctx.labels[n.name] = std::move(outer);
+      } else {
+        ctx.labels[n.name] = ctx.visible_locals();
+      }
+      continue;
+    }
+    walk_stmt(s, ctx);
+  }
   ctx.locals.resize(before);
 }
 
@@ -245,4 +266,4 @@ void sema_analyze(Chunk& chunk) {
   ctx.check_gotos();
 }
 
-} // namespace lj3
+} // namespace luatier

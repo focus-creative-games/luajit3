@@ -1,4 +1,4 @@
-#include "luajit3/lua.h"
+#include "luatier/lua.h"
 
 #include <iostream>
 #include <string>

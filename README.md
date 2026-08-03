@@ -1,8 +1,8 @@
-# LuaJIT3
+# LuaTier
 
-From-scratch Lua **5.3+** JIT runtime (C++17). **Not** derived from historical LuaJIT.
+A fully rewritten modern Lua runtime supporting Lua **5.3+**, featuring tiered hybrid execution: bytecode interpreter, offline AOT compiler, and optional tracing JIT.
 
-See [PROPOSAL.md](PROPOSAL.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
+Built in C++17 from scratch — **not** derived from historical LuaJIT. See [PROPOSAL.md](PROPOSAL.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Build
 
@@ -15,8 +15,8 @@ ctest --test-dir build --output-on-failure
 ## Run
 
 ```bash
-./build/luajit3 --version
-./build/luajit3 -e "print(1+2)"
+./build/luatier --version
+./build/luatier -e "print(1+2)"
 ```
 
 ## Layout
@@ -32,7 +32,7 @@ ctest --test-dir build --output-on-failure
 
 ## Stress env
 
-- `LJ3_STRESS_GC_EVERY_SAFEPOINT=1`
-- `LJ3_STRESS_FORCE_DEOPT=1`
-- `LJ3_STRESS_DISABLE_IC=1`
-- `LJ3_JIT_LOG=1`
+- `LUATIER_STRESS_GC_EVERY_SAFEPOINT=1`
+- `LUATIER_STRESS_FORCE_DEOPT=1`
+- `LUATIER_STRESS_DISABLE_IC=1`
+- `LUATIER_JIT_LOG=1`

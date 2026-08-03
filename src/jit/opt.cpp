@@ -2,7 +2,7 @@
 
 #include <unordered_map>
 
-namespace lj3 {
+namespace luatier {
 
 namespace {
 std::unordered_map<Proto*, MirModule> modules;
@@ -22,4 +22,4 @@ MirModule* opt_lookup(Proto* p) {
   return it == modules.end() ? nullptr : &it->second;
 }
 
-} // namespace lj3
+} // namespace luatier

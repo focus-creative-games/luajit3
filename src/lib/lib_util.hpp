@@ -10,7 +10,7 @@
 #include <cmath>
 #include <string_view>
 
-namespace lj3 {
+namespace luatier {
 namespace lib {
 
 inline void push_string(State* L, const char* s) {
@@ -78,6 +78,13 @@ inline int64_t check_int(State* L, int idx) {
   panic("integer expected");
 }
 
+// luaL_optinteger: missing or nil → def.
+inline int64_t opt_int(State* L, int idx, int64_t def) {
+  if (idx > L->gettop() || L->at(idx)->is_nil())
+    return def;
+  return check_int(L, idx);
+}
+
 inline double check_number(State* L, int idx) {
   check_any(L, idx, "check_number");
   if (!L->at(idx)->is_number())
@@ -112,4 +119,4 @@ inline Table* new_lib(State* L, int nrec) {
 }
 
 } // namespace lib
-} // namespace lj3
+} // namespace luatier

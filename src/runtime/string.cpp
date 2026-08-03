@@ -5,7 +5,7 @@
 #include <cstring>
 #include <new>
 
-namespace lj3 {
+namespace luatier {
 
 uint32_t hash_bytes(const char* p, size_t n) {
   uint32_t h = 2166136261u;
@@ -39,4 +39,4 @@ LjString* StringTable::intern(State* L, std::string_view s) {
   return mem;
 }
 
-} // namespace lj3
+} // namespace luatier

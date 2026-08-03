@@ -6,7 +6,7 @@
 #include <string_view>
 #include <unordered_map>
 
-namespace lj3 {
+namespace luatier {
 
 struct LjString : GcObject {
   size_t len = 0;
@@ -24,4 +24,4 @@ struct StringTable {
 
 uint32_t hash_bytes(const char* p, size_t n);
 
-} // namespace lj3
+} // namespace luatier

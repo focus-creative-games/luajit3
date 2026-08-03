@@ -6,7 +6,7 @@
 #include <utility>
 #include <unordered_map>
 
-namespace lj3 {
+namespace luatier {
 
 namespace {
 
@@ -28,10 +28,27 @@ struct FuncState {
   int maxstack = 0;
   int reg_hwm = 0; // high-water mark; never reuse regs below this after captures
   std::vector<int> break_list;
-  std::unordered_map<std::string, int> labels;      // name -> pc
-  std::vector<std::pair<std::string, int>> pending_gotos; // name, jmp_pc
+  // Innermost loop's first local register (break closes captured locals >= this).
+  std::vector<int> loop_break_level;
+  struct LabelInfo {
+    int pc = 0;
+    int nactvar = 0; // active locals at label (PUC Labeldesc.nactvar)
+  };
+  std::unordered_map<std::string, LabelInfo> labels;
+  struct PendingGoto {
+    std::string name;
+    int jmp_pc = 0;
+    int nactvar = 0; // actvar count at goto site
+  };
+  std::vector<PendingGoto> pending_gotos;
+  // Block-entry nactvar stack for "last label" rule (exclude block locals).
+  std::vector<int> block_entry_nactvar;
   bool vararg = false;
   int lastline = 1;
+
+  static int goto_close_a(int goto_nactvar, int label_nactvar) {
+    return (goto_nactvar > label_nactvar) ? (label_nactvar + 1) : 0;
+  }
 
   int pc() const { return static_cast<int>(proto->code.size()); }
   void emit(Instruction i, int line = -1) {
@@ -848,6 +865,15 @@ void expr(FuncState& fs, Expdesc& e, Expr& node) {
       child.push_local(param, reg, node.line);
     }
     block(child, *n.body);
+    for (auto& g : child.pending_gotos) {
+      auto it = child.labels.find(g.name);
+      if (it == child.labels.end())
+        panic("no visible label for goto: " + g.name);
+      int a = FuncState::goto_close_a(g.nactvar, it->second.nactvar);
+      int sbx = it->second.pc - (g.jmp_pc + 1);
+      child.proto->code[static_cast<size_t>(g.jmp_pc)] =
+          encode_asbx(OpCode::JMP, static_cast<uint8_t>(a), sbx);
+    }
     child.lastline = n.lastline > 0 ? n.lastline : child.lastline;
     child.code_abc(OpCode::RETURN, 0, 1, 0, child.lastline);
     // Parameters stay active for the whole function; record them now.
@@ -903,8 +929,29 @@ void storevar(FuncState& fs, Expdesc& var, int expr_reg) {
 
 void block(FuncState& fs, Block& b) {
   int saved = static_cast<int>(fs.locals.size());
-  for (auto& s : b.stmts)
-    statement(fs, *s);
+  fs.block_entry_nactvar.push_back(fs.nactvar);
+  for (size_t i = 0; i < b.stmts.size(); ++i) {
+    AstNode& s = *b.stmts[i];
+    if (s.kind == AstKind::Label) {
+      auto& n = static_cast<LabelStmt&>(s);
+      if (fs.labels.count(n.name))
+        panic("label already defined: " + n.name);
+      // PUC: a label that is last in its block (ignoring trailing labels) sees
+      // only outer locals — gotos into it close block-scoped upvalues.
+      bool last = true;
+      for (size_t j = i + 1; j < b.stmts.size(); ++j) {
+        if (b.stmts[j]->kind != AstKind::Label) {
+          last = false;
+          break;
+        }
+      }
+      int nv = last ? fs.block_entry_nactvar.back() : fs.nactvar;
+      fs.labels[n.name] = {fs.pc(), nv};
+      continue;
+    }
+    statement(fs, s);
+  }
+  fs.block_entry_nactvar.pop_back();
   fs.leave_block(saved);
 }
 
@@ -1159,7 +1206,9 @@ void statement(FuncState& fs, AstNode& node) {
     int jf = fs.code_asbx(OpCode::JMP, 0, 0);
     fs.freereg = fs.nactvar;
     int breaks_before = static_cast<int>(fs.break_list.size());
+    fs.loop_break_level.push_back(fs.nactvar);
     block(fs, *n.body);
+    fs.loop_break_level.pop_back();
     fs.code_asbx(OpCode::JMP, 0, loop - (fs.pc() + 1));
     // Condition-fail lands on `end` line marker; `break` skips it (db.lua).
     int end_marker_pc = fs.pc();
@@ -1182,24 +1231,48 @@ void statement(FuncState& fs, AstNode& node) {
     int saved = static_cast<int>(fs.locals.size());
     int loop = fs.pc();
     int breaks_before = static_cast<int>(fs.break_list.size());
+    fs.loop_break_level.push_back(fs.nactvar);
     for (auto& s : n.body->stmts)
       statement(fs, *s);
+    // Condition may reference body locals — evaluate before closing.
     Expdesc c;
     expr(fs, c, *n.cond);
     int cr = exp2reg(fs, c);
     fs.code_abc(OpCode::TEST, cr, 0, 1); // exit if true
-    int jf = fs.code_asbx(OpCode::JMP, 0, 0);
-    fs.code_asbx(OpCode::JMP, 0, loop - (fs.pc() + 1));
-    fs.fix_sbx(jf, fs.pc());
+    int exit_jmp = fs.code_asbx(OpCode::JMP, 0, 0);
+    // Continue: close captured body locals, then jump to loop head (PUC).
+    int close_level = -1;
+    for (int li = saved; li < static_cast<int>(fs.locals.size()); ++li) {
+      auto& loc = fs.locals[static_cast<size_t>(li)];
+      if (loc.active && loc.captured && (close_level < 0 || loc.reg < close_level))
+        close_level = loc.reg;
+    }
+    int cont_a = close_level >= 0 ? close_level + 1 : 0;
+    fs.code_asbx(OpCode::JMP, cont_a, loop - (fs.pc() + 1));
+    fs.fix_sbx(exit_jmp, fs.pc());
+    fs.loop_break_level.pop_back();
+    fs.leave_block(saved);
     while (static_cast<int>(fs.break_list.size()) > breaks_before) {
       fs.fix_sbx(fs.break_list.back(), fs.pc());
       fs.break_list.pop_back();
     }
-    fs.leave_block(saved);
     break;
   }
   case AstKind::Break: {
-    fs.break_list.push_back(fs.code_asbx(OpCode::JMP, 0, 0));
+    // PUC: break jumps out of the loop and closes upvalues of that loop's scope.
+    int a = 0;
+    if (!fs.loop_break_level.empty()) {
+      int min_reg = fs.loop_break_level.back();
+      int close_level = -1;
+      for (auto& l : fs.locals) {
+        if (l.active && l.captured && l.reg >= min_reg &&
+            (close_level < 0 || l.reg < close_level))
+          close_level = l.reg;
+      }
+      if (close_level >= 0)
+        a = close_level + 1;
+    }
+    fs.break_list.push_back(fs.code_asbx(OpCode::JMP, a, 0));
     break;
   }
   case AstKind::ForNum: {
@@ -1228,13 +1301,20 @@ void statement(FuncState& fs, AstNode& node) {
     fs.lastline = node.line;
     int prep = fs.code_asbx(OpCode::FORPREP, base, 0);
     int loop = fs.pc();
+    // Loop variable is scoped to each iteration (PUC leaveblock before FORLOOP)
+    // so closures capture a distinct closed upvalue per iteration.
+    int before_i = static_cast<int>(fs.locals.size());
     int ireg = fs.new_reg();
     fs.push_local(n.name, ireg, node.line);
     fs.locals.back().reg = base + 3;
     fs.nactvar = base + 4;
     fs.freereg = base + 4;
     int breaks_before = static_cast<int>(fs.break_list.size());
-    block(fs, *n.body);
+    fs.loop_break_level.push_back(base + 3);
+    block(fs, *n.body); // body locals + labels; keeps `i`
+    fs.loop_break_level.pop_back();
+    // Close captured `i` at end of each iteration.
+    fs.leave_block(before_i, /*clear_dead=*/false);
     fs.lastline = node.line;
     fs.code_asbx(OpCode::FORLOOP, base, loop - (fs.pc() + 1));
     int forloop_pc = fs.pc() - 1;
@@ -1250,7 +1330,6 @@ void statement(FuncState& fs, AstNode& node) {
       fs.fix_sbx(fs.break_list.back(), after_for);
       fs.break_list.pop_back();
     }
-    fs.leave_block(static_cast<int>(fs.locals.size()) - 1, /*clear_dead=*/false);
     fs.freereg = base;
     break;
   }
@@ -1301,21 +1380,18 @@ void statement(FuncState& fs, AstNode& node) {
     block(fs, *n.body);
     break;
   }
-  case AstKind::Label: {
-    auto& n = static_cast<LabelStmt&>(node);
-    if (fs.labels.count(n.name))
-      panic("label already defined: " + n.name);
-    fs.labels[n.name] = fs.pc();
+  case AstKind::Label:
+    // Registered in block() (needs last-label / nactvar lookahead).
     break;
-  }
   case AstKind::Goto: {
     auto& n = static_cast<GotoStmt&>(node);
     auto it = fs.labels.find(n.label);
     if (it != fs.labels.end()) {
-      fs.code_asbx(OpCode::JMP, 0, it->second - (fs.pc() + 1));
+      int a = FuncState::goto_close_a(fs.nactvar, it->second.nactvar);
+      fs.code_asbx(OpCode::JMP, a, it->second.pc - (fs.pc() + 1));
     } else {
       int j = fs.code_asbx(OpCode::JMP, 0, 0);
-      fs.pending_gotos.emplace_back(n.label, j);
+      fs.pending_gotos.push_back({n.label, j, fs.nactvar});
     }
     break;
   }
@@ -1378,7 +1454,9 @@ void statement(FuncState& fs, AstNode& node) {
     fs.nactvar = base + 3 + nvars;
     fs.freereg = fs.nactvar;
     int breaks_before = static_cast<int>(fs.break_list.size());
+    fs.loop_break_level.push_back(base + 3);
     block(fs, *n.body);
+    fs.loop_break_level.pop_back();
     // Locals end after the body; do not LOADNIL every iteration (PUC leaves
     // stale values — also keeps count/line hooks aligned).
     fs.leave_block(nlocals_before, /*clear_dead=*/false);
@@ -1422,10 +1500,13 @@ Proto* lower_chunk(State* L, Chunk& chunk, const std::string& source_name) {
   fs.freereg = 0;
   block(fs, *chunk.body);
   for (auto& g : fs.pending_gotos) {
-    auto it = fs.labels.find(g.first);
+    auto it = fs.labels.find(g.name);
     if (it == fs.labels.end())
-      panic("no visible label for goto: " + g.first);
-    fs.fix_sbx(g.second, it->second);
+      panic("no visible label for goto: " + g.name);
+    int a = FuncState::goto_close_a(g.nactvar, it->second.nactvar);
+    int sbx = it->second.pc - (g.jmp_pc + 1);
+    fs.proto->code[static_cast<size_t>(g.jmp_pc)] =
+        encode_asbx(OpCode::JMP, static_cast<uint8_t>(a), sbx);
   }
   fs.code_abc(OpCode::RETURN, 0, 1, 0);
   fs.flush_locvars_to(0);
@@ -1433,4 +1514,4 @@ Proto* lower_chunk(State* L, Chunk& chunk, const std::string& source_name) {
   return p;
 }
 
-} // namespace lj3
+} // namespace luatier

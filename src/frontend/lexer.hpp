@@ -6,7 +6,7 @@
 #include <string_view>
 #include <vector>
 
-namespace lj3 {
+namespace luatier {
 
 enum class TokenKind {
   End,
@@ -115,4 +115,4 @@ private:
 
 const char* token_name(TokenKind k);
 
-} // namespace lj3
+} // namespace luatier

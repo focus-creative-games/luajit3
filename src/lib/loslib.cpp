@@ -11,15 +11,15 @@
 
 #ifdef _WIN32
 #include <direct.h>
-#define LJ3_UNLINK _unlink
-#define LJ3_RENAME rename
+#define LUATIER_UNLINK _unlink
+#define LUATIER_RENAME rename
 #else
 #include <unistd.h>
-#define LJ3_UNLINK unlink
-#define LJ3_RENAME rename
+#define LUATIER_UNLINK unlink
+#define LUATIER_RENAME rename
 #endif
 
-namespace lj3 {
+namespace luatier {
 using namespace lib;
 
 static int os_clock(State* L) {
@@ -130,7 +130,7 @@ static int os_getenv(State* L) {
 static int os_remove(State* L) {
   std::string path = std::string(check_string(L, 1)->view());
   L->settop(0);
-  if (LJ3_UNLINK(path.c_str()) == 0)
+  if (LUATIER_UNLINK(path.c_str()) == 0)
     L->push(TValue::boolean(true));
   else {
     L->push(TValue::nil());
@@ -144,7 +144,7 @@ static int os_rename(State* L) {
   std::string from = std::string(check_string(L, 1)->view());
   std::string to = std::string(check_string(L, 2)->view());
   L->settop(0);
-  if (LJ3_RENAME(from.c_str(), to.c_str()) == 0)
+  if (LUATIER_RENAME(from.c_str(), to.c_str()) == 0)
     L->push(TValue::boolean(true));
   else {
     L->push(TValue::nil());
@@ -161,7 +161,7 @@ static int os_exit(State* L) {
 
 static int os_tmpname(State* L) {
   static int counter = 0;
-  std::string name = "lj3tmp_" + std::to_string(++counter) + ".tmp";
+  std::string name = "luatiertmp_" + std::to_string(++counter) + ".tmp";
   L->settop(0);
   push_string(L, name);
   return 1;
@@ -201,4 +201,4 @@ void open_os_lib(State* L) {
   set_global_value(L, "os", TValue::obj(ValueTag::Table, os));
 }
 
-} // namespace lj3
+} // namespace luatier

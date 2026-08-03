@@ -1,4 +1,4 @@
-# LuaJIT3 Roadmap
+# LuaTier Roadmap
 
 This roadmap implements [PROPOSAL.md](../PROPOSAL.md) under these constraints:
 

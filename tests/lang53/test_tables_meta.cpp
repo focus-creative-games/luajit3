@@ -1,6 +1,6 @@
 #include "test_harness.hpp"
 
-using namespace lj3test;
+using namespace luatiertest;
 
 int test_lang53_tables_meta() {
   int f = 0;

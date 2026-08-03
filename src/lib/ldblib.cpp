@@ -3,13 +3,14 @@
 #include "lib/lib_util.hpp"
 #include "vm/debug_hook.hpp"
 #include "vm/interpreter.hpp"
+#include "vm/meta.hpp"
 
 #include <algorithm>
 #include <cstring>
 #include <string>
 #include <unordered_set>
 
-namespace lj3 {
+namespace luatier {
 using namespace lib;
 
 namespace {
@@ -990,6 +991,22 @@ static int debug_getregistry(State* L) {
   return 1;
 }
 
+static int debug_upvalueid(State* L) {
+  check_type(L, 1, ValueTag::Function, "upvalueid");
+  int n = static_cast<int>(check_int(L, 2));
+  Closure* cl = L->at(1)->as_closure();
+  if (n < 1 || static_cast<size_t>(n) > cl->upvals.size() || !cl->upvals[static_cast<size_t>(n - 1)])
+    panic("invalid upvalue index");
+  // PUC lua_upvalueid: Lua → UpVal*; C → address of upvalue slot.
+  // We store both as UpVal*; the pointer identity is what tests compare.
+  TValue id;
+  id.type = static_cast<uint32_t>(ValueTag::LightUserdata);
+  id.payload = reinterpret_cast<uint64_t>(cl->upvals[static_cast<size_t>(n - 1)]);
+  L->settop(0);
+  L->push(id);
+  return 1;
+}
+
 static int debug_upvaluejoin(State* L) {
   check_type(L, 1, ValueTag::Function, "upvaluejoin");
   check_type(L, 3, ValueTag::Function, "upvaluejoin");
@@ -1007,6 +1024,44 @@ static int debug_upvaluejoin(State* L) {
   return 0;
 }
 
+static int debug_getmetatable(State* L) {
+  Table* mt = get_metatable(L, *L->at(1));
+  L->settop(0);
+  if (mt)
+    L->push(TValue::obj(ValueTag::Table, mt));
+  else
+    L->push(TValue::nil());
+  return 1;
+}
+
+static int debug_setmetatable(State* L) {
+  TValue obj = *L->at(1);
+  Table* mt = nullptr;
+  if (L->gettop() >= 2 && !L->at(2)->is_nil()) {
+    if (!L->at(2)->is_table())
+      panic("table expected");
+    mt = L->at(2)->as_table();
+  }
+  if (obj.is_table()) {
+    obj.as_table()->metatable = mt;
+    obj.as_table()->update_weak_mode(L);
+    if (mt)
+      L->gc.barrier(obj.as_gc(), TValue::obj(ValueTag::Table, mt));
+  } else if (obj.is_userdata()) {
+    obj.as_userdata()->metatable = mt;
+    if (mt)
+      L->gc.barrier(obj.as_gc(), TValue::obj(ValueTag::Table, mt));
+  } else {
+    ValueTag t = obj.tag();
+    if (t == ValueTag::Int)
+      t = ValueTag::Float; // Int/Float share one number metatable
+    L->type_mt[static_cast<size_t>(t)] = mt;
+  }
+  L->settop(0);
+  L->push(obj);
+  return 1;
+}
+
 static int open_debug_module(State* L) {
   Table* dbg = new_lib(L, 16);
   set_field(L, dbg, "getinfo", debug_getinfo);
@@ -1015,10 +1070,13 @@ static int open_debug_module(State* L) {
   set_field(L, dbg, "setlocal", debug_setlocal);
   set_field(L, dbg, "getupvalue", debug_getupvalue);
   set_field(L, dbg, "setupvalue", debug_setupvalue);
+  set_field(L, dbg, "upvalueid", debug_upvalueid);
   set_field(L, dbg, "upvaluejoin", debug_upvaluejoin);
   set_field(L, dbg, "sethook", debug_sethook);
   set_field(L, dbg, "gethook", debug_gethook);
   set_field(L, dbg, "getregistry", debug_getregistry);
+  set_field(L, dbg, "getmetatable", debug_getmetatable);
+  set_field(L, dbg, "setmetatable", debug_setmetatable);
   L->settop(0);
   L->push(TValue::obj(ValueTag::Table, dbg));
   return 1;
@@ -1035,4 +1093,4 @@ void open_debug_lib(State* L) {
                TValue::obj(ValueTag::Function, closure_new_c(L, open_debug_module)));
 }
 
-} // namespace lj3
+} // namespace luatier

@@ -2,7 +2,7 @@
 
 #include "runtime/value.hpp"
 
-namespace lj3 {
+namespace luatier {
 
 struct State;
 
@@ -33,4 +33,4 @@ int meta_call(State* L, int func_idx, int nargs, int nresults);
 Table* get_metatable(State* L, const TValue& v);
 void set_metatable(State* L, TValue& v, Table* mt);
 
-} // namespace lj3
+} // namespace luatier

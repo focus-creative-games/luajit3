@@ -2,7 +2,7 @@
 
 #include "vm/state.hpp"
 
-namespace lj3 {
+namespace luatier {
 
 Closure* closure_new_lua(State* L, Proto* p) {
   auto* cl = L->gc.create<Closure>(GcKind::Closure);
@@ -19,4 +19,4 @@ Closure* closure_new_c(State* L, CFunction f) {
   return cl;
 }
 
-} // namespace lj3
+} // namespace luatier

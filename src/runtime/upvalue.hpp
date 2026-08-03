@@ -3,7 +3,7 @@
 #include "gc/gc.hpp"
 #include "runtime/value.hpp"
 
-namespace lj3 {
+namespace luatier {
 
 struct Thread;
 
@@ -20,4 +20,4 @@ struct UpVal : GcObject {
   void close(State* L);
 };
 
-} // namespace lj3
+} // namespace luatier

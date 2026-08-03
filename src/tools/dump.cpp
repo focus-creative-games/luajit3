@@ -6,7 +6,7 @@
 #include <iostream>
 #include <sstream>
 
-namespace lj3 {
+namespace luatier {
 
 std::string dump_proto(const Proto* p) {
   std::ostringstream os;
@@ -31,4 +31,4 @@ std::string dump_proto(const Proto* p) {
 
 void dump_proto_to_stderr(const Proto* p) { std::cerr << dump_proto(p); }
 
-} // namespace lj3
+} // namespace luatier

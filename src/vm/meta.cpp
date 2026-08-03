@@ -10,7 +10,7 @@
 #include <cmath>
 #include <cstring>
 
-namespace lj3 {
+namespace luatier {
 
 // PUC l_strcmp: locale-aware via strcoll, segment-wise across embedded NULs.
 static int string_cmp(const LjString* ls, const LjString* rs) {
@@ -124,56 +124,77 @@ static int call_mm(State* L, const TValue& mm, const TValue* args, int nargs, TV
   return 0;
 }
 
+// PUC MAXTAGLOOP — avoid infinite __index / __newindex table chains.
+constexpr int kMaxTagLoop = 2000;
+
 TValue meta_index(State* L, const TValue& table, const TValue& key) {
-  if (table.is_table()) {
-    TValue v = table.as_table()->get(key);
-    if (!v.is_nil())
-      return v;
-  }
-  TValue mm = get_metamethod(L, table, "__index");
-  if (mm.is_nil()) {
-    if (!table.is_table())
+  TValue t = table;
+  for (int loop = 0; loop < kMaxTagLoop; ++loop) {
+    if (t.is_table()) {
+      TValue v = t.as_table()->get(key);
+      if (!v.is_nil())
+        return v;
+      TValue mm = get_metamethod(L, t, "__index");
+      if (mm.is_nil())
+        return TValue::nil();
+      if (mm.is_function()) {
+        TValue args[2] = {t, key};
+        TValue out;
+        call_mm(L, mm, args, 2, &out, 1);
+        return out;
+      }
+      t = mm; // table (or other) metamethod — continue chain
+      continue;
+    }
+    TValue mm = get_metamethod(L, t, "__index");
+    if (mm.is_nil())
       panic("attempt to index a non-table value");
-    return TValue::nil();
+    if (mm.is_function()) {
+      TValue args[2] = {t, key};
+      TValue out;
+      call_mm(L, mm, args, 2, &out, 1);
+      return out;
+    }
+    t = mm;
   }
-  if (mm.is_function()) {
-    TValue args[2] = {table, key};
-    TValue out;
-    call_mm(L, mm, args, 2, &out, 1);
-    return out;
-  }
-  if (mm.is_table())
-    return meta_index(L, mm, key);
-  panic("invalid __index metamethod");
+  panic("'__index' chain too long; possible loop");
 }
 
 void meta_newindex(State* L, const TValue& table, const TValue& key, const TValue& value) {
-  if (table.is_table()) {
-    TValue cur = table.as_table()->get(key);
-    if (!cur.is_nil() || !table.as_table()->metatable) {
-      table.as_table()->set(L, key, value);
+  TValue t = table;
+  for (int loop = 0; loop < kMaxTagLoop; ++loop) {
+    if (t.is_table()) {
+      TValue cur = t.as_table()->get(key);
+      if (!cur.is_nil()) {
+        t.as_table()->set(L, key, value);
+        return;
+      }
+      TValue mm = get_metamethod(L, t, "__newindex");
+      if (mm.is_nil()) {
+        t.as_table()->set(L, key, value);
+        return;
+      }
+      if (mm.is_function()) {
+        TValue args[3] = {t, key, value};
+        TValue out;
+        call_mm(L, mm, args, 3, &out, 0);
+        return;
+      }
+      t = mm;
+      continue;
+    }
+    TValue mm = get_metamethod(L, t, "__newindex");
+    if (mm.is_nil())
+      panic("attempt to index a non-table value");
+    if (mm.is_function()) {
+      TValue args[3] = {t, key, value};
+      TValue out;
+      call_mm(L, mm, args, 3, &out, 0);
       return;
     }
-    // key absent -- check __newindex
+    t = mm;
   }
-  TValue mm = get_metamethod(L, table, "__newindex");
-  if (mm.is_nil()) {
-    if (!table.is_table())
-      panic("attempt to index a non-table value");
-    table.as_table()->set(L, key, value);
-    return;
-  }
-  if (mm.is_function()) {
-    TValue args[3] = {table, key, value};
-    TValue out;
-    call_mm(L, mm, args, 3, &out, 0);
-    return;
-  }
-  if (mm.is_table()) {
-    meta_newindex(L, mm, key, value);
-    return;
-  }
-  panic("invalid __newindex metamethod");
+  panic("'__newindex' chain too long; possible loop");
 }
 
 bool meta_arith(State* L, const char* mt_name, const TValue& a, const TValue& b, TValue* out) {
@@ -206,9 +227,11 @@ bool meta_eq(State* L, const TValue& a, const TValue& b, bool* out_eq) {
       *out_eq = true;
       return true;
     }
+    // PUC 5.3: use __eq from a, else from b (either side is enough).
     TValue mm = get_metamethod(L, a, "__eq");
-    TValue mm2 = get_metamethod(L, b, "__eq");
-    if (mm.is_nil() || mm.payload != mm2.payload || !mm.is_function()) {
+    if (mm.is_nil())
+      mm = get_metamethod(L, b, "__eq");
+    if (mm.is_nil() || !mm.is_function()) {
       *out_eq = false;
       return true;
     }
@@ -326,4 +349,4 @@ int meta_call(State* L, int func_idx, int nargs, int nresults) {
   return call_closure(L, mm.as_closure(), nargs + 1, nresults);
 }
 
-} // namespace lj3
+} // namespace luatier

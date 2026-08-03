@@ -5,7 +5,7 @@
 
 #include <cstring>
 
-namespace lj3 {
+namespace luatier {
 
 namespace {
 
@@ -157,7 +157,7 @@ TValue read_const(State* L, Reader& r) {
   }
 }
 
-// Body layout is LuaJIT3-native (not PUC instruction stream); header is PUC-compatible
+// Body layout is LuaTier-native (not PUC instruction stream); header is PUC-compatible
 // so official suite header/truncation checks pass.
 void write_proto(Writer& w, Proto* p, bool strip, const std::string* parent_source) {
   w.u32(static_cast<uint32_t>(p->numparams));
@@ -324,4 +324,4 @@ Proto* undump_proto(State* L, const std::string& blob, const std::string& name) 
   return read_proto(L, r, name, strip);
 }
 
-} // namespace lj3
+} // namespace luatier

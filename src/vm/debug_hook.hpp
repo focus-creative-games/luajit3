@@ -2,7 +2,7 @@
 
 #include "vm/state.hpp"
 
-namespace lj3 {
+namespace luatier {
 
 enum DebugHookMask : int {
   DEBUG_HOOK_CALL = 1,
@@ -23,4 +23,4 @@ void debug_return_hook(State* L, Thread* th);
 // After a frame is popped: sync oldpc to the caller.
 void debug_on_return(State* L, Thread* th);
 
-} // namespace lj3
+} // namespace luatier

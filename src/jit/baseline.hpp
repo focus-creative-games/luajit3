@@ -2,7 +2,7 @@
 
 #include "runtime/closure.hpp"
 
-namespace lj3 {
+namespace luatier {
 
 // Phase 2 baseline JIT: records compilation requests and provides a stub
 // native entry that immediately deopts to the interpreter until real codegen lands.
@@ -18,4 +18,4 @@ void baseline_request_compile(Proto* p);
 JitCode* baseline_lookup(Proto* p);
 bool baseline_try_enter(State* L, Proto* p);
 
-} // namespace lj3
+} // namespace luatier

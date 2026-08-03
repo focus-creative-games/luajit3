@@ -1,6 +1,6 @@
 #include "frontend/parser.hpp"
 
-namespace lj3 {
+namespace luatier {
 
 namespace {
 
@@ -619,4 +619,4 @@ ExprPtr Parser::parse_table() {
   return tab;
 }
 
-} // namespace lj3
+} // namespace luatier

@@ -4,7 +4,7 @@
 
 #include <unordered_map>
 
-namespace lj3 {
+namespace luatier {
 
 namespace {
 std::unordered_map<Proto*, uint64_t> entries;
@@ -30,4 +30,4 @@ void hotness_on_loop(Proto* p) {
 uint64_t hotness_entry_count(Proto* p) { return entries[p]; }
 uint64_t hotness_loop_count(Proto* p) { return loops[p]; }
 
-} // namespace lj3
+} // namespace luatier

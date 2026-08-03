@@ -13,7 +13,7 @@
 #define LUA_MULTRET (-1)
 #endif
 
-namespace lj3 {
+namespace luatier {
 using namespace lib;
 
 static int co_create(State* L) {
@@ -55,9 +55,22 @@ static int co_resume(State* L) {
     return return_ok(std::move(results));
   };
 
+  auto return_err = [&](const char* msg) -> int {
+    L->current = from;
+    L->settop(0);
+    L->push(TValue::boolean(false));
+    push_string(L, msg);
+    return 2;
+  };
+
+  // PUC: resume of dead / non-suspended returns false+msg and does not
+  // change the coroutine status (running stays "running").
+  if (co->status == Thread::Status::Dead || co->status == Thread::Status::Error)
+    return return_err("cannot resume dead coroutine");
+  if (co->status != Thread::Status::Fresh && co->status != Thread::Status::Suspended)
+    return return_err("cannot resume non-suspended coroutine");
+
   try {
-    if (co->status == Thread::Status::Dead)
-      panic("cannot resume dead coroutine");
     L->current = co;
     int st = LUA_OK;
     if (co->status == Thread::Status::Fresh) {
@@ -74,7 +87,7 @@ static int co_resume(State* L) {
       if (!f.is_function())
         panic("coroutine main is not a function");
       st = call_closure(L, f.as_closure(), nargs, LUA_MULTRET);
-    } else if (co->status == Thread::Status::Suspended) {
+    } else {
       // Finish the yielded C call: drop its frame, then write resume values into
       // the caller's result slots (same as a normal C return).
       if (!co->frames.empty() && co->frames.back().kind == FrameKind::CApi &&
@@ -95,11 +108,9 @@ static int co_resume(State* L) {
       // Do not use set_abs_top here — growing top nil-fills and would wipe the values.
       co->top = dest + nplace;
       co->status = Thread::Status::Running;
-      // min_frames=1: keep running through outer Lua frames after an inner RETURN.
-      // (Default interpret depth would treat the first RETURN as coroutine end.)
-      st = interpret(L, 1);
-    } else {
-      panic("cannot resume non-suspended coroutine");
+      // Drain Continue frames (yieldable pcall/xpcall) and run Lua until the
+      // next yield or the coroutine body returns.
+      st = resume_after_yield(L, true, nullptr);
     }
 
     if (st == LUA_YIELD)
@@ -112,11 +123,44 @@ static int co_resume(State* L) {
       results[static_cast<size_t>(i)] = co->stack[static_cast<size_t>(i)];
     co->status = Thread::Status::Dead;
     return return_ok(std::move(results));
-  } catch (const Lj3Error& e) {
+  } catch (const LuatierError& e) {
+    bool had_continue = false;
+    for (auto& fr : co->frames) {
+      if (fr.kind == FrameKind::Continue) {
+        had_continue = true;
+        break;
+      }
+    }
+    if (had_continue) {
+      try {
+        int st = resume_after_yield(L, false, e.what());
+        if (st == LUA_YIELD)
+          return return_yield();
+        int nret = L->abs_top();
+        std::vector<TValue> results(static_cast<size_t>(nret));
+        for (int i = 0; i < nret; ++i)
+          results[static_cast<size_t>(i)] = co->stack[static_cast<size_t>(i)];
+        co->status = Thread::Status::Dead;
+        return return_ok(std::move(results));
+      } catch (const LuatierError& e2) {
+        L->current = from;
+        TValue emsg = co->err_obj_set ? co->err_obj
+                                       : TValue::obj(ValueTag::String, L->intern(e2.what()));
+        co->err_obj_set = false;
+        L->settop(0);
+        L->push(TValue::boolean(false));
+        L->push(emsg);
+        co->status = Thread::Status::Dead;
+        return 2;
+      }
+    }
     L->current = from;
+    TValue emsg = co->err_obj_set ? co->err_obj
+                                   : TValue::obj(ValueTag::String, L->intern(e.what()));
+    co->err_obj_set = false;
     L->settop(0);
     L->push(TValue::boolean(false));
-    push_string(L, e.what());
+    L->push(emsg);
     co->status = Thread::Status::Dead;
     return 2;
   }
@@ -124,7 +168,10 @@ static int co_resume(State* L) {
 
 static int coro_yield(State* L) {
   if (L->current == L->main)
-    panic("cannot yield from main thread");
+    panic("attempt to yield from outside a coroutine");
+  // nny includes this yield C frame (always +1); >1 means an outer non-yieldable C.
+  if (L->current->nny > 1)
+    panic("attempt to yield across a C-call boundary");
   L->yield_pending = true;
   L->current->status = Thread::Status::Suspended;
   return L->gettop();
@@ -155,14 +202,17 @@ static int co_running(State* L) {
 }
 
 static int co_isyieldable(State* L) {
+  // nny includes this C frame (+1). Yieldable when no outer non-yieldable C.
   L->settop(0);
-  L->push(TValue::boolean(L->current != L->main));
+  L->push(TValue::boolean(L->current != L->main && L->current->nny <= 1));
   return 1;
 }
 
 static int wrap_body(State* L) {
   Closure* self = L->current->frames.back().cl;
-  TValue thv = L->registry->get(TValue::obj(ValueTag::Function, self));
+  if (self->upvals.empty() || !self->upvals[0])
+    panic("wrap: bad coroutine");
+  TValue thv = self->upvals[0]->get();
   if (!thv.is_thread())
     panic("wrap: bad coroutine");
   int nargs = L->gettop();
@@ -175,8 +225,11 @@ static int wrap_body(State* L) {
     L->push(a);
   co_resume(L);
   if (L->gettop() >= 1 && !L->at(1)->is_truthy()) {
-    std::string err = value_to_string(*L->at(2));
-    panic(err);
+    // Propagate the original error object (PUC luaB_auxwrap).
+    TValue err = L->gettop() >= 2 ? *L->at(2) : TValue::obj(ValueTag::String, L->intern("error"));
+    L->current->err_obj = err;
+    L->current->err_obj_set = true;
+    panic(value_to_string(err));
   }
   int nret = L->gettop() - 1;
   std::vector<TValue> outs(static_cast<size_t>(nret));
@@ -194,7 +247,13 @@ static int co_wrap(State* L) {
   co_create(L);
   Thread* th = L->at(1)->as_thread();
   Closure* cl = closure_new_c(L, wrap_body);
-  L->registry->set(L, TValue::obj(ValueTag::Function, cl), TValue::obj(ValueTag::Thread, th));
+  // Thread lives in an upvalue so wrap can be collected (gc.lua / coroutine.lua).
+  auto* uv = L->gc.create<UpVal>(GcKind::UpVal);
+  uv->open = false;
+  uv->closed = TValue::obj(ValueTag::Thread, th);
+  uv->thread = nullptr;
+  uv->stack_index = -1;
+  cl->upvals.push_back(uv);
   L->settop(0);
   L->push(TValue::obj(ValueTag::Function, cl));
   return 1;
@@ -212,4 +271,4 @@ void open_coroutine_lib(State* L) {
   set_global_value(L, "coroutine", TValue::obj(ValueTag::Table, co));
 }
 
-} // namespace lj3
+} // namespace luatier

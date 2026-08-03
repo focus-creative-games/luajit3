@@ -7,7 +7,7 @@
 #include <functional>
 #include <vector>
 
-namespace lj3 {
+namespace luatier {
 
 struct UpVal;
 
@@ -40,9 +40,11 @@ struct Proto : GcObject {
   int maxstack = 0;
   int numparams = 0;
   bool is_vararg = false;
+  // Last closure created for this proto (PUC p->cache); reused when upvalues match.
+  Closure* cache = nullptr;
 };
 
 Closure* closure_new_lua(State* L, Proto* p);
 Closure* closure_new_c(State* L, CFunction f);
 
-} // namespace lj3
+} // namespace luatier

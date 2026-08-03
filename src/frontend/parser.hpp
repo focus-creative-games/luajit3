@@ -3,7 +3,7 @@
 #include "frontend/ast.hpp"
 #include "frontend/lexer.hpp"
 
-namespace lj3 {
+namespace luatier {
 
 class Parser {
 public:
@@ -47,4 +47,4 @@ private:
 
 std::unique_ptr<Chunk> parse(std::string_view src, const std::string& name = "chunk");
 
-} // namespace lj3
+} // namespace luatier

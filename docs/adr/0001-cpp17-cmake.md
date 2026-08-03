@@ -6,13 +6,13 @@ Accepted
 
 ## Context
 
-LuaJIT3 is a from-scratch runtime. Implementation language and build system must be fixed before code lands.
+LuaTier is a from-scratch runtime. Implementation language and build system must be fixed before code lands.
 
 ## Decision
 
 - Use **C++17** for all core components
 - Use **CMake** 3.16+ as the build system
-- Produce static library `luajit3` and CLI `luajit3`
+- Produce static library `luatier` and CLI `luatier`
 - Prefer sanitizer-friendly code; avoid mandatory exceptions in VM hot paths (exceptions allowed at API boundaries if needed)
 
 ## Consequences

@@ -38,7 +38,7 @@ Not required initially:
 
 ### C. ABI compatibility (non-goal)
 
-LuaJIT3 may define its own:
+LuaTier may define its own:
 
 - `TValue` and object layouts
 - Call frames and native calling conventions for JIT code

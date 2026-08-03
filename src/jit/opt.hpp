@@ -3,7 +3,7 @@
 #include "jit/baseline.hpp"
 #include "runtime/closure.hpp"
 
-namespace lj3 {
+namespace luatier {
 
 // Phase 3 optimizing JIT scaffolding: SSA MIR passes will attach here.
 struct MirModule {
@@ -14,4 +14,4 @@ struct MirModule {
 void opt_request_compile(Proto* p);
 MirModule* opt_lookup(Proto* p);
 
-} // namespace lj3
+} // namespace luatier

@@ -1,6 +1,6 @@
 #include "jit/ic.hpp"
 
-namespace lj3 {
+namespace luatier {
 
 IcState ic_observe_type(IcSlot& slot, ValueTag tag) {
   slot.hits++;
@@ -30,4 +30,4 @@ void ic_invalidate(IcSlot& slot) {
   slot = {};
 }
 
-} // namespace lj3
+} // namespace luatier

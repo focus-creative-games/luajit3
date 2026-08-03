@@ -5,7 +5,7 @@
 
 #include <vector>
 
-namespace lj3 {
+namespace luatier {
 
 struct TableNode {
   TValue key;
@@ -35,4 +35,4 @@ struct Table : GcObject {
 
 Table* table_new(State* L, size_t array_hint = 0, size_t hash_hint = 0);
 
-} // namespace lj3
+} // namespace luatier

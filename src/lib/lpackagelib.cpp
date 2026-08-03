@@ -12,7 +12,7 @@
 #define LUA_MULTRET (-1)
 #endif
 
-namespace lj3 {
+namespace luatier {
 using namespace lib;
 
 #ifdef _WIN32
@@ -265,4 +265,4 @@ void open_package_lib(State* L) {
   set_global_value(L, "package", TValue::obj(ValueTag::Table, pkg));
 }
 
-} // namespace lj3
+} // namespace luatier

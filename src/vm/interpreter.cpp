@@ -7,6 +7,7 @@
 #include "vm/meta.hpp"
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 
 #ifndef LUA_MULTRET
@@ -19,7 +20,7 @@
 #define LUA_YIELD 1
 #endif
 
-namespace lj3 {
+namespace luatier {
 
 namespace {
 
@@ -213,10 +214,12 @@ int run_c_call(State* L, Closure* cl, int func_idx, int nargs, int nresults,
   th->stack_base = func_idx + 1;
   th->top = func_idx + 1 + nargs;
   L->yield_pending = false;
+  th->nny++;
   int nret = 0;
   try {
     nret = cl->cfunc(L);
-  } catch (const Lj3Error&) {
+  } catch (const LuatierError&) {
+    th->nny--;
     th->stack_base = prev_base;
     // Non-main threads keep the C frame so debug.traceback can show
     // `error` / the failing C call on a dead coroutine (db.lua).
@@ -247,16 +250,45 @@ int run_c_call(State* L, Closure* cl, int func_idx, int nargs, int nresults,
   // Yield: keep the C frame on the stack (PUC CallInfo stays) so traceback can
   // see `coroutine.yield` and resume can finish the call.
   if (L->yield_pending) {
+    th->stack_base = prev_base;
+    if (L->yield_continue) {
+      // Nested yieldable C (pcall/xpcall): mark *this* C frame as a continuation.
+      // frames.back() may be the inner yield CApi frame kept below — find ours.
+      CallFrame* self = nullptr;
+      for (int i = static_cast<int>(th->frames.size()) - 1; i >= 0; --i) {
+        auto& fr = th->frames[static_cast<size_t>(i)];
+        if (fr.cl == cl && fr.kind == FrameKind::CApi && fr.base == func_idx) {
+          self = &fr;
+          break;
+        }
+      }
+      if (!self)
+        panic("yieldable C: missing frame");
+      self->kind = FrameKind::Continue;
+      self->cont_kind = L->yield_cont_kind;
+      self->cont_ctx = L->yield_cont_ctx;
+      self->cont_res_base = L->yield_cont_res_base;
+      self->expected_results = nresults;
+      L->yield_continue = false;
+      L->yield_cont_kind = CallFrame::ContKind::None;
+      L->yield_cont_ctx = TValue::nil();
+      L->yield_cont_res_base = 0;
+      L->yield_pending = false;
+      // pcall/xpcall already cancelled this frame's nny++ via nny-- around the
+      // protected call; leave nny unchanged on the continue path.
+      return LUA_YIELD;
+    }
     th->yield_vals = std::move(results);
     th->yield_func_idx = func_idx;
     th->yield_nresults = nresults;
-    th->stack_base = prev_base;
     L->ensure_stack(func_idx + 8);
     th->top = func_idx;
     L->yield_pending = false;
+    th->nny--; // drop this C frame's nny; frame stays for resume
     return LUA_YIELD;
   }
 
+  th->nny--;
   debug_return_hook(L, th);
   th->frames.pop_back();
   debug_on_return(L, th);
@@ -300,6 +332,9 @@ int interpret(State* L, int min_frames) {
   while (static_cast<int>(th->frames.size()) >= entry_depth && !th->frames.empty()) {
     const size_t fi = th->frames.size() - 1;
     auto& fr0 = th->frames[fi];
+    // Hit a C/continuation frame: return to the resume driver.
+    if (fr0.kind == FrameKind::Continue || fr0.kind == FrameKind::CApi || !fr0.proto)
+      return LUA_OK;
     Closure* cl = fr0.cl;
     Proto* p = fr0.proto;
     if (fr0.saved_pc >= static_cast<int>(p->code.size())) {
@@ -549,8 +584,10 @@ int interpret(State* L, int min_frames) {
         base[a] = base[b];
       break;
     case OpCode::JMP: {
-      if (a != 0)
-        L->close_upvals(th, fbase() + (a - 1));
+      if (a != 0) {
+        int level = fbase() + (a - 1);
+        L->close_upvals(th, level);
+      }
       pc() += op_sbx(ins);
       hotness_on_loop(p);
       break;
@@ -672,10 +709,13 @@ int interpret(State* L, int min_frames) {
       th->stack[static_cast<size_t>(cb + 1)] = base[a + 1];
       th->stack[static_cast<size_t>(cb + 2)] = base[a + 2];
       L->current->top = cb + 3;
-      if (!f.is_function())
+      if (!f.is_function()) {
         meta_call(L, cb, 2, c);
-      else
-        call_closure(L, f.as_closure(), 2, c);
+      } else {
+        int st = call_closure(L, f.as_closure(), 2, c);
+        if (st == LUA_YIELD)
+          return LUA_YIELD;
+      }
       // Results already land at cb == base+a+3; reload only for safety.
       (void)reload();
       break;
@@ -707,6 +747,35 @@ int interpret(State* L, int min_frames) {
       if (bx >= p->protos.size())
         panic("CLOSURE: bad proto index");
       Proto* np = p->protos[bx];
+      // PUC getcached: reuse last closure when every upvalue location matches.
+      Closure* cached = np->cache;
+      if (cached && cached->upvals.size() == np->upvalues.size()) {
+        bool ok = true;
+        for (size_t uv = 0; uv < np->upvalues.size(); ++uv) {
+          auto& d = np->upvalues[uv];
+          UpVal* have = cached->upvals[uv];
+          if (!have) {
+            ok = false;
+            break;
+          }
+          if (d.instack) {
+            if (!have->open || have->thread != th || have->stack_index != fbase() + d.idx) {
+              ok = false;
+              break;
+            }
+          } else {
+            if (d.idx >= cl->upvals.size() || have != cl->upvals[d.idx]) {
+              ok = false;
+              break;
+            }
+          }
+        }
+        if (ok) {
+          base = reload();
+          base[a] = TValue::obj(ValueTag::Function, cached);
+          break;
+        }
+      }
       Closure* ncl = closure_new_lua(L, np);
       for (size_t uv = 0; uv < np->upvalues.size(); ++uv) {
         auto& d = np->upvalues[uv];
@@ -718,6 +787,7 @@ int interpret(State* L, int min_frames) {
           ncl->upvals[uv] = cl->upvals[d.idx];
         }
       }
+      np->cache = ncl;
       base = reload();
       base[a] = TValue::obj(ValueTag::Function, ncl);
       break;
@@ -842,4 +912,116 @@ int interpret(State* L, int min_frames) {
   return LUA_OK;
 }
 
-} // namespace lj3
+namespace {
+
+void place_abs_results(State* L, int dest, int want, const std::vector<TValue>& results) {
+  Thread* th = L->current;
+  int nret = static_cast<int>(results.size());
+  int placed = (want == LUA_MULTRET) ? nret : want;
+  if (placed < 0)
+    placed = 0;
+  L->ensure_stack(dest + placed + 8);
+  for (int i = 0; i < placed; ++i)
+    th->stack[static_cast<size_t>(dest + i)] =
+        (i < nret) ? results[static_cast<size_t>(i)] : TValue::nil();
+  th->top = dest + placed;
+}
+
+int finish_continue_frame(State* L, bool ok, const char* err_msg) {
+  Thread* th = L->current;
+  if (th->frames.empty())
+    return LUA_OK;
+  CallFrame cfr = th->frames.back();
+  if (cfr.kind != FrameKind::Continue || cfr.cont_kind == CallFrame::ContKind::None)
+    return LUA_OK;
+  th->frames.pop_back();
+
+  std::vector<TValue> outs;
+  if (ok) {
+    int base = cfr.cont_res_base;
+    int nret = th->top - base;
+    if (nret < 0)
+      nret = 0;
+    outs.push_back(TValue::boolean(true));
+    for (int i = 0; i < nret; ++i)
+      outs.push_back(th->stack[static_cast<size_t>(base + i)]);
+  } else {
+    outs.push_back(TValue::boolean(false));
+    TValue emsg;
+    if (th->err_obj_set) {
+      emsg = th->err_obj;
+      th->err_obj_set = false;
+    } else {
+      emsg = TValue::obj(ValueTag::String, L->intern(err_msg ? err_msg : ""));
+    }
+    if (cfr.cont_kind == CallFrame::ContKind::XPCall && cfr.cont_ctx.is_function()) {
+      try {
+        int slot = th->top;
+        L->ensure_stack(slot + 4);
+        th->stack[static_cast<size_t>(slot)] = cfr.cont_ctx;
+        th->stack[static_cast<size_t>(slot + 1)] = emsg;
+        th->top = slot + 2;
+        th->stack_base = 0;
+        int st = call_closure(L, cfr.cont_ctx.as_closure(), 1, 1);
+        if (st == LUA_YIELD)
+          return LUA_YIELD;
+        emsg = (th->top > slot) ? th->stack[static_cast<size_t>(slot)] : TValue::nil();
+      } catch (const LuatierError& e) {
+        if (th->err_obj_set) {
+          emsg = th->err_obj;
+          th->err_obj_set = false;
+        } else {
+          emsg = TValue::obj(ValueTag::String, L->intern(e.what()));
+        }
+      }
+    }
+    outs.push_back(emsg);
+  }
+  place_abs_results(L, cfr.base, cfr.expected_results, outs);
+  return LUA_OK;
+}
+
+} // namespace
+
+int resume_after_yield(State* L, bool ok, const char* err_msg) {
+  Thread* th = L->current;
+  if (!ok) {
+    while (!th->frames.empty()) {
+      auto& fr = th->frames.back();
+      if (fr.kind == FrameKind::Continue)
+        break;
+      if (fr.kind == FrameKind::CApi && !fr.proto) {
+        th->frames.pop_back();
+        continue;
+      }
+      L->close_upvals(th, fr.base);
+      th->frames.pop_back();
+    }
+    if (!th->frames.empty() && th->frames.back().kind == FrameKind::Continue) {
+      int st = finish_continue_frame(L, false, err_msg);
+      if (st == LUA_YIELD)
+        return LUA_YIELD;
+    }
+    // Outer Continue frames (e.g. xpcall around pcall) see the false+msg
+    // tuple as a normal protected-call result.
+  }
+
+  for (;;) {
+    while (!th->frames.empty() && th->frames.back().kind == FrameKind::Continue) {
+      int st = finish_continue_frame(L, true, nullptr);
+      if (st == LUA_YIELD)
+        return LUA_YIELD;
+    }
+    if (th->frames.empty())
+      return LUA_OK;
+    if (th->frames.back().kind == FrameKind::CApi || !th->frames.back().proto)
+      return LUA_OK;
+    int st = interpret(L, 1);
+    if (st == LUA_YIELD)
+      return LUA_YIELD;
+    if (th->frames.empty() || th->frames.back().kind != FrameKind::Continue)
+      return LUA_OK;
+  }
+}
+
+} // namespace luatier

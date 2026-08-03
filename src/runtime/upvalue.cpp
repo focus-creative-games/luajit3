@@ -2,7 +2,7 @@
 
 #include "vm/state.hpp"
 
-namespace lj3 {
+namespace luatier {
 
 TValue UpVal::get() const {
   if (!open)
@@ -28,4 +28,4 @@ void UpVal::close(State* L) {
   L->gc.barrier(this, closed);
 }
 
-} // namespace lj3
+} // namespace luatier

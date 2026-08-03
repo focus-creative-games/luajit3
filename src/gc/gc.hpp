@@ -5,7 +5,7 @@
 #include <cstddef>
 #include <vector>
 
-namespace lj3 {
+namespace luatier {
 
 enum class GcColor : uint8_t { White0 = 0, White1 = 1, Gray = 2, Black = 3 };
 
@@ -85,4 +85,4 @@ private:
   bool gc_isrunning_ = true;
 };
 
-} // namespace lj3
+} // namespace luatier

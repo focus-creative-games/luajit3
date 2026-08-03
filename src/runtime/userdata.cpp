@@ -3,7 +3,7 @@
 #include "runtime/table.hpp"
 #include "vm/state.hpp"
 
-namespace lj3 {
+namespace luatier {
 
 Userdata* userdata_new(State* L, size_t size, Table* mt) {
   auto* u = L->gc.create<Userdata>(GcKind::Userdata);
@@ -18,4 +18,4 @@ void* userdata_data(Userdata* u) { return u->data.data(); }
 
 const void* userdata_data(const Userdata* u) { return u->data.data(); }
 
-} // namespace lj3
+} // namespace luatier

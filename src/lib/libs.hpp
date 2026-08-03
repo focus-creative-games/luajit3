@@ -2,7 +2,7 @@
 
 #include "vm/state.hpp"
 
-namespace lj3 {
+namespace luatier {
 
 void open_base_lib(State* L);
 void open_coroutine_lib(State* L);
@@ -20,4 +20,4 @@ void package_set_loaded(State* L, const char* name, const TValue& mod);
 
 void open_libs(State* L);
 
-} // namespace lj3
+} // namespace luatier

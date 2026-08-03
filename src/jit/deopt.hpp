@@ -3,7 +3,7 @@
 #include "runtime/closure.hpp"
 #include "vm/state.hpp"
 
-namespace lj3 {
+namespace luatier {
 
 struct StackMapSlot {
   int reg = -1;
@@ -18,4 +18,4 @@ struct DeoptPoint {
 // Reconstruct interpreter state at bytecode_pc (Phase 2+ full maps).
 void deopt_to_interpreter(State* L, Proto* p, int bytecode_pc);
 
-} // namespace lj3
+} // namespace luatier

@@ -5,7 +5,7 @@
 #include <iostream>
 #include <unordered_map>
 
-namespace lj3 {
+namespace luatier {
 
 namespace {
 std::unordered_map<Proto*, JitCode> codes;
@@ -20,8 +20,8 @@ void baseline_request_compile(Proto* p) {
   // Stub "compilation": mark as baseline-ready with null entry (always deopt).
   jc.tier = Tier::Baseline;
   jc.entry = nullptr;
-  if (std::getenv("LJ3_JIT_LOG"))
-    std::cerr << "[lj3] baseline compile stub for proto@" << p << " maxstack=" << p->maxstack
+  if (std::getenv("LUATIER_JIT_LOG"))
+    std::cerr << "[luatier] baseline compile stub for proto@" << p << " maxstack=" << p->maxstack
               << "\n";
 }
 
@@ -39,4 +39,4 @@ bool baseline_try_enter(State* L, Proto* p) {
   return false;
 }
 
-} // namespace lj3
+} // namespace luatier

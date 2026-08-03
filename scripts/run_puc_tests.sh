@@ -2,14 +2,14 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SUITE="${ROOT}/tests/lua-5.3.4-tests"
-if [[ -x "${ROOT}/build/luajit3" ]]; then
-  LUA="${ROOT}/build/luajit3"
-elif [[ -x "${ROOT}/build/Debug/luajit3" ]]; then
-  LUA="${ROOT}/build/Debug/luajit3"
-elif [[ -x "${ROOT}/build/Release/luajit3" ]]; then
-  LUA="${ROOT}/build/Release/luajit3"
+if [[ -x "${ROOT}/build/luatier" ]]; then
+  LUA="${ROOT}/build/luatier"
+elif [[ -x "${ROOT}/build/Debug/luatier" ]]; then
+  LUA="${ROOT}/build/Debug/luatier"
+elif [[ -x "${ROOT}/build/Release/luatier" ]]; then
+  LUA="${ROOT}/build/Release/luatier"
 else
-  echo "luajit3 binary not found; build first" >&2
+  echo "luatier binary not found; build first" >&2
   exit 1
 fi
 cd "$SUITE"

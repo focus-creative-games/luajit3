@@ -1,6 +1,6 @@
 #pragma once
 
-#include "luajit3/lua.h"
+#include "luatier/lua.h"
 
 #ifdef __cplusplus
 extern "C" {

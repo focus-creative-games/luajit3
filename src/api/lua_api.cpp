@@ -1,5 +1,5 @@
-#include "luajit3/lua.h"
-#include "luajit3/lauxlib.h"
+#include "luatier/lua.h"
+#include "luatier/lauxlib.h"
 
 #include "lib/libs.hpp"
 #include "vm/meta.hpp"
@@ -10,7 +10,7 @@
 #include <fstream>
 #include <sstream>
 
-using namespace lj3;
+using namespace luatier;
 
 struct lua_State {
   State* st;
@@ -102,7 +102,7 @@ int lua_pcall(lua_State* L, int nargs, int nresults, int) {
     }
     Closure* cl = L->st->at(func_idx)->as_closure();
     return L->st->resume_call(cl, nargs, nresults);
-  } catch (const Lj3Error& e) {
+  } catch (const LuatierError& e) {
     L->st->settop(func_idx - 1);
     L->st->push(TValue::obj(ValueTag::String, L->st->intern(e.what())));
     return LUA_ERRRUN;

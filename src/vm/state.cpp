@@ -20,7 +20,7 @@
 #define LUA_ERRRUN 2
 #endif
 
-namespace lj3 {
+namespace luatier {
 
 #ifndef LUA_MULTRET
 #define LUA_MULTRET (-1)
@@ -38,9 +38,9 @@ State::State() : gc(this) {
   globals->set(this, TValue::obj(ValueTag::String, intern("_G")),
                TValue::obj(ValueTag::Table, globals));
   open_libs(this);
-  const char* deopt = std::getenv("LJ3_STRESS_FORCE_DEOPT");
+  const char* deopt = std::getenv("LUATIER_STRESS_FORCE_DEOPT");
   force_deopt = deopt && deopt[0] == '1';
-  const char* ic = std::getenv("LJ3_STRESS_DISABLE_IC");
+  const char* ic = std::getenv("LUATIER_STRESS_DISABLE_IC");
   disable_ic = ic && ic[0] == '1';
 }
 
@@ -155,7 +155,7 @@ int State::load_string(const std::string& source, const std::string& chunk_name)
     }
     push(TValue::obj(ValueTag::Function, cl));
     return LUA_OK;
-  } catch (const Lj3Error& e) {
+  } catch (const LuatierError& e) {
     push(TValue::obj(ValueTag::String, intern(e.what())));
     return LUA_ERRSYNTAX;
   }
@@ -166,7 +166,7 @@ int State::pcall(int nargs, int nresults) {
   (void)func_idx;
   try {
     return resume_call(at(gettop() - nargs)->as_closure(), nargs, nresults);
-  } catch (const Lj3Error& e) {
+  } catch (const LuatierError& e) {
     settop(gettop() - nargs - 1);
     push(TValue::obj(ValueTag::String, intern(e.what())));
     return LUA_ERRRUN;
@@ -177,4 +177,4 @@ int State::resume_call(Closure* cl, int nargs, int nresults) {
   return call_closure(this, cl, nargs, nresults);
 }
 
-} // namespace lj3
+} // namespace luatier

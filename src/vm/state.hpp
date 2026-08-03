@@ -12,7 +12,7 @@
 #include <string>
 #include <vector>
 
-namespace lj3 {
+namespace luatier {
 
 enum class FrameKind : uint8_t {
   InterpLua,
@@ -38,6 +38,11 @@ struct CallFrame {
   bool finalizer = false; // __gc finalizer call (namewhat "metamethod")
   int protect_top = 0;
   int protect_frames = 0;
+  // Yieldable C call (pcall/xpcall): continuation after the protected body
+  // returns or errors across a yield. cont_ctx holds xpcall's message handler.
+  enum class ContKind : uint8_t { None, PCall, XPCall } cont_kind = ContKind::None;
+  TValue cont_ctx{};
+  int cont_res_base = 0; // absolute stack index of protected-call results
 };
 
 struct DebugHookState {
@@ -59,6 +64,11 @@ struct Thread : GcObject {
   int stack_base = 0;
   enum class Status { Fresh, Running, Suspended, Dead, Error } status = Status::Fresh;
   std::string error;
+  // Non-yieldable C-call nesting (PUC L->nny). Yield only when nny==0.
+  int nny = 0;
+  // Original object from error(obj); used by pcall/xpcall instead of only the string.
+  TValue err_obj{};
+  bool err_obj_set = false;
   // After yield: values returned to resume; resume args fill CALL at yield_func_idx.
   std::vector<TValue> yield_vals;
   int yield_func_idx = 0;
@@ -82,6 +92,12 @@ struct State {
 
   // Coroutine yield: set by coroutine.yield C function; honored after C call returns.
   bool yield_pending = false;
+  // When set, run_c_call keeps the C frame as a continuation and does not
+  // rebind yield_func_idx (nested yieldable C: pcall/xpcall).
+  bool yield_continue = false;
+  CallFrame::ContKind yield_cont_kind = CallFrame::ContKind::None;
+  TValue yield_cont_ctx{};
+  int yield_cont_res_base = 0;
 
   State();
   ~State();
@@ -110,4 +126,4 @@ struct State {
 
 std::unique_ptr<State> new_state();
 
-} // namespace lj3
+} // namespace luatier

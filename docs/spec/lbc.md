@@ -1,4 +1,4 @@
-# LBC — LuaJIT3 Portable Register Bytecode
+# LBC — LuaTier Portable Register Bytecode
 
 **Status:** Phase 0 freeze (v0.1)  
 **Related:** [PROPOSAL.md](../../PROPOSAL.md) §7

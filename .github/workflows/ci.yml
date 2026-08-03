@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DLJ3_ENABLE_ASAN=ON -DLJ3_ENABLE_UBSAN=ON
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DLUATIER_ENABLE_ASAN=ON -DLUATIER_ENABLE_UBSAN=ON
       - name: Build
         run: cmake --build build -j
       - name: Test

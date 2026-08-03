@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-namespace lj3 {
+namespace luatier {
 
 enum class IcState : uint8_t { Uninitialized, Monomorphic, Polymorphic, Megamorphic };
 
@@ -19,4 +19,4 @@ struct IcSlot {
 IcState ic_observe_type(IcSlot& slot, ValueTag tag);
 void ic_invalidate(IcSlot& slot);
 
-} // namespace lj3
+} // namespace luatier
