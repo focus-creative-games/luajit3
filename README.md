@@ -30,6 +30,15 @@ ctest --test-dir build --output-on-failure
 - `src/api/` — Lua-compatible C API
 - `tests/` — unit + differential oracle tests
 
+## Benchmarks
+
+```powershell
+cmake --build build --config Release --target luatier_cli
+.\scripts\run_bench.ps1   # vs Lua 5.3.6; writes docs/bench-report.md
+```
+
+See [bench/README.md](bench/README.md).
+
 ## Stress env
 
 - `LUATIER_STRESS_GC_EVERY_SAFEPOINT=1`

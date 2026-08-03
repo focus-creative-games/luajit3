@@ -57,10 +57,11 @@ Targets:
 | `LUATIER_STRESS_TIER_THRASH` | aggressive tier up/down |
 | `LUATIER_STRESS_POISON_ALLOC` | allocator poison in Debug |
 
-## Benchmarks (post Phase 1)
+## Benchmarks
 
-- microbenchmarks under `bench/micro`
-- table-heavy / alloc-heavy / coroutine-heavy
+- microbenchmarks under `bench/micro` (arith / table / string / coro / GC / meta)
+- harness: `scripts/run_bench.ps1` vs reference PUC Lua (default Lua 5.3.6)
+- report: `docs/bench-report.md` (in-script `os.clock()`, best of N)
 - real-world scripts as available
 
 Performance never gates Phase 1. Phase 2+ require no semantic regressions vs interpreter.
