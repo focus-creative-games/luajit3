@@ -90,17 +90,35 @@ bool try_to_number(const TValue& v, TValue* out) {
                         s.find('p') != std::string::npos || s.find('P') != std::string::npos;
   if (!has_frac) {
     size_t hs = 0;
-    if (!s.empty() && (s[0] == '+' || s[0] == '-'))
+    int sign = 1;
+    if (!s.empty() && (s[0] == '+' || s[0] == '-')) {
+      if (s[0] == '-')
+        sign = -1;
       hs = 1;
+    }
     const bool hex = s.size() > hs + 2 && s[hs] == '0' && (s[hs + 1] == 'x' || s[hs + 1] == 'X');
-    try {
-      size_t idx = 0;
-      long long n = std::stoll(s, &idx, hex ? 0 : 10);
-      if (idx == s.size()) {
-        *out = TValue::integer(static_cast<int64_t>(n));
+    if (hex) {
+      uint64_t u = 0;
+      size_t i = hs + 2;
+      for (; i < s.size() && std::isxdigit(static_cast<unsigned char>(s[i])); ++i) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        int d = std::isdigit(c) ? (c - '0') : (std::tolower(c) - 'a' + 10);
+        u = (u << 4) + static_cast<uint64_t>(d);
+      }
+      if (i == s.size()) {
+        *out = TValue::integer(static_cast<int64_t>(sign < 0 ? (0u - u) : u));
         return true;
       }
-    } catch (...) {
+    } else {
+      try {
+        size_t idx = 0;
+        long long n = std::stoll(s, &idx, 10);
+        if (idx == s.size()) {
+          *out = TValue::integer(static_cast<int64_t>(n));
+          return true;
+        }
+      } catch (...) {
+      }
     }
   }
   double d = 0;

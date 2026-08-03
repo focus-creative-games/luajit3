@@ -556,27 +556,94 @@ int interpret(State* L, int min_frames) {
       break;
     }
     case OpCode::FORPREP: {
-      if (!base[a].is_number() || !base[a + 1].is_number() || !base[a + 2].is_number())
-        panic("'for' initial/limit/step must be a number");
-      // Lua 5.3: if all of init/limit/step are integers, the loop uses integers.
-      if (base[a].is_int() && base[a + 1].is_int() && base[a + 2].is_int()) {
-        int64_t idx = base[a].as_int();
+      // Coerce & pick integer vs float loop (PUC OP_FORPREP / forlimit).
+      // Integer +/- must wrap like Lua intop (unsigned), otherwise maxinteger
+      // loops are UB / can hang under optimizing compilers.
+      auto wrap_add = [](int64_t x, int64_t y) -> int64_t {
+        return static_cast<int64_t>(static_cast<uint64_t>(x) + static_cast<uint64_t>(y));
+      };
+      auto wrap_sub = [](int64_t x, int64_t y) -> int64_t {
+        return static_cast<int64_t>(static_cast<uint64_t>(x) - static_cast<uint64_t>(y));
+      };
+      auto tointeger_mode = [](const TValue& obj, int64_t* p, int mode) -> bool {
+        TValue n;
+        if (!try_to_number(obj, &n))
+          return false;
+        if (n.is_int() && mode != 0) {
+          *p = n.as_int();
+          return true;
+        }
+        double d = n.to_number();
+        if (mode == 1)
+          d = std::floor(d);
+        else if (mode == 2)
+          d = std::ceil(d);
+        if (d != d)
+          return false;
+        if (d < static_cast<double>(INT64_MIN) || d > static_cast<double>(INT64_MAX))
+          return false;
+        int64_t i = static_cast<int64_t>(d);
+        if (mode == 0 && static_cast<double>(i) != d)
+          return false;
+        *p = i;
+        return true;
+      };
+      auto forlimit = [&](const TValue& obj, int64_t step, int64_t* p, bool* stopnow) -> bool {
+        *stopnow = false;
+        int mode = (step < 0) ? 2 : 1;
+        if (tointeger_mode(obj, p, mode))
+          return true;
+        TValue nf;
+        if (!try_to_number(obj, &nf))
+          return false;
+        double n = nf.to_number();
+        if (n > 0) {
+          *p = INT64_MAX;
+          if (step < 0)
+            *stopnow = true;
+        } else {
+          *p = INT64_MIN;
+          if (step >= 0)
+            *stopnow = true;
+        }
+        return true;
+      };
+
+      if (base[a].is_int() && base[a + 2].is_int()) {
         int64_t step = base[a + 2].as_int();
-        base[a] = TValue::integer(idx - step);
-      } else {
-        double idx = base[a].to_number();
-        double step = base[a + 2].to_number();
-        base[a] = TValue::number(idx - step);
+        int64_t ilimit = 0;
+        bool stopnow = false;
+        if (forlimit(base[a + 1], step, &ilimit, &stopnow)) {
+          int64_t initv = stopnow ? 0 : base[a].as_int();
+          base[a + 1] = TValue::integer(ilimit);
+          base[a] = TValue::integer(wrap_sub(initv, step));
+          pc() += op_sbx(ins);
+          break;
+        }
       }
+      TValue nlimit, nstep, ninit;
+      if (!try_to_number(base[a + 1], &nlimit))
+        panic("'for' limit must be a number");
+      if (!try_to_number(base[a + 2], &nstep))
+        panic("'for' step must be a number");
+      if (!try_to_number(base[a], &ninit))
+        panic("'for' initial value must be a number");
+      double step = nstep.to_number();
+      base[a + 1] = TValue::number(nlimit.to_number());
+      base[a + 2] = TValue::number(step);
+      base[a] = TValue::number(ninit.to_number() - step);
       pc() += op_sbx(ins);
       break;
     }
     case OpCode::FORLOOP: {
       if (base[a].is_int() && base[a + 1].is_int() && base[a + 2].is_int()) {
+        auto wrap_add = [](int64_t x, int64_t y) -> int64_t {
+          return static_cast<int64_t>(static_cast<uint64_t>(x) + static_cast<uint64_t>(y));
+        };
         int64_t step = base[a + 2].as_int();
-        int64_t idx = base[a].as_int() + step;
+        int64_t idx = wrap_add(base[a].as_int(), step);
         int64_t limit = base[a + 1].as_int();
-        if ((step > 0) ? (idx <= limit) : (idx >= limit)) {
+        if ((step > 0) ? (idx <= limit) : (limit <= idx)) {
           pc() += op_sbx(ins);
           base[a] = TValue::integer(idx);
           base[a + 3] = TValue::integer(idx);

@@ -1025,6 +1025,10 @@ static int open_debug_module(State* L) {
 }
 
 void open_debug_lib(State* L) {
+  open_debug_module(L);
+  TValue dbg = *L->at(1);
+  L->settop(0);
+  set_global_value(L, "debug", dbg);
   Table* pkg = L->globals->get(TValue::obj(ValueTag::String, L->intern("package"))).as_table();
   Table* preload = pkg->get(TValue::obj(ValueTag::String, L->intern("preload"))).as_table();
   preload->set(L, TValue::obj(ValueTag::String, L->intern("debug")),

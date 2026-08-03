@@ -462,9 +462,11 @@ static int base_next(State* L) {
   }
 
   // Start hash from the beginning only after nil or a key that lived in array.
+  // Tombstones (used + nil value) still count as valid keys for `next` so that
+  // clearing fields during traversal remains defined (PUC pairs erase tests).
   bool seen = key.is_nil() || (key_is_index && ikey >= 1 && ikey <= asize);
   for (auto& n : t->hash) {
-    if (!n.used || n.value.is_nil())
+    if (!n.used)
       continue;
     int64_t hk = 0;
     if (key_as_next_index(n.key, &hk) && hk >= 1 && hk <= asize)
@@ -474,10 +476,14 @@ static int base_next(State* L) {
         seen = true;
       continue;
     }
+    if (n.value.is_nil())
+      continue; // skip tombstones / deleted entries when yielding
     L->push(n.key);
     L->push(n.value);
     return 2;
   }
+  if (!key.is_nil() && !seen)
+    panic("invalid key to 'next'");
   L->push(TValue::nil());
   return 1;
 }
@@ -485,6 +491,8 @@ static int base_next(State* L) {
 static int pairs_next_wrap(State* L) { return base_next(L); }
 
 static int base_pairs(State* L) {
+  if (L->gettop() < 1)
+    panic("bad argument #1 to 'pairs' (value expected)");
   TValue mm = get_metamethod(L, *L->at(1), "__pairs");
   if (mm.is_function()) {
     L->push(mm);
@@ -493,19 +501,22 @@ static int base_pairs(State* L) {
     return 3;
   }
   TValue t = *L->at(1);
+  // PUC: generator is the global `next` (same function object every time).
+  TValue nextf = L->globals->get(TValue::obj(ValueTag::String, L->intern("next")));
   L->settop(0);
-  L->push(TValue::obj(ValueTag::Function, closure_new_c(L, pairs_next_wrap)));
+  L->push(nextf.is_function() ? nextf
+                              : TValue::obj(ValueTag::Function, closure_new_c(L, pairs_next_wrap)));
   L->push(t);
   L->push(TValue::nil());
   return 3;
 }
 
 static int ipairs_iter(State* L) {
-  if (L->gettop() < 2 || !L->at(1)->is_table())
+  if (L->gettop() < 2)
     panic("bad argument to ipairs iterator");
-  Table* t = L->at(1)->as_table();
+  TValue t = *L->at(1);
   int64_t i = L->at(2)->is_number() ? static_cast<int64_t>(L->at(2)->to_number()) + 1 : 1;
-  TValue v = t->get_int(i);
+  TValue v = meta_index(L, t, TValue::integer(i));
   if (v.is_nil()) {
     L->settop(0);
     L->push(TValue::nil());
@@ -518,9 +529,16 @@ static int ipairs_iter(State* L) {
 }
 
 static int base_ipairs(State* L) {
+  if (L->gettop() < 1)
+    panic("bad argument #1 to 'ipairs' (value expected)");
   TValue t = *L->at(1);
+  // Upvalue 0 holds the shared ipairs iterator (PUC: ipairs{} == ipairs{}).
+  Closure* self = (!L->current->frames.empty()) ? L->current->frames.back().cl : nullptr;
+  TValue iter = (self && !self->upvals.empty() && self->upvals[0])
+                    ? self->upvals[0]->get()
+                    : TValue::obj(ValueTag::Function, closure_new_c(L, ipairs_iter));
   L->settop(0);
-  L->push(TValue::obj(ValueTag::Function, closure_new_c(L, ipairs_iter)));
+  L->push(iter);
   L->push(t);
   L->push(TValue::integer(0));
   return 3;
@@ -755,7 +773,18 @@ void open_base_lib(State* L) {
   set_global(L, "rawlen", base_rawlen);
   set_global(L, "next", base_next);
   set_global(L, "pairs", base_pairs);
-  set_global(L, "ipairs", base_ipairs);
+  {
+    // ipairs closes over a single shared iterator closure.
+    Closure* iter = closure_new_c(L, ipairs_iter);
+    Closure* ipairs_cl = closure_new_c(L, base_ipairs);
+    auto* uv = L->gc.create<UpVal>(GcKind::UpVal);
+    uv->open = false;
+    uv->closed = TValue::obj(ValueTag::Function, iter);
+    uv->thread = nullptr;
+    uv->stack_index = -1;
+    ipairs_cl->upvals.push_back(uv);
+    set_global_value(L, "ipairs", TValue::obj(ValueTag::Function, ipairs_cl));
+  }
   set_global(L, "load", base_load);
   set_global(L, "loadfile", base_loadfile);
   set_global(L, "dofile", base_dofile);

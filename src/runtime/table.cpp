@@ -101,16 +101,21 @@ TValue Table::get_int(int64_t i) const {
   return get(TValue::integer(i));
 }
 
-static bool key_as_array_index(const TValue& key, int64_t* out) {
+// PUC: integer-valued floats (incl. negatives / 0) are stored as integers.
+static bool key_as_integer(const TValue& key, int64_t* out) {
   if (key.is_int()) {
     *out = key.as_int();
     return true;
   }
   if (key.is_float()) {
     double d = key.as_float();
-    if (d >= 1.0 && d == std::floor(d) && d <= static_cast<double>(INT64_MAX)) {
+    if (d != d) // NaN
+      return false;
+    if (d >= static_cast<double>(INT64_MIN) && d <= static_cast<double>(INT64_MAX) &&
+        d == std::floor(d)) {
       *out = static_cast<int64_t>(d);
-      return true;
+      // Reject floats that cannot round-trip (e.g. > 2^53).
+      return static_cast<double>(*out) == d;
     }
   }
   return false;
@@ -119,7 +124,7 @@ static bool key_as_array_index(const TValue& key, int64_t* out) {
 TValue Table::get(const TValue& key) const {
   TValue lookup = key;
   int64_t i = 0;
-  if (key_as_array_index(key, &i)) {
+  if (key_as_integer(key, &i)) {
     lookup = TValue::integer(i);
     if (i >= 1 && static_cast<size_t>(i) <= array.size())
       return array[static_cast<size_t>(i - 1)];
@@ -180,14 +185,14 @@ void Table::set(State* L, const TValue& key, const TValue& value) {
     panic("table index is nil");
   TValue lookup = key;
   int64_t i = 0;
-  if (key_as_array_index(key, &i)) {
-    // Prefer the array part for integer keys (including integer-valued floats
-    // from numeric for), growing it via set_int when needed.
+  if (key_as_integer(key, &i)) {
+    // Prefer the array part for positive integer keys (incl. integer-valued
+    // floats from numeric for), growing it via set_int when needed.
+    lookup = TValue::integer(i);
     if (i >= 1 && i <= 64) {
       set_int(L, i, value);
       return;
     }
-    lookup = TValue::integer(i);
     if (i >= 1 && static_cast<size_t>(i) <= array.size()) {
       array[static_cast<size_t>(i - 1)] = value;
       L->gc.barrier(this, value);

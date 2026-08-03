@@ -189,25 +189,39 @@ Token Lexer::lex_number() {
                           s.find('p') == std::string::npos &&
                           s.find('P') == std::string::npos;
     if (pure_int) {
-      // PUC l_str2int: hex via base 16; decimal is always base 10 (leading 0 ≠ octal).
-      // Hex has no overflow check (0x8000… → mininteger via cast);
+      // PUC l_str2int: hex has no overflow check (keeps shifting into uint64);
       // decimal above MAXINTEGER becomes a float.
       try {
         size_t idx = 0;
         const bool hex = s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X');
-        unsigned long long u = std::stoull(s, &idx, hex ? 16 : 10);
-        if (idx == s.size()) {
-          if (hex || u <= static_cast<unsigned long long>(INT64_MAX)) {
+        if (hex) {
+          uint64_t u = 0;
+          size_t i = 2;
+          for (; i < s.size() && std::isxdigit(static_cast<unsigned char>(s[i])); ++i) {
+            unsigned char c = static_cast<unsigned char>(s[i]);
+            int d = std::isdigit(c) ? (c - '0') : (std::tolower(c) - 'a' + 10);
+            u = (u << 4) + static_cast<uint64_t>(d);
+          }
+          if (i == s.size()) {
             t.integer = static_cast<int64_t>(u);
             t.kind = TokenKind::Integer;
-          } else {
-            t.number = static_cast<double>(u);
-            t.kind = TokenKind::Number;
+            return t;
           }
-          return t;
+        } else {
+          unsigned long long u = std::stoull(s, &idx, 10);
+          if (idx == s.size()) {
+            if (u <= static_cast<unsigned long long>(INT64_MAX)) {
+              t.integer = static_cast<int64_t>(u);
+              t.kind = TokenKind::Integer;
+            } else {
+              t.number = static_cast<double>(u);
+              t.kind = TokenKind::Number;
+            }
+            return t;
+          }
         }
       } catch (...) {
-        // fall through to stod
+        // fall through to strtod
       }
     }
     char* end = nullptr;

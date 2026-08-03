@@ -10,91 +10,138 @@
 namespace lj3 {
 using namespace lib;
 
-static void concat_addfield(Table* t, int64_t i, std::string& out) {
-  TValue v = t->get_int(i);
-  if (!v.is_string()) {
-    const char* tn = "nil";
-    if (v.is_bool())
-      tn = "boolean";
-    else if (v.is_number())
-      tn = "number";
-    else if (v.is_table())
-      tn = "table";
-    else if (v.is_function())
-      tn = "function";
-    else if (v.is_userdata())
-      tn = "userdata";
-    else if (v.is_thread())
-      tn = "thread";
-    panic(std::string("invalid value (") + tn + ") at index " + std::to_string(i) +
-          " in table for 'concat'");
+static int64_t aux_getn(State* L, const TValue& t) {
+  TValue len;
+  if (!meta_len(L, t, &len))
+    panic("attempt to get length of a " + std::string(value_to_string(t)) + " value");
+  if (len.is_int())
+    return len.as_int();
+  if (len.is_float()) {
+    double d = len.as_float();
+    if (d == std::floor(d) && d >= static_cast<double>(INT64_MIN) &&
+        d <= static_cast<double>(INT64_MAX))
+      return static_cast<int64_t>(d);
   }
-  out.append(v.as_string()->view());
+  panic("object length is not an integer");
+}
+
+static TValue geti(State* L, const TValue& t, int64_t i) {
+  return meta_index(L, t, TValue::integer(i));
+}
+
+static void seti(State* L, const TValue& t, int64_t i, const TValue& v) {
+  meta_newindex(L, t, TValue::integer(i), v);
+}
+
+static void concat_addfield(State* L, const TValue& t, int64_t i, std::string& out) {
+  TValue v = geti(L, t, i);
+  // PUC lua_isstring: strings and numbers are accepted.
+  if (v.is_string()) {
+    out.append(v.as_string()->view());
+    return;
+  }
+  if (v.is_number()) {
+    out += value_to_string(v);
+    return;
+  }
+  const char* tn = "nil";
+  if (v.is_bool())
+    tn = "boolean";
+  else if (v.is_table())
+    tn = "table";
+  else if (v.is_function())
+    tn = "function";
+  else if (v.is_userdata())
+    tn = "userdata";
+  else if (v.is_thread())
+    tn = "thread";
+  panic(std::string("invalid value (") + tn + ") at index " + std::to_string(i) +
+        " in table for 'concat'");
 }
 
 static int tab_concat(State* L) {
-  Table* t = check_table(L, 1);
+  TValue t = *L->at(1);
+  if (!t.is_table())
+    panic("table expected");
   std::string sep = L->gettop() >= 2 ? std::string(check_string(L, 2)->view()) : "";
   int64_t i = L->gettop() >= 3 ? check_int(L, 3) : 1;
-  int64_t last = L->gettop() >= 4 ? check_int(L, 4) : table_length(t);
+  int64_t last = L->gettop() >= 4 ? check_int(L, 4) : aux_getn(L, t);
   std::string out;
-  // PUC: i < last then optional last element — avoids ++ overflowing maxinteger.
   for (; i < last; ++i) {
-    concat_addfield(t, i, out);
+    concat_addfield(L, t, i, out);
     out += sep;
   }
   if (i == last)
-    concat_addfield(t, i, out);
+    concat_addfield(L, t, i, out);
   L->settop(0);
   push_string(L, out);
   return 1;
 }
 
 static int tab_insert(State* L) {
-  Table* t = check_table(L, 1);
+  TValue t = *L->at(1);
+  if (!t.is_table())
+    panic("table expected");
   if (L->gettop() == 2) {
-    int64_t n = table_length(t) + 1;
-    t->set_int(L, n, *L->at(2));
-  } else {
+    int64_t pos = aux_getn(L, t) + 1;
+    seti(L, t, pos, *L->at(2));
+  } else if (L->gettop() == 3) {
     int64_t pos = check_int(L, 2);
-    int64_t n = table_length(t);
-    for (int64_t k = n; k >= pos; --k)
-      t->set_int(L, k + 1, t->get_int(k));
-    t->set_int(L, pos, *L->at(3));
+    int64_t e = aux_getn(L, t) + 1;
+    if (pos < 1 || pos > e)
+      panic("position out of bounds");
+    for (int64_t k = e; k > pos; --k)
+      seti(L, t, k, geti(L, t, k - 1));
+    seti(L, t, pos, *L->at(3));
+  } else {
+    panic("wrong number of arguments to 'insert'");
   }
   return 0;
 }
 
 static int tab_remove(State* L) {
-  Table* t = check_table(L, 1);
-  int64_t pos = L->gettop() >= 2 ? check_int(L, 2) : table_length(t);
-  TValue v = t->get_int(pos);
-  int64_t n = table_length(t);
-  for (int64_t k = pos; k < n; ++k)
-    t->set_int(L, k, t->get_int(k + 1));
-  t->set_int(L, n, TValue::nil());
+  TValue t = *L->at(1);
+  if (!t.is_table())
+    panic("table expected");
+  int64_t size = aux_getn(L, t);
+  int64_t pos = L->gettop() >= 2 ? check_int(L, 2) : size;
+  if (pos != size) {
+    if (pos < 1 || pos > size + 1)
+      panic("position out of bounds");
+  }
+  TValue v = geti(L, t, pos);
+  for (int64_t k = pos; k < size; ++k)
+    seti(L, t, k, geti(L, t, k + 1));
+  if (pos >= 1 && pos <= size)
+    seti(L, t, size, TValue::nil());
+  else if (pos == 0)
+    seti(L, t, 0, TValue::nil());
   L->settop(0);
   L->push(v);
   return 1;
 }
 
 static int tab_move(State* L) {
-  Table* a = check_table(L, 1);
+  TValue a = *L->at(1);
+  if (!a.is_table())
+    panic("table expected");
   int64_t f = check_int(L, 2);
   int64_t e = check_int(L, 3);
-  int64_t t = check_int(L, 4);
-  Table* dest = L->gettop() >= 5 ? check_table(L, 5) : a;
+  int64_t tpos = check_int(L, 4);
+  TValue dest = L->gettop() >= 5 ? *L->at(5) : a;
+  if (L->gettop() >= 5 && !dest.is_table())
+    panic("table expected");
   if (e >= f) {
-    if (dest == a && t > e) {
+    if (values_equal(dest, a) && tpos > e) {
       for (int64_t i = e; i >= f; --i)
-        dest->set_int(L, t + (i - f), a->get_int(i));
+        seti(L, dest, tpos + (i - f), geti(L, a, i));
     } else {
       for (int64_t i = f; i <= e; ++i)
-        dest->set_int(L, t + (i - f), a->get_int(i));
+        seti(L, dest, tpos + (i - f), geti(L, a, i));
     }
   }
   L->settop(0);
-  L->push(TValue::obj(ValueTag::Table, dest));
+  L->push(dest);
   return 1;
 }
 
@@ -110,12 +157,14 @@ static int tab_pack(State* L) {
 }
 
 static int tab_unpack(State* L) {
-  Table* t = check_table(L, 1);
+  TValue t = *L->at(1);
+  if (!t.is_table())
+    panic("table expected");
   int64_t i = L->gettop() >= 2 ? check_int(L, 2) : 1;
-  int64_t j = L->gettop() >= 3 ? check_int(L, 3) : table_length(t);
+  int64_t j = L->gettop() >= 3 ? check_int(L, 3) : aux_getn(L, t);
   L->settop(0);
   for (int64_t k = i; k <= j; ++k)
-    L->push(t->get_int(k));
+    L->push(geti(L, t, k));
   return static_cast<int>(j - i + 1);
 }
 
@@ -140,18 +189,20 @@ static int sort_compare(const TValue& a, const TValue& b, SortCtx* ctx) {
 }
 
 static int tab_sort(State* L) {
-  Table* t = check_table(L, 1);
+  TValue t = *L->at(1);
+  if (!t.is_table())
+    panic("table expected");
   TValue cmp = L->gettop() >= 2 ? *L->at(2) : TValue::nil();
-  int64_t n = table_length(t);
+  int64_t n = aux_getn(L, t);
   std::vector<TValue> arr(static_cast<size_t>(n));
   for (int64_t i = 1; i <= n; ++i)
-    arr[static_cast<size_t>(i - 1)] = t->get_int(i);
+    arr[static_cast<size_t>(i - 1)] = geti(L, t, i);
   SortCtx ctx{L, cmp};
   std::stable_sort(arr.begin(), arr.end(), [&](const TValue& a, const TValue& b) {
     return sort_compare(a, b, &ctx) < 0;
   });
   for (int64_t i = 1; i <= n; ++i)
-    t->set_int(L, i, arr[static_cast<size_t>(i - 1)]);
+    seti(L, t, i, arr[static_cast<size_t>(i - 1)]);
   return 0;
 }
 

@@ -253,6 +253,15 @@ int ensure_env_upval(FuncState& fs) {
       panic("_ENV upvalue missing in main chunk");
     return 0;
   }
+  // Prefer an enclosing local `_ENV` (lexical environments) over chaining the
+  // chunk's upvalue — needed for `do local _ENV = mt; function f() A=1 end end`.
+  int reg = fs.prev->find_local("_ENV");
+  if (reg >= 0)
+    return add_upval(fs, "_ENV", true, reg);
+  for (size_t i = 0; i < fs.prev->proto->upvalues.size(); ++i) {
+    if (fs.prev->proto->upvalues[i].name == "_ENV")
+      return add_upval(fs, "_ENV", false, static_cast<int>(i));
+  }
   int parent = ensure_env_upval(*fs.prev);
   return add_upval(fs, "_ENV", false, parent);
 }
@@ -304,10 +313,19 @@ int search_var(FuncState& fs, const std::string& name, Expdesc& e) {
       return 0;
     }
   }
-  // global via _ENV upvalue (created on demand; not every function has _ENV)
+  // global via _ENV[name]. Prefer a local `_ENV` in this function (block scope).
+  int env_local = fs.find_local("_ENV");
+  if (env_local >= 0) {
+    e.kind = Expdesc::Global;
+    e.info = fs.string_k(name);
+    e.table = env_local; // local _ENV register
+    e.key = -2;          // sentinel: index local env, not GETTABUP
+    return 0;
+  }
   (void)ensure_env_upval(fs);
   e.kind = Expdesc::Global;
   e.info = fs.string_k(name);
+  e.key = -1;
   return 0;
 }
 
@@ -324,16 +342,24 @@ void discharge(FuncState& fs, Expdesc& e) {
     break;
   case Expdesc::Global: {
     e.reg = fs.new_reg();
-    int env = ensure_env_upval(fs);
-    if (e.info <= 255) {
-      fs.code_abc(OpCode::GETTABUP, e.reg, env, e.info);
-    } else {
-      // C field is 8-bit: fall back to GETUPVAL + LOADK + GETTABLE.
-      fs.code_abc(OpCode::GETUPVAL, e.reg, env, 0);
+    if (e.key == -2) {
+      // `_ENV` is a local in this function: GETTABLE local_env[name]
       int kreg = fs.new_reg();
       fs.code_abx(OpCode::LOADK, kreg, static_cast<uint16_t>(e.info));
-      fs.code_abc(OpCode::GETTABLE, e.reg, e.reg, kreg);
+      fs.code_abc(OpCode::GETTABLE, e.reg, e.table, kreg);
       fs.freereg = e.reg + 1;
+    } else {
+      int env = ensure_env_upval(fs);
+      if (e.info <= 255) {
+        fs.code_abc(OpCode::GETTABUP, e.reg, env, e.info);
+      } else {
+        // C field is 8-bit: fall back to GETUPVAL + LOADK + GETTABLE.
+        fs.code_abc(OpCode::GETUPVAL, e.reg, env, 0);
+        int kreg = fs.new_reg();
+        fs.code_abx(OpCode::LOADK, kreg, static_cast<uint16_t>(e.info));
+        fs.code_abc(OpCode::GETTABLE, e.reg, e.reg, kreg);
+        fs.freereg = e.reg + 1;
+      }
     }
     e.kind = Expdesc::Nonrelocable;
     break;
@@ -852,15 +878,21 @@ void storevar(FuncState& fs, Expdesc& var, int expr_reg) {
   } else if (var.kind == Expdesc::Upval) {
     fs.code_abc(OpCode::SETUPVAL, expr_reg, var.info, 0);
   } else if (var.kind == Expdesc::Global) {
-    int env = ensure_env_upval(fs);
-    if (var.info <= 255) {
-      fs.code_abc(OpCode::SETTABUP, env, var.info, expr_reg);
-    } else {
-      int treg = fs.new_reg();
-      fs.code_abc(OpCode::GETUPVAL, treg, env, 0);
+    if (var.key == -2) {
       int kreg = fs.new_reg();
       fs.code_abx(OpCode::LOADK, kreg, static_cast<uint16_t>(var.info));
-      fs.code_abc(OpCode::SETTABLE, treg, kreg, expr_reg);
+      fs.code_abc(OpCode::SETTABLE, var.table, kreg, expr_reg);
+    } else {
+      int env = ensure_env_upval(fs);
+      if (var.info <= 255) {
+        fs.code_abc(OpCode::SETTABUP, env, var.info, expr_reg);
+      } else {
+        int treg = fs.new_reg();
+        fs.code_abc(OpCode::GETUPVAL, treg, env, 0);
+        int kreg = fs.new_reg();
+        fs.code_abx(OpCode::LOADK, kreg, static_cast<uint16_t>(var.info));
+        fs.code_abc(OpCode::SETTABLE, treg, kreg, expr_reg);
+      }
     }
   } else if (var.kind == Expdesc::Indexed) {
     fs.code_abc(OpCode::SETTABLE, var.table, var.key, expr_reg);
@@ -934,10 +966,22 @@ void statement(FuncState& fs, AstNode& node) {
   }
   case AstKind::Assign: {
     auto& n = static_cast<Assign&>(node);
+    fs.freereg = fs.nactvar;
     std::vector<Expdesc> vars;
     for (auto& v : n.vars) {
       Expdesc e;
       expr(fs, e, *v);
+      if (e.kind == Expdesc::Indexed) {
+        // Snapshot table & key registers so later stores in this statement
+        // cannot clobber locals that share those slots (PUC multi-assign:
+        // `i, a[i], a, ... = ...` must use pre-assign values of a/i).
+        int t = fs.new_reg();
+        fs.code_abc(OpCode::MOVE, t, e.table, 0);
+        e.table = t;
+        int k = fs.new_reg();
+        fs.code_abc(OpCode::MOVE, k, e.key, 0);
+        e.key = k;
+      }
       vars.push_back(e);
     }
     int nvars = static_cast<int>(vars.size());

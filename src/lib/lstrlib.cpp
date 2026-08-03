@@ -490,25 +490,41 @@ static bool single_match(MatchState& ms, size_t si, size_t pi, size_t* out_pi) {
     bool negate = j < ms.p.size() && ms.p[j] == '^';
     if (negate)
       ++j;
+    // PUC: first ']' after '[' / '[^' is a literal member, not the closer.
     bool found = false;
     if (si < ms.s.size()) {
       char c = ms.s[si];
-      while (j < ms.p.size() && ms.p[j] != ']') {
-        if (ms.p[j] == '%' && j + 1 < ms.p.size()) {
-          if (match_class(c, ms.p[j + 1]))
+      size_t k = j;
+      do {
+        if (k >= ms.p.size())
+          return false;
+        if (ms.p[k] == '%' && k + 1 < ms.p.size()) {
+          if (match_class(c, ms.p[k + 1]))
             found = true;
-          j += 2;
-          continue;
+          k += 2;
+        } else {
+          char lo = ms.p[k++];
+          char hi = lo;
+          if (k < ms.p.size() && ms.p[k] == '-' && k + 1 < ms.p.size() && ms.p[k + 1] != ']') {
+            hi = ms.p[k + 1];
+            k += 2;
+          }
+          if (static_cast<unsigned char>(lo) <= static_cast<unsigned char>(c) &&
+              static_cast<unsigned char>(c) <= static_cast<unsigned char>(hi))
+            found = true;
         }
-        char lo = ms.p[j++];
-        char hi = lo;
-        if (j < ms.p.size() && ms.p[j] == '-' && j + 1 < ms.p.size() && ms.p[j + 1] != ']') {
-          hi = ms.p[j + 1];
+      } while (k < ms.p.size() && ms.p[k] != ']');
+      j = k;
+    } else {
+      // Still need to locate the closing ']' for out_pi.
+      do {
+        if (j >= ms.p.size())
+          return false;
+        if (ms.p[j] == '%' && j + 1 < ms.p.size())
           j += 2;
-        }
-        if (lo <= c && c <= hi)
-          found = true;
-      }
+        else
+          ++j;
+      } while (j < ms.p.size() && ms.p[j] != ']');
     }
     if (j >= ms.p.size() || ms.p[j] != ']')
       return false;
@@ -658,8 +674,9 @@ static bool match(MatchState& ms, size_t si, size_t pi) {
       pi = ep;
       goto init;
     }
-    if (std::isdigit(static_cast<unsigned char>(spec))) {
-      int cap = spec - '0';
+    if (spec >= '1' && spec <= '9') {
+      // PUC: %1 is captures[0] (l - '1').
+      int cap = spec - '1';
       if (!match_capture(ms, si, cap))
         return false;
       auto [a, b] = ms.captures[static_cast<size_t>(cap)];
@@ -793,17 +810,25 @@ static int str_match(State* L) {
 
 static std::string gsub_expand_repl(const std::string& repl, const MatchState& ms) {
   std::string out;
+  auto whole = [&]() {
+    return std::string(ms.s.substr(ms.match_start, ms.match_end - ms.match_start));
+  };
   for (size_t i = 0; i < repl.size(); ++i) {
     if (repl[i] == '%' && i + 1 < repl.size()) {
       char c = repl[++i];
       if (c == '%') {
         out += '%';
       } else if (c == '0') {
-        out.append(ms.s.substr(ms.match_start, ms.match_end - ms.match_start));
+        out += whole();
       } else if (c >= '1' && c <= '9') {
         size_t idx = static_cast<size_t>(c - '1');
+        // PUC push_onecapture: with no captures, %1 is the whole match.
         if (idx < ms.captures.size())
           out += capture_string(ms, idx);
+        else if (idx == 0)
+          out += whole();
+        else
+          panic("invalid capture index %" + std::to_string(idx + 1));
       } else {
         out += '%';
         out += c;
@@ -819,19 +844,18 @@ static int str_gsub(State* L) {
   std::string s(check_string(L, 1)->view());
   std::string_view pat = check_string(L, 2)->view();
   TValue repl_v = *L->at(3);
-  int64_t n = L->gettop() >= 4 ? check_int(L, 4) : -1;
-  // Keep repl alive across settop by not clearing until end; stash on stack bottom.
+  int64_t max_s = L->gettop() >= 4 ? check_int(L, 4) : static_cast<int64_t>(s.size()) + 1;
   std::string out;
-  size_t i = 0;
+  size_t src = 0;
+  // PUC 5.3.3+: reject a subsequent empty match that ends at the same point.
+  size_t lastmatch = static_cast<size_t>(-1);
   int count = 0;
   bool anchor = !pat.empty() && pat[0] == '^';
-  while (i <= s.size() && (n < 0 || count < n)) {
-    if (i == s.size() && count > 0)
-      break;
-    MatchState ms{s, pat, 0, 0, {}};
-    if (!match_search(ms, i, anchor))
-      break;
-    out.append(s.substr(i, ms.match_start - i));
+  std::string_view pat_body = pat;
+  if (anchor && !pat_body.empty())
+    pat_body.remove_prefix(1);
+
+  auto apply_repl = [&](MatchState& ms) {
     if (repl_v.is_function()) {
       int base = L->gettop();
       L->push(repl_v);
@@ -866,16 +890,29 @@ static int str_gsub(State* L) {
                                                              : value_to_string(repl_v)),
                               ms);
     }
-    size_t next = ms.match_end;
-    if (next <= i)
-      next = i + 1;
-    i = next;
-    ++count;
+  };
+
+  while (count < max_s) {
+    MatchState ms{s, pat_body, 0, 0, {}};
+    bool matched = match(ms, src, 0);
+    // Anchor patterns only try once at the original start (handled by match on '^' skip).
+    if (matched)
+      ms.match_start = src;
+    size_t e = matched ? ms.match_end : static_cast<size_t>(-2);
+    if (matched && e != lastmatch) {
+      ++count;
+      apply_repl(ms);
+      src = lastmatch = e;
+    } else if (src < s.size()) {
+      out += s[src++];
+    } else {
+      break;
+    }
     if (anchor)
       break;
   }
-  if (i < s.size())
-    out.append(s.substr(i));
+  if (src < s.size())
+    out.append(s.substr(src));
   L->settop(0);
   push_string(L, out);
   L->push(TValue::integer(count));
@@ -891,10 +928,11 @@ static UpVal* make_closed_upval(State* L, const TValue& v) {
   return uv;
 }
 
-// PUC-style gmatch: one C closure with upvalues (s, pattern, position).
+// PUC-style gmatch: upvalues (s, pattern, src_pos, lastmatch_end).
 static int gmatch_iter(State* L) {
   Closure* cl = L->current->frames.empty() ? nullptr : L->current->frames.back().cl;
-  if (!cl || cl->upvals.size() < 3 || !cl->upvals[0] || !cl->upvals[1] || !cl->upvals[2]) {
+  if (!cl || cl->upvals.size() < 4 || !cl->upvals[0] || !cl->upvals[1] || !cl->upvals[2] ||
+      !cl->upvals[3]) {
     L->settop(0);
     L->push(TValue::nil());
     return 1;
@@ -902,6 +940,7 @@ static int gmatch_iter(State* L) {
   TValue sv = cl->upvals[0]->get();
   TValue pv = cl->upvals[1]->get();
   TValue iv = cl->upvals[2]->get();
+  TValue lv = cl->upvals[3]->get();
   if (!sv.is_string() || !pv.is_string()) {
     L->settop(0);
     L->push(TValue::nil());
@@ -909,45 +948,50 @@ static int gmatch_iter(State* L) {
   }
   std::string s(sv.as_string()->view());
   std::string_view pat = pv.as_string()->view();
-  int64_t i = iv.is_number() ? static_cast<int64_t>(iv.to_number()) : 0;
-  if (i < 0)
-    i = 0;
-  MatchState ms{s, pat, 0, 0, {}};
-  if (!match_search(ms, static_cast<size_t>(i), false)) {
+  size_t src = iv.is_number() ? static_cast<size_t>(iv.to_number()) : 0;
+  // lastmatch_end as size_t; -1 sentinel stored as integer -1.
+  size_t lastmatch =
+      (lv.is_int() && lv.as_int() < 0) ? static_cast<size_t>(-1) : static_cast<size_t>(lv.to_number());
+
+  for (; src <= s.size(); ++src) {
+    MatchState ms{s, pat, 0, 0, {}};
+    ms.match_start = src;
+    if (!match(ms, src, 0))
+      continue;
+    size_t e = ms.match_end;
+    if (e == lastmatch)
+      continue;
+    cl->upvals[2]->set(L, TValue::integer(static_cast<int64_t>(e)));
+    cl->upvals[3]->set(L, TValue::integer(static_cast<int64_t>(e)));
     L->settop(0);
-    L->push(TValue::nil());
-    return 1;
-  }
-  size_t next = ms.match_end;
-  if (next == ms.match_start)
-    next = ms.match_start + 1;
-  cl->upvals[2]->set(L, TValue::integer(static_cast<int64_t>(next)));
-  L->settop(0);
-  if (ms.captures.empty()) {
-    push_string(L, std::string(ms.s.substr(ms.match_start, ms.match_end - ms.match_start)));
-  } else {
-    for (size_t c = 0; c < ms.captures.size(); ++c) {
-      auto [a, b] = ms.captures[c];
-      if (b == kCapPosition)
-        L->push(TValue::integer(static_cast<int64_t>(a + 1)));
-      else
-        push_string(L, capture_string(ms, c));
+    if (ms.captures.empty()) {
+      push_string(L, std::string(ms.s.substr(ms.match_start, ms.match_end - ms.match_start)));
+    } else {
+      for (size_t c = 0; c < ms.captures.size(); ++c) {
+        auto [a, b] = ms.captures[c];
+        if (b == kCapPosition)
+          L->push(TValue::integer(static_cast<int64_t>(a + 1)));
+        else
+          push_string(L, capture_string(ms, c));
+      }
     }
+    return L->gettop();
   }
-  return L->gettop();
+  L->settop(0);
+  L->push(TValue::nil());
+  return 1;
 }
 
 static int str_gmatch(State* L) {
   check_string(L, 1);
   check_string(L, 2);
-  // Keep s and pattern on the stack, then push initial position — same as PUC.
   L->settop(2);
-  L->push(TValue::integer(0));
   Closure* cl = closure_new_c(L, gmatch_iter);
-  cl->upvals.resize(3);
+  cl->upvals.resize(4);
   cl->upvals[0] = make_closed_upval(L, *L->at(1));
   cl->upvals[1] = make_closed_upval(L, *L->at(2));
-  cl->upvals[2] = make_closed_upval(L, *L->at(3));
+  cl->upvals[2] = make_closed_upval(L, TValue::integer(0));           // src
+  cl->upvals[3] = make_closed_upval(L, TValue::integer(static_cast<int64_t>(-1))); // lastmatch
   L->settop(0);
   L->push(TValue::obj(ValueTag::Function, cl));
   return 1;
@@ -998,7 +1042,7 @@ static int getnum(const char*& fmt, int df) {
 static int getnumlimit(const char*& fmt, int df) {
   int sz = getnum(fmt, df);
   if (sz > kMaxIntSize || sz <= 0)
-    panic("integral size out of limits [1,16]");
+    panic("integral size (" + std::to_string(sz) + ") out of limits [1,16]");
   return sz;
 }
 
@@ -1029,7 +1073,13 @@ static PackOpt getoption(PackHeader& h, const char*& fmt, int& size) {
   case 'z': return PackOpt::ZStr;
   case 'x': size = 1; return PackOpt::Padding;
   case 'X': return PackOpt::PadAlign;
-  case ' ': break;
+  case ' ':
+  case '\n':
+  case '\t':
+  case '\v':
+  case '\f':
+  case '\r':
+    break; // ignore whitespace
   case '<': h.islittle = true; break;
   case '>': h.islittle = false; break;
   case '=': h.islittle = native_little(); break;
@@ -1206,10 +1256,14 @@ static int str_packsize(State* L) {
   h.islittle = native_little();
   h.maxalign = 1;
   size_t totalsize = 0;
+  // PUC MAXSIZE: largest size_t that also fits in a Lua integer / int (use INT_MAX).
+  constexpr size_t kMaxSize = static_cast<size_t>(std::numeric_limits<int>::max());
   while (*fmt != '\0') {
     int size = 0, ntoalign = 0;
     PackOpt opt = getdetails(h, totalsize, fmt, size, ntoalign);
     size += ntoalign;
+    if (static_cast<size_t>(size) > kMaxSize || totalsize > kMaxSize - static_cast<size_t>(size))
+      panic("format result too large");
     totalsize += static_cast<size_t>(size);
     if (opt == PackOpt::String || opt == PackOpt::ZStr)
       panic("variable-length format");
@@ -1222,12 +1276,16 @@ static int str_packsize(State* L) {
 static int str_unpack(State* L) {
   const char* fmt = check_string(L, 1)->view().data();
   std::string_view data = check_string(L, 2)->view();
+  // PUC Lua 5.3 posrelat: pos==0 and out-of-range negatives become 0, then
+  // (size_t)0-1 underflows so the "initial position out of string" check fires.
   int64_t ipos = L->gettop() >= 3 ? check_int(L, 3) : 1;
-  if (ipos < 0)
-    ipos = static_cast<int64_t>(data.size()) + ipos + 1;
-  if (ipos < 1)
-    ipos = 1;
-  size_t pos = static_cast<size_t>(ipos - 1);
+  if (ipos < 0) {
+    if (static_cast<size_t>(-ipos) > data.size())
+      ipos = 0;
+    else
+      ipos = static_cast<int64_t>(data.size()) + ipos + 1;
+  }
+  size_t pos = static_cast<size_t>(ipos) - 1;
   if (pos > data.size())
     panic("initial position out of string");
   PackHeader h;
