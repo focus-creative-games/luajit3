@@ -8,6 +8,7 @@
 
 #include <cstdlib>
 #include <fstream>
+#include <iostream>
 #include <sstream>
 
 using namespace luatier;
@@ -68,14 +69,29 @@ int luaL_loadbuffer(lua_State* L, const char* buff, size_t sz, const char* name)
 }
 
 int luaL_loadfile(lua_State* L, const char* filename) {
-  std::ifstream in(filename, std::ios::binary);
-  if (!in) {
-    L->st->push(TValue::obj(ValueTag::String, L->st->intern("cannot open file")));
-    return LUA_ERRFILE;
+  std::string source;
+  std::string chunk_name;
+  if (filename == nullptr) {
+    chunk_name = "=stdin";
+    std::ostringstream ss;
+    ss << std::cin.rdbuf();
+    source = ss.str();
+  } else {
+    std::ifstream in(filename, std::ios::binary);
+    if (!in) {
+      L->st->push(TValue::obj(ValueTag::String, L->st->intern("cannot open file")));
+      return LUA_ERRFILE;
+    }
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    source = ss.str();
+    chunk_name = std::string("@") + filename;
   }
-  std::ostringstream ss;
-  ss << in.rdbuf();
-  return L->st->load_string(ss.str(), std::string("@") + filename);
+  if (source.size() >= 3 && static_cast<unsigned char>(source[0]) == 0xEF &&
+      static_cast<unsigned char>(source[1]) == 0xBB &&
+      static_cast<unsigned char>(source[2]) == 0xBF)
+    source.erase(0, 3);
+  return L->st->load_string(source, chunk_name);
 }
 
 int luaL_dofile(lua_State* L, const char* filename) {
@@ -92,7 +108,7 @@ int luaL_dostring(lua_State* L, const char* s) {
   return lua_pcall(L, 0, LUA_MULTRET, 0);
 }
 
-int lua_pcall(lua_State* L, int nargs, int nresults, int) {
+int lua_pcall(lua_State* L, int nargs, int nresults, int errfunc) {
   int func_idx = L->st->gettop() - nargs;
   try {
     if (!L->st->at(func_idx)->is_function()) {
@@ -103,8 +119,36 @@ int lua_pcall(lua_State* L, int nargs, int nresults, int) {
     Closure* cl = L->st->at(func_idx)->as_closure();
     return L->st->resume_call(cl, nargs, nresults);
   } catch (const LuatierError& e) {
+    TValue emsg;
+    if (L->st->current->err_obj_set) {
+      L->st->current->err_obj_set = false;
+      emsg = L->st->current->err_obj;
+    } else {
+      emsg = TValue::obj(ValueTag::String, L->st->intern(e.what()));
+    }
     L->st->settop(func_idx - 1);
-    L->st->push(TValue::obj(ValueTag::String, L->st->intern(e.what())));
+    if (errfunc > 0) {
+      TValue* mh = L->st->at(errfunc);
+      if (mh && mh->is_function()) {
+        L->st->push(*mh);
+        L->st->push(emsg);
+        try {
+          L->st->resume_call(mh->as_closure(), 1, 1);
+          return LUA_ERRRUN;
+        } catch (const LuatierError& e2) {
+          if (L->st->current->err_obj_set) {
+            L->st->current->err_obj_set = false;
+            emsg = L->st->current->err_obj;
+          } else {
+            emsg = TValue::obj(ValueTag::String, L->st->intern(e2.what()));
+          }
+          L->st->settop(func_idx - 1);
+          L->st->push(emsg);
+          return LUA_ERRERR;
+        }
+      }
+    }
+    L->st->push(emsg);
     return LUA_ERRRUN;
   }
 }

@@ -842,9 +842,8 @@ static int base_load(State* L) {
 }
 
 static int base_loadfile(State* L) {
-  std::string filename = (L->gettop() >= 1 && !L->at(1)->is_nil())
-                             ? std::string(L->at(1)->as_string()->view())
-                             : "";
+  bool from_stdin = (L->gettop() < 1 || L->at(1)->is_nil());
+  std::string filename = from_stdin ? "" : std::string(L->at(1)->as_string()->view());
   std::string mode = "bt";
   if (L->gettop() >= 2 && !L->at(2)->is_nil())
     mode = std::string(L->at(2)->as_string()->view());
@@ -856,21 +855,30 @@ static int base_loadfile(State* L) {
     has_env = true;
   }
 
-  std::ifstream in(filename, std::ios::binary);
-  if (!in) {
-    L->settop(0);
-    L->push(TValue::nil());
-    push_string(L, "cannot open " + filename + ": No such file or directory");
-    return 2;
+  std::string source;
+  std::string chunk_name;
+  if (from_stdin) {
+    chunk_name = "=stdin";
+    std::ostringstream ss;
+    ss << std::cin.rdbuf();
+    source = ss.str();
+  } else {
+    std::ifstream in(filename, std::ios::binary);
+    if (!in) {
+      L->settop(0);
+      L->push(TValue::nil());
+      push_string(L, "cannot open " + filename + ": No such file or directory");
+      return 2;
+    }
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    source = ss.str();
+    chunk_name = "@" + filename;
   }
-  std::ostringstream ss;
-  ss << in.rdbuf();
-  std::string source = ss.str();
   if (source.size() >= 3 && static_cast<unsigned char>(source[0]) == 0xEF &&
       static_cast<unsigned char>(source[1]) == 0xBB &&
       static_cast<unsigned char>(source[2]) == 0xBF)
     source.erase(0, 3);
-  std::string chunk_name = "@" + filename;
 
   try {
     L->settop(0);

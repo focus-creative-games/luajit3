@@ -73,7 +73,7 @@ target_include_directories(luatier PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
-add_executable(luatier_cli src/main.cpp)
+add_executable(luatier_cli src/main.cpp src/standalone.cpp)
 target_link_libraries(luatier_cli PRIVATE luatier)
 set_target_properties(luatier_cli PROPERTIES OUTPUT_NAME luatier)
 # PUC allows ~200 syntactic nestings; our recursive parser/sema/lowering frames

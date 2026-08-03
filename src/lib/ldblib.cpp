@@ -1,12 +1,14 @@
 #include "lib/libs.hpp"
 
 #include "lib/lib_util.hpp"
+#include "luatier/lua.h"
 #include "vm/debug_hook.hpp"
 #include "vm/interpreter.hpp"
 #include "vm/ldebug.hpp"
 #include "vm/meta.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <unordered_set>
@@ -1046,6 +1048,33 @@ static int debug_setuservalue(State* L) {
   return 1;
 }
 
+// PUC db_debug: interactive prompt until "cont".
+static int debug_debug(State* L) {
+  for (;;) {
+    std::fputs("lua_debug> ", stderr);
+    std::fflush(stderr);
+    char buffer[250];
+    if (std::fgets(buffer, sizeof(buffer), stdin) == nullptr || buffer[0] == '\0')
+      return 0;
+    if (std::strncmp(buffer, "cont", 4) == 0)
+      return 0;
+    try {
+      int st = L->load_string(buffer, "=(debug command)");
+      if (st != LUA_OK) {
+        std::fprintf(stderr, "%s\n", L->gettop() >= 1 ? value_to_string(*L->at(-1)).c_str() : "error");
+        L->settop(0);
+        continue;
+      }
+      call_closure(L, L->at(-1)->as_closure(), 0, 0);
+      L->settop(0);
+    } catch (const LuatierError& e) {
+      L->current->err_obj_set = false;
+      std::fprintf(stderr, "%s\n", e.what());
+      L->settop(0);
+    }
+  }
+}
+
 static int open_debug_module(State* L) {
   Table* dbg = new_lib(L, 16);
   set_field(L, dbg, "getinfo", debug_getinfo);
@@ -1063,6 +1092,7 @@ static int open_debug_module(State* L) {
   set_field(L, dbg, "setmetatable", debug_setmetatable);
   set_field(L, dbg, "getuservalue", debug_getuservalue);
   set_field(L, dbg, "setuservalue", debug_setuservalue);
+  set_field(L, dbg, "debug", debug_debug);
   L->settop(0);
   L->push(TValue::obj(ValueTag::Table, dbg));
   return 1;

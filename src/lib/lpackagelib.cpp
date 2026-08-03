@@ -1,9 +1,11 @@
 #include "lib/libs.hpp"
 
 #include "lib/lib_util.hpp"
+#include "luatier/lua.h"
 #include "vm/interpreter.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -238,6 +240,56 @@ static int pkg_searchpath(State* L) {
   return searchpath_impl(L, std::move(name), path, sep, rep);
 }
 
+static bool package_noenv(State* L) {
+  TValue v = L->registry->get(TValue::obj(ValueTag::String, L->intern("LUA_NOENV")));
+  return !v.is_nil();
+}
+
+// PUC setpath: versioned env first, then unversioned; ";;" → ";" + default + ";".
+static std::string expand_path_env(const char* envname, const char* dft, bool noenv) {
+  std::string versioned = std::string(envname) + LUA_VERSUFFIX;
+  const char* path = std::getenv(versioned.c_str());
+  if (path == nullptr)
+    path = std::getenv(envname);
+  if (path == nullptr || noenv)
+    return dft;
+  // Replace ";;" with ";\1;" then "\1" with default (AUXMARK technique).
+  std::string s = path;
+  std::string out;
+  out.reserve(s.size() + std::strlen(dft) + 8);
+  for (size_t i = 0; i < s.size();) {
+    if (i + 1 < s.size() && s[i] == ';' && s[i + 1] == ';') {
+      out.push_back(';');
+      out.push_back('\1');
+      out.push_back(';');
+      i += 2;
+    } else {
+      out.push_back(s[i++]);
+    }
+  }
+  std::string final;
+  final.reserve(out.size() + std::strlen(dft));
+  for (size_t i = 0; i < out.size(); ++i) {
+    if (out[i] == '\1')
+      final += dft;
+    else
+      final.push_back(out[i]);
+  }
+  return final;
+}
+
+static void set_package_path_field(State* L, Table* pkg, const char* field, const char* envname,
+                                   const char* dft) {
+  std::string path = expand_path_env(envname, dft, package_noenv(L));
+  set_field_value(L, pkg, field, TValue::obj(ValueTag::String, L->intern(path)));
+}
+
+void package_reapply_paths(State* L) {
+  Table* pkg = package_table(L);
+  set_package_path_field(L, pkg, "path", "LUA_PATH", k_path_default);
+  set_package_path_field(L, pkg, "cpath", "LUA_CPATH", k_cpath_default);
+}
+
 void open_package_lib(State* L) {
   Table* pkg = new_lib(L, 16);
   Table* loaded = new_lib(L, 16);
@@ -254,8 +306,8 @@ void open_package_lib(State* L) {
   set_field_value(L, pkg, "loaded", TValue::obj(ValueTag::Table, loaded));
   set_field_value(L, pkg, "preload", TValue::obj(ValueTag::Table, preload));
   set_field_value(L, pkg, "searchers", TValue::obj(ValueTag::Table, searchers));
-  set_field_value(L, pkg, "path", TValue::obj(ValueTag::String, L->intern(k_path_default)));
-  set_field_value(L, pkg, "cpath", TValue::obj(ValueTag::String, L->intern(k_cpath_default)));
+  set_package_path_field(L, pkg, "path", "LUA_PATH", k_path_default);
+  set_package_path_field(L, pkg, "cpath", "LUA_CPATH", k_cpath_default);
   set_field(L, pkg, "require", pkg_require);
   set_field(L, pkg, "loadlib", pkg_loadlib);
   set_field(L, pkg, "searchpath", pkg_searchpath);
