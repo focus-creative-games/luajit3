@@ -3,6 +3,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace luatier {
@@ -16,10 +17,12 @@ struct LocalScope {
 struct Ctx {
   int loop_depth = 0;
   std::vector<LocalScope> locals;
-  std::unordered_map<std::string, std::set<std::string>> labels;
+  // Per-block label maps; innermost at back. Nested blocks may reuse names.
+  std::vector<std::unordered_map<std::string, std::set<std::string>>> label_scopes;
   struct PendingGoto {
     std::string label;
     std::set<std::string> visible;
+    size_t scope_depth = 0;
   };
   std::vector<PendingGoto> gotos;
 
@@ -30,12 +33,21 @@ struct Ctx {
     return s;
   }
 
+  const std::set<std::string>* find_label(const std::string& name) const {
+    for (int i = static_cast<int>(label_scopes.size()) - 1; i >= 0; --i) {
+      auto it = label_scopes[static_cast<size_t>(i)].find(name);
+      if (it != label_scopes[static_cast<size_t>(i)].end())
+        return &it->second;
+    }
+    return nullptr;
+  }
+
   void check_gotos() {
     for (auto& g : gotos) {
-      auto it = labels.find(g.label);
-      if (it == labels.end())
+      const std::set<std::string>* labs = find_label(g.label);
+      if (!labs)
         panic("no visible label '" + g.label + "' for goto");
-      for (auto& name : it->second) {
+      for (auto& name : *labs) {
         if (!g.visible.count(name))
           panic("goto jumps into the scope of local '" + name + "'");
       }
@@ -112,7 +124,7 @@ void walk_stmt(AstNode& s, Ctx& ctx) {
     break;
   case AstKind::Goto: {
     auto& n = static_cast<GotoStmt&>(s);
-    ctx.gotos.push_back({n.label, ctx.visible_locals()});
+    ctx.gotos.push_back({n.label, ctx.visible_locals(), ctx.label_scopes.size()});
     break;
   }
   case AstKind::Label:
@@ -228,11 +240,14 @@ void walk_stmt(AstNode& s, Ctx& ctx) {
 
 void walk_block(Block& b, Ctx& ctx) {
   size_t before = ctx.locals.size();
+  ctx.label_scopes.emplace_back();
+  const size_t scope_idx = ctx.label_scopes.size() - 1;
   for (size_t i = 0; i < b.stmts.size(); ++i) {
     AstNode& s = *b.stmts[i];
     if (s.kind == AstKind::Label) {
       auto& n = static_cast<LabelStmt&>(s);
-      if (ctx.labels.count(n.name))
+      auto& cur = ctx.label_scopes[scope_idx];
+      if (cur.count(n.name))
         panic("label '" + n.name + "' already defined");
       // PUC: if label is the last non-void statement in the block (only labels
       // follow), gotos may target it without entering this block's locals.
@@ -247,14 +262,33 @@ void walk_block(Block& b, Ctx& ctx) {
         std::set<std::string> outer;
         for (size_t k = 0; k < before; ++k)
           outer.insert(ctx.locals[k].name);
-        ctx.labels[n.name] = std::move(outer);
+        cur[n.name] = std::move(outer);
       } else {
-        ctx.labels[n.name] = ctx.visible_locals();
+        cur[n.name] = ctx.visible_locals();
       }
       continue;
     }
     walk_stmt(s, ctx);
   }
+  // Bind gotos from this block / nested blocks to labels defined here.
+  std::vector<Ctx::PendingGoto> remain;
+  const size_t scope_sz = ctx.label_scopes.size();
+  auto& cur = ctx.label_scopes[scope_idx];
+  for (auto& g : ctx.gotos) {
+    if (g.scope_depth >= scope_sz) {
+      auto it = cur.find(g.label);
+      if (it != cur.end()) {
+        for (auto& name : it->second) {
+          if (!g.visible.count(name))
+            panic("goto jumps into the scope of local '" + name + "'");
+        }
+        continue;
+      }
+    }
+    remain.push_back(std::move(g));
+  }
+  ctx.gotos = std::move(remain);
+  ctx.label_scopes.pop_back();
   ctx.locals.resize(before);
 }
 

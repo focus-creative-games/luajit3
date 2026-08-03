@@ -623,6 +623,7 @@ static int base_load(State* L) {
     try {
       source = read_via_function(L, reader);
     } catch (const LuatierError& e) {
+      L->current->err_obj_set = false;
       L->settop(0);
       L->push(TValue::nil());
       push_string(L, e.what());
@@ -657,6 +658,7 @@ static int base_load(State* L) {
     }
     return 1;
   } catch (const LuatierError& e) {
+    L->current->err_obj_set = false;
     L->settop(0);
     L->push(TValue::nil());
     push_string(L, e.what());
@@ -702,6 +704,7 @@ static int base_loadfile(State* L) {
     }
     return 1;
   } catch (const LuatierError& e) {
+    L->current->err_obj_set = false;
     L->settop(0);
     L->push(TValue::nil());
     push_string(L, e.what());

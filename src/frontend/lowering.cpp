@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <utility>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace luatier {
 
@@ -930,14 +931,23 @@ void storevar(FuncState& fs, Expdesc& var, int expr_reg) {
 void block(FuncState& fs, Block& b) {
   int saved = static_cast<int>(fs.locals.size());
   fs.block_entry_nactvar.push_back(fs.nactvar);
+  const size_t pending_before = fs.pending_gotos.size();
+
+  // Label names defined in this block (for uniqueness + shadowing).
+  std::unordered_set<std::string> names_here;
+  for (auto& sp : b.stmts) {
+    if (sp->kind == AstKind::Label)
+      names_here.insert(static_cast<LabelStmt&>(*sp).name);
+  }
+  std::unordered_set<std::string> defined_here;
+  std::unordered_map<std::string, FuncState::LabelInfo> shadowed;
+
   for (size_t i = 0; i < b.stmts.size(); ++i) {
     AstNode& s = *b.stmts[i];
     if (s.kind == AstKind::Label) {
       auto& n = static_cast<LabelStmt&>(s);
-      if (fs.labels.count(n.name))
+      if (defined_here.count(n.name))
         panic("label already defined: " + n.name);
-      // PUC: a label that is last in its block (ignoring trailing labels) sees
-      // only outer locals — gotos into it close block-scoped upvalues.
       bool last = true;
       for (size_t j = i + 1; j < b.stmts.size(); ++j) {
         if (b.stmts[j]->kind != AstKind::Label) {
@@ -946,11 +956,59 @@ void block(FuncState& fs, Block& b) {
         }
       }
       int nv = last ? fs.block_entry_nactvar.back() : fs.nactvar;
+      if (fs.labels.count(n.name) && !defined_here.count(n.name))
+        shadowed[n.name] = fs.labels[n.name];
       fs.labels[n.name] = {fs.pc(), nv};
+      defined_here.insert(n.name);
+      continue;
+    }
+    if (s.kind == AstKind::Goto) {
+      auto& n = static_cast<GotoStmt&>(s);
+      // Prefer a label belonging to this block (incl. forward) over an outer one.
+      if (names_here.count(n.label)) {
+        if (defined_here.count(n.label)) {
+          auto& info = fs.labels[n.label];
+          int a = FuncState::goto_close_a(fs.nactvar, info.nactvar);
+          fs.code_asbx(OpCode::JMP, a, info.pc - (fs.pc() + 1));
+        } else {
+          int j = fs.code_asbx(OpCode::JMP, 0, 0);
+          fs.pending_gotos.push_back({n.label, j, fs.nactvar});
+        }
+      } else if (fs.labels.count(n.label)) {
+        auto& info = fs.labels[n.label];
+        int a = FuncState::goto_close_a(fs.nactvar, info.nactvar);
+        fs.code_asbx(OpCode::JMP, a, info.pc - (fs.pc() + 1));
+      } else {
+        int j = fs.code_asbx(OpCode::JMP, 0, 0);
+        fs.pending_gotos.push_back({n.label, j, fs.nactvar});
+      }
       continue;
     }
     statement(fs, s);
   }
+
+  // Patch only gotos opened in this block that target this block's labels.
+  std::vector<FuncState::PendingGoto> remain;
+  for (size_t i = 0; i < fs.pending_gotos.size(); ++i) {
+    auto& g = fs.pending_gotos[i];
+    if (i >= pending_before && defined_here.count(g.name)) {
+      auto& info = fs.labels[g.name];
+      int a = FuncState::goto_close_a(g.nactvar, info.nactvar);
+      int sbx = info.pc - (g.jmp_pc + 1);
+      fs.proto->code[static_cast<size_t>(g.jmp_pc)] =
+          encode_asbx(OpCode::JMP, static_cast<uint8_t>(a), sbx);
+    } else {
+      remain.push_back(g);
+    }
+  }
+  fs.pending_gotos = std::move(remain);
+  for (auto& name : defined_here) {
+    fs.labels.erase(name);
+    auto it = shadowed.find(name);
+    if (it != shadowed.end())
+      fs.labels[name] = it->second;
+  }
+
   fs.block_entry_nactvar.pop_back();
   fs.leave_block(saved);
 }

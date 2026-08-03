@@ -397,8 +397,13 @@ void GC::run_finalizers() {
     }
   }
   running_finalizer_ = false;
-  if (!first_error.empty())
+  if (!first_error.empty()) {
+    // Drop any non-string err_obj from error{} inside __gc; the suite expects
+    // the wrapped "error in __gc (...)" string from collectgarbage.
+    if (L_ && L_->current)
+      L_->current->err_obj_set = false;
     panic(first_error);
+  }
 }
 
 void GC::sweep() {

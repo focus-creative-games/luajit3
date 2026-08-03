@@ -9,6 +9,12 @@
 
 namespace luatier {
 
+// Max nested C calls / resume depth (PUC LUAI_MAXCCALLS). Prevents native
+// stack overflow on recursive coroutine.wrap / C callbacks.
+#ifndef LUAI_MAXCCALLS
+#define LUAI_MAXCCALLS 200
+#endif
+
 struct LuatierError : std::runtime_error {
   using std::runtime_error::runtime_error;
 };

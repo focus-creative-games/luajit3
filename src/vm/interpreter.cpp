@@ -1,11 +1,14 @@
 #include "vm/interpreter.hpp"
 
+#include "common/common.hpp"
 #include "jit/hotness.hpp"
 #include "runtime/string.hpp"
+#include "runtime/value.hpp"
 #include "tools/profile.hpp"
 #include "vm/debug_hook.hpp"
 #include "vm/meta.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -23,6 +26,9 @@
 namespace luatier {
 
 namespace {
+
+// invoke_mm: Lua frame pushed; continue outer interpret.
+constexpr int MM_PUSHED = 2;
 
 const char* arith_mt(OpCode op) {
   switch (op) {
@@ -139,6 +145,27 @@ TValue do_arith(State* L, OpCode op, const TValue& a, const TValue& b) {
   return arith_raw(op, a, b);
 }
 
+// PUC luaD_call nesting: raise "C stack overflow" before the native stack dies.
+void incr_Ccalls(Thread* th) {
+  if (++th->nCcalls >= LUAI_MAXCCALLS) {
+    if (th->nCcalls == LUAI_MAXCCALLS)
+      panic("C stack overflow");
+    if (th->nCcalls >= LUAI_MAXCCALLS + (LUAI_MAXCCALLS >> 3))
+      panic("error in error handling");
+  }
+}
+
+struct CCallDepth {
+  Thread* th;
+  explicit CCallDepth(Thread* t) : th(t) { incr_Ccalls(th); }
+  ~CCallDepth() {
+    if (th && th->nCcalls > 0)
+      --th->nCcalls;
+  }
+  CCallDepth(const CCallDepth&) = delete;
+  CCallDepth& operator=(const CCallDepth&) = delete;
+};
+
 void push_lua_frame(State* L, Closure* cl, int func_idx, int nargs, int nresults,
                     bool is_tailcall = false) {
   Thread* th = L->current;
@@ -193,6 +220,8 @@ int run_c_call(State* L, Closure* cl, int func_idx, int nargs, int nresults,
     panic("run_c_call: bad func_idx/nargs");
   if (static_cast<int>(th->stack.size()) < func_idx + 1 + nargs)
     panic("run_c_call: stack underflow");
+
+  CCallDepth _cc(th); // PUC luaD_call nCcalls++
 
   // Push a C frame so debug levels match PUC (level 0 = C, level 1 = Lua caller).
   CallFrame cfr;
@@ -310,6 +339,220 @@ int run_c_call(State* L, Closure* cl, int func_idx, int nargs, int nresults,
   return LUA_OK;
 }
 
+int live_regs_top(Thread* th) {
+  int limit = th->top;
+  for (auto& fr : th->frames) {
+    if (fr.proto)
+      limit = std::max(limit, fr.base + fr.proto->maxstack);
+    else if (fr.cl && fr.cl->proto)
+      limit = std::max(limit, fr.base + fr.cl->proto->maxstack);
+    else if (fr.cl && fr.cl->is_c)
+      limit = std::max(limit, fr.base + 1);
+  }
+  return limit;
+}
+
+// Flat metamethod call from a Lua opcode (PUC luaT_callTM via luaD_call).
+// Sets caller pending_finish_op. Returns LUA_OK (C MM done), LUA_YIELD, or MM_PUSHED.
+int invoke_mm(State* L, size_t caller_fi, const TValue& mm, const TValue* args, int nargs,
+              int nout) {
+  Thread* th = L->current;
+  if (!mm.is_function())
+    panic("invoke_mm: function expected");
+  auto& cfr = th->frames[caller_fi];
+  const int call_base = live_regs_top(th);
+  L->ensure_stack(call_base + 1 + nargs + nout + 8);
+  th->stack[static_cast<size_t>(call_base)] = mm;
+  for (int i = 0; i < nargs; ++i)
+    th->stack[static_cast<size_t>(call_base + 1 + i)] = args[i];
+  th->top = call_base + 1 + nargs;
+  cfr.pending_finish_op = true;
+  cfr.meta_res_base = call_base;
+  Closure* cl = mm.as_closure();
+  if (cl->is_c) {
+    int st = run_c_call(L, cl, call_base, nargs, nout);
+    if (st == LUA_YIELD)
+      return LUA_YIELD;
+    return LUA_OK;
+  }
+  push_lua_frame(L, cl, call_base, nargs, nout);
+  return MM_PUSHED;
+}
+
+int finish_interrupted_op(State* L, size_t fi) {
+  Thread* th = L->current;
+  auto& fr = th->frames[fi];
+  if (!fr.pending_finish_op || !fr.proto)
+    return LUA_OK;
+  fr.pending_finish_op = false;
+  const int opc = fr.saved_pc - 1;
+  if (opc < 0 || opc >= static_cast<int>(fr.proto->code.size()))
+    panic("finish_interrupted_op: bad pc");
+  Instruction ins = fr.proto->code[static_cast<size_t>(opc)];
+  OpCode op = static_cast<OpCode>(op_get(ins));
+  int a = op_a(ins);
+  int b = op_b(ins);
+  int c = op_c(ins);
+  (void)b;
+  (void)c;
+  TValue* base = th->stack.data() + fr.base;
+  TValue res = th->stack[static_cast<size_t>(fr.meta_res_base)];
+
+  switch (op) {
+  case OpCode::EQ:
+  case OpCode::LT:
+  case OpCode::LE: {
+    bool r = res.is_truthy();
+    if (fr.le_invert)
+      r = !r;
+    fr.le_invert = false;
+    if (r != (a != 0))
+      fr.saved_pc++;
+    break;
+  }
+  case OpCode::ADD:
+  case OpCode::SUB:
+  case OpCode::MUL:
+  case OpCode::DIV:
+  case OpCode::IDIV:
+  case OpCode::MOD:
+  case OpCode::POW:
+  case OpCode::BAND:
+  case OpCode::BOR:
+  case OpCode::BXOR:
+  case OpCode::SHL:
+  case OpCode::SHR:
+  case OpCode::UNM:
+  case OpCode::BNOT:
+  case OpCode::LEN:
+    base[a] = res;
+    break;
+  case OpCode::GETTABLE:
+  case OpCode::GETI:
+  case OpCode::GETFIELD:
+  case OpCode::GETTABUP:
+    base[a] = res;
+    break;
+  case OpCode::SELF:
+    base[a] = res;
+    break;
+  case OpCode::SETTABLE:
+  case OpCode::SETI:
+  case OpCode::SETFIELD:
+  case OpCode::SETTABUP:
+    break;
+  case OpCode::CONCAT: {
+    int pos = fr.concat_pos;
+    int last = fr.concat_last;
+    int dest = fr.concat_dest;
+    TValue acc = res;
+    pos++;
+    while (pos <= last) {
+      TValue rhs = th->stack[static_cast<size_t>(fr.base + pos)];
+      if ((acc.is_string() || acc.is_number()) && (rhs.is_string() || rhs.is_number())) {
+        acc = TValue::obj(ValueTag::String,
+                          L->intern(value_to_string(acc) + value_to_string(rhs)));
+        pos++;
+        continue;
+      }
+      TValue mm = get_metamethod(L, acc, "__concat");
+      if (mm.is_nil())
+        mm = get_metamethod(L, rhs, "__concat");
+      if (mm.is_nil() || !mm.is_function())
+        panic("attempt to concatenate incompatible types");
+      fr.concat_pos = pos;
+      fr.concat_last = last;
+      fr.concat_dest = dest;
+      TValue args[2] = {acc, rhs};
+      int st = invoke_mm(L, fi, mm, args, 2, 1);
+      if (st == LUA_OK) {
+        acc = th->stack[static_cast<size_t>(fr.meta_res_base)];
+        fr.pending_finish_op = false;
+        pos++;
+        continue;
+      }
+      if (st == LUA_YIELD)
+        return LUA_YIELD;
+      return LUA_OK; // MM_PUSHED
+    }
+    base[dest] = acc;
+    break;
+  }
+  default:
+    panic("finish_interrupted_op: unexpected opcode");
+  }
+  return LUA_OK;
+}
+
+// Resolve __index with possible yield. Writes to *out when DONE.
+// Returns LUA_OK (out set), LUA_YIELD, or MM_PUSHED.
+int index_yieldable(State* L, size_t fi, const TValue& table, const TValue& key, TValue* out) {
+  TValue t = table;
+  for (int loop = 0; loop < 2000; ++loop) {
+    if (t.is_table()) {
+      TValue v = t.as_table()->get(key);
+      if (!v.is_nil()) {
+        *out = v;
+        return LUA_OK;
+      }
+      TValue mm = get_metamethod(L, t, "__index");
+      if (mm.is_nil()) {
+        *out = TValue::nil();
+        return LUA_OK;
+      }
+      if (mm.is_function()) {
+        TValue args[2] = {t, key};
+        return invoke_mm(L, fi, mm, args, 2, 1);
+      }
+      t = mm;
+      continue;
+    }
+    TValue mm = get_metamethod(L, t, "__index");
+    if (mm.is_nil())
+      panic("attempt to index a non-table value");
+    if (mm.is_function()) {
+      TValue args[2] = {t, key};
+      return invoke_mm(L, fi, mm, args, 2, 1);
+    }
+    t = mm;
+  }
+  panic("'__index' chain too long; possible loop");
+}
+
+int newindex_yieldable(State* L, size_t fi, const TValue& table, const TValue& key,
+                       const TValue& value) {
+  TValue t = table;
+  for (int loop = 0; loop < 2000; ++loop) {
+    if (t.is_table()) {
+      TValue cur = t.as_table()->get(key);
+      if (!cur.is_nil()) {
+        t.as_table()->set(L, key, value);
+        return LUA_OK;
+      }
+      TValue mm = get_metamethod(L, t, "__newindex");
+      if (mm.is_nil()) {
+        t.as_table()->set(L, key, value);
+        return LUA_OK;
+      }
+      if (mm.is_function()) {
+        TValue args[3] = {t, key, value};
+        return invoke_mm(L, fi, mm, args, 3, 0);
+      }
+      t = mm;
+      continue;
+    }
+    TValue mm = get_metamethod(L, t, "__newindex");
+    if (mm.is_nil())
+      panic("attempt to index a non-table value");
+    if (mm.is_function()) {
+      TValue args[3] = {t, key, value};
+      return invoke_mm(L, fi, mm, args, 3, 0);
+    }
+    t = mm;
+  }
+  panic("'__newindex' chain too long; possible loop");
+}
+
 } // namespace
 
 int call_closure(State* L, Closure* cl, int nargs, int nresults) {
@@ -318,6 +561,8 @@ int call_closure(State* L, Closure* cl, int nargs, int nresults) {
     panic("call_closure stack underflow");
   if (cl->is_c)
     return run_c_call(L, cl, func_idx, nargs, nresults);
+  // Nested interpret from C counts as a C-call level (PUC luaD_call).
+  CCallDepth _cc(L->current);
   push_lua_frame(L, cl, func_idx, nargs, nresults);
   return interpret(L);
 }
@@ -335,6 +580,13 @@ int interpret(State* L, int min_frames) {
     // Hit a C/continuation frame: return to the resume driver.
     if (fr0.kind == FrameKind::Continue || fr0.kind == FrameKind::CApi || !fr0.proto)
       return LUA_OK;
+    // Metamethod returned: finish the interrupted opcode (PUC luaV_finishOp).
+    if (fr0.pending_finish_op) {
+      int st = finish_interrupted_op(L, fi);
+      if (st == LUA_YIELD)
+        return LUA_YIELD;
+      continue;
+    }
     Closure* cl = fr0.cl;
     Proto* p = fr0.proto;
     if (fr0.saved_pc >= static_cast<int>(p->code.size())) {
@@ -418,52 +670,132 @@ int interpret(State* L, int min_frames) {
         panic("GETTABUP: bad constant");
       TValue t = cl->upvals[static_cast<size_t>(b)]->get();
       TValue key = p->constants[static_cast<size_t>(c)];
-      TValue v = meta_index(L, t, key);
-      base = reload();
-      base[a] = v;
+      TValue v;
+      int st = index_yieldable(L, fi, t, key, &v);
+      if (st == LUA_YIELD)
+        return LUA_YIELD;
+      if (st == MM_PUSHED)
+        break;
+      if (th->frames[fi].pending_finish_op) {
+        st = finish_interrupted_op(L, fi);
+        if (st == LUA_YIELD)
+          return LUA_YIELD;
+      } else {
+        base = reload();
+        base[a] = v;
+      }
       break;
     }
     case OpCode::SETTABUP: {
       TValue t = cl->upvals[static_cast<size_t>(a)]->get();
       TValue key = p->constants[static_cast<size_t>(b)];
       TValue val = base[c];
-      meta_newindex(L, t, key, val);
+      int st = newindex_yieldable(L, fi, t, key, val);
+      if (st == LUA_YIELD)
+        return LUA_YIELD;
+      if (st == MM_PUSHED)
+        break;
+      if (th->frames[fi].pending_finish_op) {
+        st = finish_interrupted_op(L, fi);
+        if (st == LUA_YIELD)
+          return LUA_YIELD;
+      }
       (void)reload();
       break;
     }
     case OpCode::GETTABLE: {
-      TValue v = meta_index(L, base[b], base[c]);
-      base = reload();
-      base[a] = v;
+      TValue v;
+      int st = index_yieldable(L, fi, base[b], base[c], &v);
+      if (st == LUA_YIELD)
+        return LUA_YIELD;
+      if (st == MM_PUSHED)
+        break;
+      if (th->frames[fi].pending_finish_op) {
+        st = finish_interrupted_op(L, fi);
+        if (st == LUA_YIELD)
+          return LUA_YIELD;
+      } else {
+        base = reload();
+        base[a] = v;
+      }
       break;
     }
     case OpCode::SETTABLE: {
       TValue t = base[a], key = base[b], val = base[c];
-      meta_newindex(L, t, key, val);
+      int st = newindex_yieldable(L, fi, t, key, val);
+      if (st == LUA_YIELD)
+        return LUA_YIELD;
+      if (st == MM_PUSHED)
+        break;
+      if (th->frames[fi].pending_finish_op) {
+        st = finish_interrupted_op(L, fi);
+        if (st == LUA_YIELD)
+          return LUA_YIELD;
+      }
       (void)reload();
       break;
     }
     case OpCode::GETI: {
-      TValue v = meta_index(L, base[b], TValue::integer(c));
-      base = reload();
-      base[a] = v;
+      TValue v;
+      int st = index_yieldable(L, fi, base[b], TValue::integer(c), &v);
+      if (st == LUA_YIELD)
+        return LUA_YIELD;
+      if (st == MM_PUSHED)
+        break;
+      if (th->frames[fi].pending_finish_op) {
+        st = finish_interrupted_op(L, fi);
+        if (st == LUA_YIELD)
+          return LUA_YIELD;
+      } else {
+        base = reload();
+        base[a] = v;
+      }
       break;
     }
     case OpCode::SETI: {
       TValue t = base[a], val = base[c];
-      meta_newindex(L, t, TValue::integer(b), val);
+      int st = newindex_yieldable(L, fi, t, TValue::integer(b), val);
+      if (st == LUA_YIELD)
+        return LUA_YIELD;
+      if (st == MM_PUSHED)
+        break;
+      if (th->frames[fi].pending_finish_op) {
+        st = finish_interrupted_op(L, fi);
+        if (st == LUA_YIELD)
+          return LUA_YIELD;
+      }
       (void)reload();
       break;
     }
     case OpCode::GETFIELD: {
-      TValue v = meta_index(L, base[b], p->constants[static_cast<size_t>(c)]);
-      base = reload();
-      base[a] = v;
+      TValue v;
+      int st = index_yieldable(L, fi, base[b], p->constants[static_cast<size_t>(c)], &v);
+      if (st == LUA_YIELD)
+        return LUA_YIELD;
+      if (st == MM_PUSHED)
+        break;
+      if (th->frames[fi].pending_finish_op) {
+        st = finish_interrupted_op(L, fi);
+        if (st == LUA_YIELD)
+          return LUA_YIELD;
+      } else {
+        base = reload();
+        base[a] = v;
+      }
       break;
     }
     case OpCode::SETFIELD: {
       TValue t = base[a], val = base[c];
-      meta_newindex(L, t, p->constants[static_cast<size_t>(b)], val);
+      int st = newindex_yieldable(L, fi, t, p->constants[static_cast<size_t>(b)], val);
+      if (st == LUA_YIELD)
+        return LUA_YIELD;
+      if (st == MM_PUSHED)
+        break;
+      if (th->frames[fi].pending_finish_op) {
+        st = finish_interrupted_op(L, fi);
+        if (st == LUA_YIELD)
+          return LUA_YIELD;
+      }
       (void)reload();
       break;
     }
@@ -474,10 +806,23 @@ int interpret(State* L, int min_frames) {
       TValue t = base[b];
       TValue key = base[c];
       base[a + 1] = t;
-      TValue m = meta_index(L, t, key);
-      base = reload();
-      base[a + 1] = t;
-      base[a] = m;
+      TValue m;
+      int st = index_yieldable(L, fi, t, key, &m);
+      if (st == LUA_YIELD)
+        return LUA_YIELD;
+      if (st == MM_PUSHED)
+        break;
+      if (th->frames[fi].pending_finish_op) {
+        st = finish_interrupted_op(L, fi);
+        if (st == LUA_YIELD)
+          return LUA_YIELD;
+        base = reload();
+        base[a + 1] = t;
+      } else {
+        base = reload();
+        base[a + 1] = t;
+        base[a] = m;
+      }
       break;
     }
     case OpCode::ADD:
@@ -493,9 +838,28 @@ int interpret(State* L, int min_frames) {
     case OpCode::SHL:
     case OpCode::SHR: {
       TValue lhs = base[b], rhs = base[c];
-      TValue r = do_arith(L, op, lhs, rhs);
-      base = reload();
-      base[a] = r;
+      TValue na, nb;
+      if (try_to_number(lhs, &na) && try_to_number(rhs, &nb)) {
+        base[a] = arith_raw(op, na, nb);
+        break;
+      }
+      const char* mt = arith_mt(op);
+      TValue mm = mt ? get_metamethod(L, lhs, mt) : TValue::nil();
+      if (mm.is_nil() && mt)
+        mm = get_metamethod(L, rhs, mt);
+      if (mm.is_nil() || !mm.is_function()) {
+        (void)do_arith(L, op, lhs, rhs); // panic with the usual message
+        break;
+      }
+      TValue args[2] = {lhs, rhs};
+      int st = invoke_mm(L, fi, mm, args, 2, 1);
+      if (st == LUA_YIELD)
+        return LUA_YIELD;
+      if (st == MM_PUSHED)
+        break;
+      st = finish_interrupted_op(L, fi);
+      if (st == LUA_YIELD)
+        return LUA_YIELD;
       break;
     }
     case OpCode::UNM: {
@@ -506,11 +870,18 @@ int interpret(State* L, int min_frames) {
         else
           base[a] = TValue::number(-nb.as_float());
       } else {
-        TValue out;
-        if (!meta_unary(L, "__unm", base[b], &out))
+        TValue mm = get_metamethod(L, base[b], "__unm");
+        if (mm.is_nil() || !mm.is_function())
           panic("attempt to perform arithmetic on non-number");
-        base = reload();
-        base[a] = out;
+        TValue args[1] = {base[b]};
+        int st = invoke_mm(L, fi, mm, args, 1, 1);
+        if (st == LUA_YIELD)
+          return LUA_YIELD;
+        if (st == MM_PUSHED)
+          break;
+        st = finish_interrupted_op(L, fi);
+        if (st == LUA_YIELD)
+          return LUA_YIELD;
       }
       break;
     }
@@ -519,11 +890,18 @@ int interpret(State* L, int min_frames) {
       if (to_integer(base[b], &x))
         base[a] = TValue::integer(~x);
       else {
-        TValue out;
-        if (!meta_unary(L, "__bnot", base[b], &out))
+        TValue mm = get_metamethod(L, base[b], "__bnot");
+        if (mm.is_nil() || !mm.is_function())
           panic("number has no integer representation");
-        base = reload();
-        base[a] = out;
+        TValue args[1] = {base[b]};
+        int st = invoke_mm(L, fi, mm, args, 1, 1);
+        if (st == LUA_YIELD)
+          return LUA_YIELD;
+        if (st == MM_PUSHED)
+          break;
+        st = finish_interrupted_op(L, fi);
+        if (st == LUA_YIELD)
+          return LUA_YIELD;
       }
       break;
     }
@@ -531,46 +909,198 @@ int interpret(State* L, int min_frames) {
       base[a] = TValue::boolean(!base[b].is_truthy());
       break;
     case OpCode::LEN: {
+      TValue vb = base[b];
+      if (vb.is_string()) {
+        base[a] = TValue::integer(static_cast<int64_t>(vb.as_string()->len));
+        break;
+      }
+      if (vb.is_table()) {
+        TValue mm = get_metamethod(L, vb, "__len");
+        if (mm.is_nil()) {
+          base[a] = TValue::integer(table_length(vb.as_table()));
+          break;
+        }
+        if (mm.is_function()) {
+          TValue args[1] = {vb};
+          int st = invoke_mm(L, fi, mm, args, 1, 1);
+          if (st == LUA_YIELD)
+            return LUA_YIELD;
+          if (st == MM_PUSHED)
+            break;
+          st = finish_interrupted_op(L, fi);
+          if (st == LUA_YIELD)
+            return LUA_YIELD;
+          break;
+        }
+      }
       TValue out;
-      meta_len(L, base[b], &out);
+      if (!meta_len(L, vb, &out))
+        panic("attempt to get length of incompatible type");
       base = reload();
       base[a] = out;
       break;
     }
     case OpCode::CONCAT: {
+      auto& cfr = th->frames[fi];
+      cfr.concat_pos = b;
+      cfr.concat_last = c;
+      cfr.concat_dest = a;
       TValue acc = base[b];
-      for (int r = b + 1; r <= c; ++r) {
+      int pos = b + 1;
+      while (pos <= c) {
         base = reload();
-        TValue out;
-        meta_concat(L, acc, base[r], &out);
-        acc = out;
+        TValue rhs = base[pos];
+        if ((acc.is_string() || acc.is_number()) && (rhs.is_string() || rhs.is_number())) {
+          acc = TValue::obj(ValueTag::String,
+                            L->intern(value_to_string(acc) + value_to_string(rhs)));
+          pos++;
+          continue;
+        }
+        TValue mm = get_metamethod(L, acc, "__concat");
+        if (mm.is_nil())
+          mm = get_metamethod(L, rhs, "__concat");
+        if (mm.is_nil() || !mm.is_function())
+          panic("attempt to concatenate incompatible types");
+        cfr.concat_pos = pos;
+        TValue args[2] = {acc, rhs};
+        int st = invoke_mm(L, fi, mm, args, 2, 1);
+        if (st == LUA_YIELD)
+          return LUA_YIELD;
+        if (st == MM_PUSHED)
+          break;
+        // C MM done: take result and continue folding
+        acc = th->stack[static_cast<size_t>(cfr.meta_res_base)];
+        cfr.pending_finish_op = false;
+        pos++;
+        if (pos > c) {
+          base = reload();
+          base[a] = acc;
+        }
+        continue;
       }
-      base = reload();
-      base[a] = acc;
+      if (pos > c && !cfr.pending_finish_op) {
+        base = reload();
+        base[a] = acc;
+      }
       break;
     }
     case OpCode::EQ: {
+      TValue rb = base[b], rc = base[c];
+      if (rb.tag() != rc.tag() && !(rb.is_number() && rc.is_number())) {
+        if (a != 0)
+          pc()++; // eq==false; skip JMP when A wants true
+        break;
+      }
       bool eq = false;
-      meta_eq(L, base[b], base[c], &eq);
-      (void)reload();
+      if (rb.is_table() || rb.is_function() || rb.tag() == ValueTag::Userdata) {
+        if (rb.payload == rc.payload) {
+          eq = true;
+        } else {
+          TValue mm = get_metamethod(L, rb, "__eq");
+          if (mm.is_nil())
+            mm = get_metamethod(L, rc, "__eq");
+          if (!mm.is_nil() && mm.is_function()) {
+            TValue args[2] = {rb, rc};
+            int st = invoke_mm(L, fi, mm, args, 2, 1);
+            if (st == LUA_YIELD)
+              return LUA_YIELD;
+            if (st == MM_PUSHED)
+              break;
+            st = finish_interrupted_op(L, fi);
+            if (st == LUA_YIELD)
+              return LUA_YIELD;
+            break;
+          }
+          eq = false;
+        }
+      } else {
+        eq = values_equal(rb, rc);
+      }
       if (eq != (a != 0))
         pc()++;
       break;
     }
     case OpCode::LT: {
-      bool lt = false;
-      meta_lt(L, base[b], base[c], &lt);
-      (void)reload();
-      if (lt != (a != 0))
-        pc()++;
+      TValue rb = base[b], rc = base[c];
+      TValue na, nb;
+      if (try_to_number(rb, &na) && try_to_number(rc, &nb)) {
+        bool lt = na.to_number() < nb.to_number();
+        if (lt != (a != 0))
+          pc()++;
+        break;
+      }
+      if (rb.is_string() && rc.is_string()) {
+        bool lt = false;
+        meta_lt(L, rb, rc, &lt);
+        if (lt != (a != 0))
+          pc()++;
+        break;
+      }
+      TValue mm = get_metamethod(L, rb, "__lt");
+      if (mm.is_nil())
+        mm = get_metamethod(L, rc, "__lt");
+      if (mm.is_nil() || !mm.is_function())
+        panic("attempt to compare incompatible types");
+      th->frames[fi].le_invert = false;
+      TValue args[2] = {rb, rc};
+      int st = invoke_mm(L, fi, mm, args, 2, 1);
+      if (st == LUA_YIELD)
+        return LUA_YIELD;
+      if (st == MM_PUSHED)
+        break;
+      st = finish_interrupted_op(L, fi);
+      if (st == LUA_YIELD)
+        return LUA_YIELD;
       break;
     }
     case OpCode::LE: {
-      bool le = false;
-      meta_le(L, base[b], base[c], &le);
-      (void)reload();
-      if (le != (a != 0))
-        pc()++;
+      TValue rb = base[b], rc = base[c];
+      TValue na, nb;
+      if (try_to_number(rb, &na) && try_to_number(rc, &nb)) {
+        bool le = na.to_number() <= nb.to_number();
+        if (le != (a != 0))
+          pc()++;
+        break;
+      }
+      if (rb.is_string() && rc.is_string()) {
+        bool le = false;
+        meta_le(L, rb, rc, &le);
+        if (le != (a != 0))
+          pc()++;
+        break;
+      }
+      TValue mm = get_metamethod(L, rb, "__le");
+      if (mm.is_nil())
+        mm = get_metamethod(L, rc, "__le");
+      if (!mm.is_nil() && mm.is_function()) {
+        th->frames[fi].le_invert = false;
+        TValue args[2] = {rb, rc};
+        int st = invoke_mm(L, fi, mm, args, 2, 1);
+        if (st == LUA_YIELD)
+          return LUA_YIELD;
+        if (st == MM_PUSHED)
+          break;
+        st = finish_interrupted_op(L, fi);
+        if (st == LUA_YIELD)
+          return LUA_YIELD;
+        break;
+      }
+      // fallback: not (rc < rb) via __lt
+      mm = get_metamethod(L, rc, "__lt");
+      if (mm.is_nil())
+        mm = get_metamethod(L, rb, "__lt");
+      if (mm.is_nil() || !mm.is_function())
+        panic("attempt to compare incompatible types");
+      th->frames[fi].le_invert = true;
+      TValue args[2] = {rc, rb}; // b < a  ⇒  invert for a <= b
+      int st = invoke_mm(L, fi, mm, args, 2, 1);
+      if (st == LUA_YIELD)
+        return LUA_YIELD;
+      if (st == MM_PUSHED)
+        break;
+      st = finish_interrupted_op(L, fi);
+      if (st == LUA_YIELD)
+        return LUA_YIELD;
       break;
     }
     case OpCode::TEST:

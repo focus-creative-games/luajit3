@@ -1,5 +1,6 @@
 #include "lib/libs.hpp"
 
+#include "common/common.hpp"
 #include "lib/lib_util.hpp"
 #include "vm/interpreter.hpp"
 
@@ -69,6 +70,21 @@ static int co_resume(State* L) {
     return return_err("cannot resume dead coroutine");
   if (co->status != Thread::Status::Fresh && co->status != Thread::Status::Suspended)
     return return_err("cannot resume non-suspended coroutine");
+
+  // PUC lua_resume: inherit C-call depth from the caller; refuse before native SO.
+  {
+    unsigned short ncc = static_cast<unsigned short>(from->nCcalls + 1);
+    if (ncc >= LUAI_MAXCCALLS)
+      return return_err("C stack overflow");
+    co->nCcalls = ncc;
+  }
+  struct ResumeCcalls {
+    Thread* co;
+    ~ResumeCcalls() {
+      if (co && co->nCcalls > 0)
+        --co->nCcalls;
+    }
+  } _rc{co};
 
   try {
     L->current = co;

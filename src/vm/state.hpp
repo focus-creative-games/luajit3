@@ -43,6 +43,16 @@ struct CallFrame {
   enum class ContKind : uint8_t { None, PCall, XPCall } cont_kind = ContKind::None;
   TValue cont_ctx{};
   int cont_res_base = 0; // absolute stack index of protected-call results
+
+  // Yieldable metamethod (PUC luaV_finishOp): set on the Lua caller frame while
+  // a flat-pushed metamethod runs; cleared when finish_interrupted_op runs.
+  bool pending_finish_op = false;
+  bool le_invert = false; // OP_LE fell back to not (b < a)
+  int meta_res_base = 0;  // absolute slot of metamethod result (call_base)
+  // OP_CONCAT progress across yields: next register index to fold, and last.
+  int concat_pos = 0;
+  int concat_last = 0;
+  int concat_dest = 0;
 };
 
 struct DebugHookState {
@@ -66,6 +76,8 @@ struct Thread : GcObject {
   std::string error;
   // Non-yieldable C-call nesting (PUC L->nny). Yield only when nny==0.
   int nny = 0;
+  // Nested C-call / resume depth (PUC L->nCcalls). Limit: LUAI_MAXCCALLS.
+  unsigned short nCcalls = 0;
   // Original object from error(obj); used by pcall/xpcall instead of only the string.
   TValue err_obj{};
   bool err_obj_set = false;
