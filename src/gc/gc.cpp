@@ -238,6 +238,7 @@ void GC::propagate_one() {
     auto* u = static_cast<Userdata*>(o);
     if (u->metatable)
       mark_object(u->metatable);
+    mark_value(u->uservalue);
     break;
   }
   default:

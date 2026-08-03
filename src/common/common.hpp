@@ -15,6 +15,17 @@ namespace luatier {
 #define LUAI_MAXCCALLS 200
 #endif
 
+// Parser / codegen limits (PUC llimits.h).
+#ifndef MAXVARS
+#define MAXVARS 200
+#endif
+#ifndef MAXUPVAL
+#define MAXUPVAL 255
+#endif
+#ifndef MAXSTACK
+#define MAXSTACK 250
+#endif
+
 struct LuatierError : std::runtime_error {
   using std::runtime_error::runtime_error;
 };

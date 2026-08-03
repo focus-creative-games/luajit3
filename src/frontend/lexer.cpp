@@ -28,7 +28,86 @@ const char* token_name(TokenKind k) {
   case TokenKind::Number: return "number";
   case TokenKind::Integer: return "integer";
   case TokenKind::String: return "string";
+  case TokenKind::Char: return "character";
   default: return "token";
+  }
+}
+
+std::string token_to_near(const Token& t) {
+  switch (t.kind) {
+  case TokenKind::End:
+    return "<eof>";
+  case TokenKind::Identifier:
+    return "'" + t.text + "'";
+  case TokenKind::String:
+    // PUC txtToken: "'%s'" over scanner buff (includes quotes / [[...]]).
+    return "'" + (t.near.empty() ? t.text : t.near) + "'";
+  case TokenKind::Number:
+  case TokenKind::Integer:
+    return "'" + t.text + "'";
+  case TokenKind::Char: {
+    auto uc = static_cast<unsigned char>(t.integer);
+    if (std::isprint(uc))
+      return std::string("'") + static_cast<char>(uc) + "'";
+    return "'<" + std::string("\\") + std::to_string(static_cast<int>(uc)) + ">'";
+  }
+  case TokenKind::KwAnd: return "'and'";
+  case TokenKind::KwBreak: return "'break'";
+  case TokenKind::KwDo: return "'do'";
+  case TokenKind::KwElse: return "'else'";
+  case TokenKind::KwElseif: return "'elseif'";
+  case TokenKind::KwEnd: return "'end'";
+  case TokenKind::KwFalse: return "'false'";
+  case TokenKind::KwFor: return "'for'";
+  case TokenKind::KwFunction: return "'function'";
+  case TokenKind::KwGoto: return "'goto'";
+  case TokenKind::KwIf: return "'if'";
+  case TokenKind::KwIn: return "'in'";
+  case TokenKind::KwLocal: return "'local'";
+  case TokenKind::KwNil: return "'nil'";
+  case TokenKind::KwNot: return "'not'";
+  case TokenKind::KwOr: return "'or'";
+  case TokenKind::KwRepeat: return "'repeat'";
+  case TokenKind::KwReturn: return "'return'";
+  case TokenKind::KwThen: return "'then'";
+  case TokenKind::KwTrue: return "'true'";
+  case TokenKind::KwUntil: return "'until'";
+  case TokenKind::KwWhile: return "'while'";
+  case TokenKind::Plus: return "'+'";
+  case TokenKind::Minus: return "'-'";
+  case TokenKind::Star: return "'*'";
+  case TokenKind::Slash: return "'/'";
+  case TokenKind::Percent: return "'%'";
+  case TokenKind::Caret: return "'^'";
+  case TokenKind::Hash: return "'#'";
+  case TokenKind::Amp: return "'&'";
+  case TokenKind::Tilde: return "'~'";
+  case TokenKind::Pipe: return "'|'";
+  case TokenKind::LtLt: return "'<<'";
+  case TokenKind::GtGt: return "'>>'";
+  case TokenKind::SlashSlash: return "'//'";
+  case TokenKind::EqEq: return "'=='";
+  case TokenKind::TildeEq: return "'~='";
+  case TokenKind::LtEq: return "'<='";
+  case TokenKind::GtEq: return "'>='";
+  case TokenKind::Lt: return "'<'";
+  case TokenKind::Gt: return "'>'";
+  case TokenKind::Eq: return "'='";
+  case TokenKind::LParen: return "'('";
+  case TokenKind::RParen: return "')'";
+  case TokenKind::LBrace: return "'{'";
+  case TokenKind::RBrace: return "'}'";
+  case TokenKind::LBracket: return "'['";
+  case TokenKind::RBracket: return "']'";
+  case TokenKind::ColonColon: return "'::'";
+  case TokenKind::Semi: return "';'";
+  case TokenKind::Colon: return "':'";
+  case TokenKind::Comma: return "','";
+  case TokenKind::Dot: return "'.'";
+  case TokenKind::DotDot: return "'..'";
+  case TokenKind::DotDotDot: return "'...'";
+  default:
+    return "'<unknown>'";
   }
 }
 
@@ -183,9 +262,10 @@ Token Lexer::lex_number() {
   }
   t.text = s;
   try {
+    const bool is_hex_num = s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X');
     const bool pure_int = s.find('.') == std::string::npos &&
-                          s.find('e') == std::string::npos &&
-                          s.find('E') == std::string::npos &&
+                          (is_hex_num || (s.find('e') == std::string::npos &&
+                                          s.find('E') == std::string::npos)) &&
                           s.find('p') == std::string::npos &&
                           s.find('P') == std::string::npos;
     if (pure_int) {
@@ -193,7 +273,7 @@ Token Lexer::lex_number() {
       // decimal above MAXINTEGER becomes a float.
       try {
         size_t idx = 0;
-        const bool hex = s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X');
+        const bool hex = is_hex_num;
         if (hex) {
           uint64_t u = 0;
           size_t i = 2;
@@ -374,6 +454,7 @@ Token Lexer::lex_string(char quote) {
     }
   }
   t.text = std::move(out);
+  t.near = std::move(save);
   return t;
 }
 
@@ -384,6 +465,9 @@ Token Lexer::lex_long_string(int level) {
   t.col = col_;
   // opening [ =* [ already consumed by caller partially
   std::string out;
+  std::string near = "[";
+  near.append(static_cast<size_t>(level), '=');
+  near.push_back('[');
   // Lua 5.3: first newline after [[ is skipped (not part of the value).
   if (curr_is_newline())
     incline();
@@ -393,30 +477,35 @@ Token Lexer::lex_long_string(int level) {
     if (curr_is_newline()) {
       incline();
       out.push_back('\n');
+      near.push_back('\n');
       continue;
     }
     char c = get();
+    near.push_back(c);
     if (c == ']') {
       int lvl = 0;
       size_t save = pos_;
       int save_line = line_, save_col = col_;
+      size_t near_save = near.size();
       while (peek_char() == '=') {
-        get();
+        near.push_back(get());
         lvl++;
       }
       if (lvl == level && peek_char() == ']') {
-        get();
+        near.push_back(get());
         break;
       }
       pos_ = save;
       line_ = save_line;
       col_ = save_col;
+      near.resize(near_save);
       out.push_back(']');
     } else {
       out.push_back(c);
     }
   }
   t.text = std::move(out);
+  t.near = std::move(near);
   return t;
 }
 
@@ -537,7 +626,10 @@ Token Lexer::lex_one() {
     }
     break;
   default:
-    panic(std::string("unexpected character: ") + c);
+    // PUC: any other byte is a single-char token (errors report near '<\N>').
+    t.kind = TokenKind::Char;
+    t.integer = static_cast<unsigned char>(c);
+    break;
   }
   return t;
 }

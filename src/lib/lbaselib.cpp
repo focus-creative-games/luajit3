@@ -7,6 +7,7 @@
 #include "vm/meta.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -49,13 +50,35 @@ static Closure* bind_env_closure(State* L, Proto* p, const TValue* env) {
   return cl;
 }
 
+static std::string_view skip_load_preamble(std::string_view s) {
+  for (;;) {
+    if (s.size() >= 3 && static_cast<unsigned char>(s[0]) == 0xEF &&
+        static_cast<unsigned char>(s[1]) == 0xBB && static_cast<unsigned char>(s[2]) == 0xBF)
+      s.remove_prefix(3);
+    if (s.empty())
+      return s;
+    if (s[0] == '#') {
+      size_t p = 0;
+      while (p < s.size() && s[p] != '\n')
+        ++p;
+      if (p >= s.size())
+        return std::string_view{};
+      s.remove_prefix(p + 1);
+      continue;
+    }
+    break;
+  }
+  return s;
+}
+
 static int load_chunk(State* L, std::string_view source, std::string_view chunk_name,
                       const TValue* env, std::string_view mode) {
-  const bool binary = is_proto_dump(source);
+  const std::string_view body = skip_load_preamble(source);
+  const bool binary = is_proto_dump(body);
   if (binary) {
     if (!mode.empty() && mode.find('b') == std::string_view::npos)
       panic("attempt to load a binary chunk");
-    Proto* p = undump_proto(L, std::string(source), std::string(chunk_name));
+    Proto* p = undump_proto(L, std::string(body), std::string(chunk_name));
     Closure* cl = bind_env_closure(L, p, env);
     L->push(TValue::obj(ValueTag::Function, cl));
     return LUA_OK;
@@ -172,11 +195,83 @@ static int base_type(State* L) {
   return 1;
 }
 
+// Match luaO_chunkid / luaL_where for error(message, level).
+static std::string error_chunkid(std::string_view source) {
+  constexpr int kIdSize = 60;
+  std::string out;
+  out.reserve(static_cast<size_t>(kIdSize));
+  if (!source.empty() && source[0] == '=') {
+    size_t len = source.size() - 1;
+    if (len <= static_cast<size_t>(kIdSize))
+      out.assign(source.substr(1));
+    else
+      out.assign(source.substr(1, static_cast<size_t>(kIdSize)));
+    return out;
+  }
+  if (!source.empty() && source[0] == '@') {
+    size_t len = source.size() - 1;
+    if (len <= static_cast<size_t>(kIdSize)) {
+      out.assign(source.substr(1));
+    } else {
+      out.append("...");
+      out.append(source.substr(source.size() - static_cast<size_t>(kIdSize - 3)));
+    }
+    return out;
+  }
+  out.append("[string \"");
+  size_t budget = static_cast<size_t>(kIdSize) - 11;
+  size_t len = source.size();
+  size_t nl = source.find('\n');
+  if (nl != std::string_view::npos)
+    len = nl;
+  if (len < budget && nl == std::string_view::npos) {
+    out.append(source.substr(0, len));
+  } else {
+    if (len > budget)
+      len = budget;
+    if (len > 0)
+      out.append(source.substr(0, len));
+    out.append("...");
+  }
+  out.append("\"]");
+  return out;
+}
+
+static std::string error_where(State* L, int level) {
+  Thread* th = L->current;
+  if (level < 0 || level >= static_cast<int>(th->frames.size()))
+    return "";
+  CallFrame& fr = th->frames[th->frames.size() - 1 - static_cast<size_t>(level)];
+  if (!fr.proto)
+    return "";
+  int pc = fr.saved_pc - 1;
+  if (pc < 0)
+    pc = 0;
+  int line = -1;
+  if (pc < static_cast<int>(fr.proto->lineinfo.size()))
+    line = fr.proto->lineinfo[static_cast<size_t>(pc)];
+  if (line <= 0)
+    return "";
+  return error_chunkid(fr.proto->source) + ":" + std::to_string(line) + ": ";
+}
+
 static int base_error(State* L) {
-  TValue obj = L->gettop() >= 1 ? *L->at(1) : TValue::obj(ValueTag::String, L->intern("error"));
+  // PUC luaB_error: missing message → nil; level defaults to 1.
+  TValue obj = L->gettop() >= 1 ? *L->at(1) : TValue::nil();
+  int level = 1;
+  if (L->gettop() >= 2 && !L->at(2)->is_nil())
+    level = static_cast<int>(check_int(L, 2));
+  if (obj.is_string() && level > 0) {
+    std::string prefix = error_where(L, level);
+    if (!prefix.empty()) {
+      obj = TValue::obj(ValueTag::String,
+                        L->intern(prefix + std::string(obj.as_string()->view())));
+    }
+  }
   L->current->err_obj = obj;
   L->current->err_obj_set = true;
-  panic(value_to_string(obj));
+  // LuatierError needs a string; pcall/xpcall restore err_obj (may be nil).
+  panic(obj.is_nil() ? std::string() : value_to_string(obj));
 }
 
 static TValue take_error_object(State* L, const char* fallback) {
@@ -188,24 +283,88 @@ static TValue take_error_object(State* L, const char* fallback) {
 }
 
 static int base_assert(State* L) {
-  if (!L->at(1)->is_truthy()) {
-    static thread_local std::string hold;
-    hold = (L->gettop() >= 2) ? value_to_string(*L->at(2)) : "assertion failed!";
-    panic(hold);
-  }
-  return L->gettop();
+  // PUC luaB_assert: missing condition → "value expected"; else on failure
+  // leave only the message (default string) and call error (level 1).
+  if (L->gettop() < 1)
+    panic("value expected");
+  if (L->at(1)->is_truthy())
+    return L->gettop();
+  TValue msg = (L->gettop() >= 2) ? *L->at(2)
+                                  : TValue::obj(ValueTag::String, L->intern("assertion failed!"));
+  L->settop(0);
+  L->push(msg);
+  return base_error(L);
 }
 
 static int base_tonumber(State* L) {
-  TValue* v = L->at(1);
-  TValue out;
-  if (try_to_number(*v, &out)) {
+  if (L->gettop() < 1)
+    panic("value expected");
+  // Standard conversion (no base / nil base).
+  if (L->gettop() < 2 || L->at(2)->is_nil()) {
+    TValue* v = L->at(1);
+    if (v->is_number()) {
+      TValue keep = *v;
+      L->settop(0);
+      L->push(keep);
+      return 1;
+    }
+    TValue out;
+    if (try_to_number(*v, &out)) {
+      L->settop(0);
+      L->push(out);
+      return 1;
+    }
     L->settop(0);
-    L->push(out);
+    L->push(TValue::nil());
     return 1;
   }
+  // tonumber(s, base): s must be a string; base in [2,36].
+  int64_t base = check_int(L, 2);
+  if (base < 2 || base > 36)
+    panic("bad argument #2 to 'tonumber' (base out of range)");
+  if (!L->at(1)->is_string())
+    panic("bad argument #1 to 'tonumber' (string expected)");
+  std::string_view sv = L->at(1)->as_string()->view();
+  const char* s = sv.data();
+  const char* end = s + sv.size();
+  // Skip leading spaces.
+  while (s < end && std::isspace(static_cast<unsigned char>(*s)))
+    ++s;
+  int neg = 0;
+  if (s < end && *s == '-') {
+    ++s;
+    neg = 1;
+  } else if (s < end && *s == '+') {
+    ++s;
+  }
+  if (s >= end || !std::isalnum(static_cast<unsigned char>(*s))) {
+    L->settop(0);
+    L->push(TValue::nil());
+    return 1;
+  }
+  uint64_t n = 0;
+  const char* p = s;
+  for (; p < end && std::isalnum(static_cast<unsigned char>(*p)); ++p) {
+    unsigned char c = static_cast<unsigned char>(*p);
+    int digit = std::isdigit(c) ? (c - '0') : (std::toupper(c) - 'A' + 10);
+    if (digit >= base) {
+      L->settop(0);
+      L->push(TValue::nil());
+      return 1;
+    }
+    n = n * static_cast<uint64_t>(base) + static_cast<uint64_t>(digit);
+  }
+  // Trailing spaces only.
+  while (p < end && std::isspace(static_cast<unsigned char>(*p)))
+    ++p;
+  if (p != end) {
+    L->settop(0);
+    L->push(TValue::nil());
+    return 1;
+  }
+  int64_t result = static_cast<int64_t>(neg ? (0u - n) : n);
   L->settop(0);
-  L->push(TValue::nil());
+  L->push(TValue::integer(result));
   return 1;
 }
 
@@ -222,6 +381,22 @@ static int base_tostring(State* L) {
     if (!L->at(1)->is_string())
       panic("'__tostring' must return a string");
     return 1;
+  }
+  // PUC luaL_tolstring: prefer metatable __name for tables/userdata.
+  if (v.is_table() || v.is_userdata()) {
+    Table* mt = get_metatable(L, v);
+    if (mt) {
+      TValue nm = mt->get(TValue::obj(ValueTag::String, L->intern("__name")));
+      if (nm.is_string()) {
+        char buf[128];
+        const void* p = v.is_table() ? static_cast<const void*>(v.as_table())
+                                     : static_cast<const void*>(v.as_userdata());
+        std::snprintf(buf, sizeof(buf), "%s: %p", nm.as_string()->view().data(), p);
+        L->settop(0);
+        push_string(L, buf);
+        return 1;
+      }
+    }
   }
   std::string s = value_to_string(v);
   L->settop(0);
@@ -411,11 +586,11 @@ static int base_getmetatable(State* L) {
 static int base_setmetatable(State* L) {
   TValue t = *L->at(1);
   if (!t.is_table())
-    panic("setmetatable: first argument must be a table");
+    arg_type_error(L, 1, "table");
   Table* mt = nullptr;
   if (L->gettop() >= 2 && !L->at(2)->is_nil()) {
     if (!L->at(2)->is_table())
-      panic("setmetatable: second argument must be a table or nil");
+      arg_type_error(L, 2, "table");
     mt = L->at(2)->as_table();
   }
   Table* cur = t.as_table()->metatable;
@@ -691,6 +866,10 @@ static int base_loadfile(State* L) {
   std::ostringstream ss;
   ss << in.rdbuf();
   std::string source = ss.str();
+  if (source.size() >= 3 && static_cast<unsigned char>(source[0]) == 0xEF &&
+      static_cast<unsigned char>(source[1]) == 0xBB &&
+      static_cast<unsigned char>(source[2]) == 0xBF)
+    source.erase(0, 3);
   std::string chunk_name = "@" + filename;
 
   try {
@@ -728,8 +907,20 @@ static int base_dofile(State* L) {
   // live temps (seen when dofile('literals.lua') followed GC-heavy strings.lua).
   Thread* th = L->current;
   const int saved_base = th->stack_base;
+  const int res_base = th->top - 1;
   th->stack_base = 0;
-  call_closure(L, f.as_closure(), 0, LUA_MULTRET);
+  th->nny--;
+  int st = LUA_OK;
+  try {
+    st = call_closure(L, f.as_closure(), 0, LUA_MULTRET);
+  } catch (...) {
+    th->nny++;
+    th->stack_base = saved_base;
+    throw;
+  }
+  if (st == LUA_YIELD)
+    return propagate_yieldable(L, CallFrame::ContKind::DoFile, TValue::nil(), res_base);
+  th->nny++;
   th->stack_base = saved_base;
   return L->gettop();
 }
@@ -739,8 +930,12 @@ static int gc_stepmul = 200;
 
 static int base_collectgarbage(State* L) {
   const char* opt = "collect";
-  if (L->gettop() >= 1 && !L->at(1)->is_nil())
+  if (L->gettop() >= 1 && !L->at(1)->is_nil()) {
+    if (!L->at(1)->is_string())
+      panic("bad argument #1 to 'collectgarbage' (string expected, got " +
+            obj_type_name(L, *L->at(1)) + ")");
     opt = L->at(1)->as_string()->view().data();
+  }
   int64_t arg2 = 0;
   bool has_arg2 = L->gettop() >= 2;
   if (has_arg2)

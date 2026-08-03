@@ -14,6 +14,8 @@ enum class TokenKind {
   Number,
   Integer,
   String,
+  // Single-byte non-operator char (PUC returns the raw byte as a token).
+  Char,
   Vararg,
   // keywords
   KwAnd,
@@ -77,6 +79,8 @@ enum class TokenKind {
 struct Token {
   TokenKind kind = TokenKind::End;
   std::string text;
+  // PUC scanner buff form for "near '...'" (strings include delimiters).
+  std::string near;
   double number = 0;
   int64_t integer = 0;
   int line = 1;
@@ -114,5 +118,8 @@ private:
 };
 
 const char* token_name(TokenKind k);
+
+// PUC luaX_token2str-ish text for "near X" in syntax errors.
+std::string token_to_near(const Token& t);
 
 } // namespace luatier

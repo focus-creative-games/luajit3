@@ -6,6 +6,7 @@
 #include "runtime/value.hpp"
 #include "tools/profile.hpp"
 #include "vm/debug_hook.hpp"
+#include "vm/ldebug.hpp"
 #include "vm/meta.hpp"
 
 #include <algorithm>
@@ -54,9 +55,12 @@ bool to_integer(const TValue& v, int64_t* out) {
     return true;
   }
   if (v.is_float()) {
+    // PUC lua_numbertointeger: n >= minint && n < -minint (== 2^63 as float).
+    // Do not use INT64_MAX cast to double (not exact; would accept 2^63).
     double d = v.as_float();
-    if (std::floor(d) == d && d >= static_cast<double>(INT64_MIN) &&
-        d <= static_cast<double>(INT64_MAX)) {
+    constexpr double kMin = static_cast<double>(INT64_MIN);
+    constexpr double kSup = -kMin; // 2^63 exactly
+    if (d >= kMin && d < kSup && std::floor(d) == d) {
       *out = static_cast<int64_t>(d);
       return true;
     }
@@ -65,23 +69,30 @@ bool to_integer(const TValue& v, int64_t* out) {
   return false;
 }
 
-TValue coerce_number(const TValue& v) {
+bool is_bitwise_op(OpCode op) {
+  return op == OpCode::BAND || op == OpCode::BOR || op == OpCode::BXOR || op == OpCode::SHL ||
+         op == OpCode::SHR;
+}
+
+TValue coerce_number(State* L, const TValue& v, int reg, OpCode op) {
   TValue n;
   if (try_to_number(v, &n))
     return n;
-  if (v.is_string())
-    panic("attempt to perform arithmetic on a string value");
-  panic("attempt to perform arithmetic on non-number");
+  if (is_bitwise_op(op))
+    opinterror(L, v, reg, "attempt to perform bitwise operation on a ");
+  opinterror(L, v, reg, "attempt to perform arithmetic on a ");
 }
 
-TValue arith_raw(OpCode op, const TValue& a_in, const TValue& b_in) {
-  TValue a = coerce_number(a_in);
-  TValue b = coerce_number(b_in);
-  if (op == OpCode::BAND || op == OpCode::BOR || op == OpCode::BXOR || op == OpCode::SHL ||
-      op == OpCode::SHR) {
+TValue arith_raw(State* L, OpCode op, const TValue& a_in, const TValue& b_in, int reg_a,
+                 int reg_b) {
+  TValue a = coerce_number(L, a_in, reg_a, op);
+  TValue b = coerce_number(L, b_in, reg_b, op);
+  if (is_bitwise_op(op)) {
     int64_t x, y;
-    if (!to_integer(a, &x) || !to_integer(b, &y))
-      panic("number has no integer representation");
+    if (!to_integer(a, &x))
+      tointerror(L, a, reg_a);
+    if (!to_integer(b, &y))
+      tointerror(L, b, reg_b);
     int64_t r = 0;
     // PUC luaV_shiftl: |disp| >= 64 → 0; negative disp reverses direction; bit ops via unsigned.
     auto shiftl = [](int64_t v, int64_t disp) -> int64_t {
@@ -114,35 +125,68 @@ TValue arith_raw(OpCode op, const TValue& a_in, const TValue& b_in) {
     default: break;
     }
   }
+  // PUC luaV_div / luaV_mod: integer floor division and modulo.
+  if ((op == OpCode::IDIV || op == OpCode::MOD) && a.is_int() && b.is_int()) {
+    int64_t m = a.as_int(), n = b.as_int();
+    if (static_cast<uint64_t>(n) + 1u <= 1u) { // n == 0 or n == -1
+      if (n == 0) {
+        if (op == OpCode::IDIV)
+          runerror(L, "attempt to divide by zero");
+        runerror(L, "attempt to perform 'n%0'");
+      }
+      // n == -1: avoid overflow with minint / -1
+      if (op == OpCode::IDIV)
+        return TValue::integer(static_cast<int64_t>(0u - static_cast<uint64_t>(m)));
+      return TValue::integer(0);
+    }
+    if (op == OpCode::IDIV) {
+      int64_t q = m / n;
+      if ((m ^ n) < 0 && m % n != 0)
+        q -= 1; // C truncates toward 0; floor needs correction
+      return TValue::integer(q);
+    }
+    int64_t r = m % n;
+    if (r != 0 && (m ^ n) < 0)
+      r += n;
+    return TValue::integer(r);
+  }
   if (!a.is_number() || !b.is_number())
-    panic("attempt to perform arithmetic on non-number");
+    opinterror(L, a.is_number() ? b_in : a_in, a.is_number() ? reg_b : reg_a,
+               "attempt to perform arithmetic on a ");
   double x = a.to_number(), y = b.to_number(), r = 0;
   switch (op) {
   case OpCode::ADD: r = x + y; break;
   case OpCode::SUB: r = x - y; break;
   case OpCode::MUL: r = x * y; break;
   case OpCode::DIV: r = x / y; break;
-  case OpCode::IDIV: r = std::floor(x / y); break;
-  case OpCode::MOD: r = x - std::floor(x / y) * y; break;
+  case OpCode::IDIV:
+    // Float // : IEEE floor(x/y); 0 divisor → ±inf (no runerror).
+    r = std::floor(x / y);
+    break;
+  case OpCode::MOD:
+    // Float % : PUC luai_nummod via fmod; 0 → NaN (no runerror).
+    r = std::fmod(x, y);
+    if (r * y < 0)
+      r += y;
+    break;
   case OpCode::POW: r = std::pow(x, y); break;
   default: panic("bad arith");
   }
-  if (op == OpCode::IDIV && a.is_int() && b.is_int())
-    return TValue::integer(static_cast<int64_t>(r));
   return TValue::number(r);
 }
 
-TValue do_arith(State* L, OpCode op, const TValue& a, const TValue& b) {
+TValue do_arith(State* L, OpCode op, const TValue& a, const TValue& b, int reg_a = -1,
+                int reg_b = -1) {
   TValue na, nb;
   if (try_to_number(a, &na) && try_to_number(b, &nb))
-    return arith_raw(op, na, nb);
+    return arith_raw(L, op, na, nb, reg_a, reg_b);
   if (!(a.is_number() && b.is_number())) {
     TValue out;
     const char* mt = arith_mt(op);
     if (mt && meta_arith(L, mt, a, b, &out))
       return out;
   }
-  return arith_raw(op, a, b);
+  return arith_raw(L, op, a, b, reg_a, reg_b);
 }
 
 // PUC luaD_call nesting: raise "C stack overflow" before the native stack dies.
@@ -214,7 +258,7 @@ void push_lua_frame(State* L, Closure* cl, int func_idx, int nargs, int nresults
 }
 
 int run_c_call(State* L, Closure* cl, int func_idx, int nargs, int nresults,
-               bool is_tailcall = false) {
+               bool is_tailcall = false, const char* invoked_name = nullptr) {
   Thread* th = L->current;
   if (func_idx < 0 || nargs < 0)
     panic("run_c_call: bad func_idx/nargs");
@@ -230,6 +274,8 @@ int run_c_call(State* L, Closure* cl, int func_idx, int nargs, int nresults,
   cfr.base = func_idx;
   cfr.kind = FrameKind::CApi;
   cfr.tailcall = is_tailcall;
+  if (invoked_name && invoked_name[0])
+    cfr.invoked_name = invoked_name;
   th->frames.push_back(cfr);
   if (is_tailcall)
     debug_on_tailcall(L, th);
@@ -459,7 +505,14 @@ int finish_interrupted_op(State* L, size_t fi) {
       if (mm.is_nil())
         mm = get_metamethod(L, rhs, "__concat");
       if (mm.is_nil() || !mm.is_function())
-        panic("attempt to concatenate incompatible types");
+        if (!(acc.is_string() || acc.is_number()) || !(rhs.is_string() || rhs.is_number())) {
+          th->err_reg = pos;
+          if (!(acc.is_string() || acc.is_number()))
+            runerror(L, "attempt to concatenate a " + obj_type_name(L, acc) + " value" +
+                            varinfo_reg(L, -1));
+          runerror(L, "attempt to concatenate a " + obj_type_name(L, rhs) + " value" +
+                          varinfo_reg(L, -1));
+        }
       fr.concat_pos = pos;
       fr.concat_last = last;
       fr.concat_dest = dest;
@@ -509,7 +562,7 @@ int index_yieldable(State* L, size_t fi, const TValue& table, const TValue& key,
     }
     TValue mm = get_metamethod(L, t, "__index");
     if (mm.is_nil())
-      panic("attempt to index a non-table value");
+      typeerror(L, t, -1, "index");
     if (mm.is_function()) {
       TValue args[2] = {t, key};
       return invoke_mm(L, fi, mm, args, 2, 1);
@@ -543,7 +596,7 @@ int newindex_yieldable(State* L, size_t fi, const TValue& table, const TValue& k
     }
     TValue mm = get_metamethod(L, t, "__newindex");
     if (mm.is_nil())
-      panic("attempt to index a non-table value");
+      typeerror(L, t, -1, "index");
     if (mm.is_function()) {
       TValue args[3] = {t, key, value};
       return invoke_mm(L, fi, mm, args, 3, 0);
@@ -704,8 +757,10 @@ int interpret(State* L, int min_frames) {
       break;
     }
     case OpCode::GETTABLE: {
+      th->err_reg = b;
       TValue v;
       int st = index_yieldable(L, fi, base[b], base[c], &v);
+      th->err_reg = -1;
       if (st == LUA_YIELD)
         return LUA_YIELD;
       if (st == MM_PUSHED)
@@ -721,8 +776,10 @@ int interpret(State* L, int min_frames) {
       break;
     }
     case OpCode::SETTABLE: {
+      th->err_reg = a;
       TValue t = base[a], key = base[b], val = base[c];
       int st = newindex_yieldable(L, fi, t, key, val);
+      th->err_reg = -1;
       if (st == LUA_YIELD)
         return LUA_YIELD;
       if (st == MM_PUSHED)
@@ -736,8 +793,10 @@ int interpret(State* L, int min_frames) {
       break;
     }
     case OpCode::GETI: {
+      th->err_reg = b;
       TValue v;
       int st = index_yieldable(L, fi, base[b], TValue::integer(c), &v);
+      th->err_reg = -1;
       if (st == LUA_YIELD)
         return LUA_YIELD;
       if (st == MM_PUSHED)
@@ -753,8 +812,10 @@ int interpret(State* L, int min_frames) {
       break;
     }
     case OpCode::SETI: {
+      th->err_reg = a;
       TValue t = base[a], val = base[c];
       int st = newindex_yieldable(L, fi, t, TValue::integer(b), val);
+      th->err_reg = -1;
       if (st == LUA_YIELD)
         return LUA_YIELD;
       if (st == MM_PUSHED)
@@ -768,8 +829,10 @@ int interpret(State* L, int min_frames) {
       break;
     }
     case OpCode::GETFIELD: {
+      th->err_reg = b;
       TValue v;
       int st = index_yieldable(L, fi, base[b], p->constants[static_cast<size_t>(c)], &v);
+      th->err_reg = -1;
       if (st == LUA_YIELD)
         return LUA_YIELD;
       if (st == MM_PUSHED)
@@ -785,8 +848,10 @@ int interpret(State* L, int min_frames) {
       break;
     }
     case OpCode::SETFIELD: {
+      th->err_reg = a;
       TValue t = base[a], val = base[c];
       int st = newindex_yieldable(L, fi, t, p->constants[static_cast<size_t>(b)], val);
+      th->err_reg = -1;
       if (st == LUA_YIELD)
         return LUA_YIELD;
       if (st == MM_PUSHED)
@@ -806,8 +871,10 @@ int interpret(State* L, int min_frames) {
       TValue t = base[b];
       TValue key = base[c];
       base[a + 1] = t;
+      th->err_reg = b;
       TValue m;
       int st = index_yieldable(L, fi, t, key, &m);
+      th->err_reg = -1;
       if (st == LUA_YIELD)
         return LUA_YIELD;
       if (st == MM_PUSHED)
@@ -840,7 +907,7 @@ int interpret(State* L, int min_frames) {
       TValue lhs = base[b], rhs = base[c];
       TValue na, nb;
       if (try_to_number(lhs, &na) && try_to_number(rhs, &nb)) {
-        base[a] = arith_raw(op, na, nb);
+        base[a] = arith_raw(L, op, na, nb, b, c);
         break;
       }
       const char* mt = arith_mt(op);
@@ -848,7 +915,7 @@ int interpret(State* L, int min_frames) {
       if (mm.is_nil() && mt)
         mm = get_metamethod(L, rhs, mt);
       if (mm.is_nil() || !mm.is_function()) {
-        (void)do_arith(L, op, lhs, rhs); // panic with the usual message
+        (void)do_arith(L, op, lhs, rhs, b, c); // panic with the usual message
         break;
       }
       TValue args[2] = {lhs, rhs};
@@ -871,8 +938,10 @@ int interpret(State* L, int min_frames) {
           base[a] = TValue::number(-nb.as_float());
       } else {
         TValue mm = get_metamethod(L, base[b], "__unm");
-        if (mm.is_nil() || !mm.is_function())
-          panic("attempt to perform arithmetic on non-number");
+        if (mm.is_nil() || !mm.is_function()) {
+          th->err_reg = b;
+          opinterror(L, base[b], b, "attempt to perform arithmetic on a ");
+        }
         TValue args[1] = {base[b]};
         int st = invoke_mm(L, fi, mm, args, 1, 1);
         if (st == LUA_YIELD)
@@ -891,8 +960,11 @@ int interpret(State* L, int min_frames) {
         base[a] = TValue::integer(~x);
       else {
         TValue mm = get_metamethod(L, base[b], "__bnot");
-        if (mm.is_nil() || !mm.is_function())
-          panic("number has no integer representation");
+        if (mm.is_nil() || !mm.is_function()) {
+          if (!base[b].is_number())
+            opinterror(L, base[b], b, "attempt to perform bitwise operation on a ");
+          tointerror(L, base[b], b);
+        }
         TValue args[1] = {base[b]};
         int st = invoke_mm(L, fi, mm, args, 1, 1);
         if (st == LUA_YIELD)
@@ -934,8 +1006,10 @@ int interpret(State* L, int min_frames) {
         }
       }
       TValue out;
+      th->err_reg = b;
       if (!meta_len(L, vb, &out))
-        panic("attempt to get length of incompatible type");
+        typeerror(L, vb, b, "get length of");
+      th->err_reg = -1;
       base = reload();
       base[a] = out;
       break;
@@ -960,7 +1034,14 @@ int interpret(State* L, int min_frames) {
         if (mm.is_nil())
           mm = get_metamethod(L, rhs, "__concat");
         if (mm.is_nil() || !mm.is_function())
-          panic("attempt to concatenate incompatible types");
+          if (!(acc.is_string() || acc.is_number()) || !(rhs.is_string() || rhs.is_number())) {
+          th->err_reg = pos;
+          if (!(acc.is_string() || acc.is_number()))
+            runerror(L, "attempt to concatenate a " + obj_type_name(L, acc) + " value" +
+                            varinfo_reg(L, -1));
+          runerror(L, "attempt to concatenate a " + obj_type_name(L, rhs) + " value" +
+                          varinfo_reg(L, -1));
+        }
         cfr.concat_pos = pos;
         TValue args[2] = {acc, rhs};
         int st = invoke_mm(L, fi, mm, args, 2, 1);
@@ -1022,9 +1103,8 @@ int interpret(State* L, int min_frames) {
     }
     case OpCode::LT: {
       TValue rb = base[b], rc = base[c];
-      TValue na, nb;
-      if (try_to_number(rb, &na) && try_to_number(rc, &nb)) {
-        bool lt = na.to_number() < nb.to_number();
+      if (rb.is_number() && rc.is_number()) {
+        bool lt = number_lt(rb, rc);
         if (lt != (a != 0))
           pc()++;
         break;
@@ -1040,7 +1120,7 @@ int interpret(State* L, int min_frames) {
       if (mm.is_nil())
         mm = get_metamethod(L, rc, "__lt");
       if (mm.is_nil() || !mm.is_function())
-        panic("attempt to compare incompatible types");
+        compareerror(L, rb, rc);
       th->frames[fi].le_invert = false;
       TValue args[2] = {rb, rc};
       int st = invoke_mm(L, fi, mm, args, 2, 1);
@@ -1055,9 +1135,8 @@ int interpret(State* L, int min_frames) {
     }
     case OpCode::LE: {
       TValue rb = base[b], rc = base[c];
-      TValue na, nb;
-      if (try_to_number(rb, &na) && try_to_number(rc, &nb)) {
-        bool le = na.to_number() <= nb.to_number();
+      if (rb.is_number() && rc.is_number()) {
+        bool le = number_le(rb, rc);
         if (le != (a != 0))
           pc()++;
         break;
@@ -1090,7 +1169,7 @@ int interpret(State* L, int min_frames) {
       if (mm.is_nil())
         mm = get_metamethod(L, rb, "__lt");
       if (mm.is_nil() || !mm.is_function())
-        panic("attempt to compare incompatible types");
+        compareerror(L, rb, rc);
       th->frames[fi].le_invert = true;
       TValue args[2] = {rc, rb}; // b < a  ⇒  invert for a <= b
       int st = invoke_mm(L, fi, mm, args, 2, 1);
@@ -1190,11 +1269,11 @@ int interpret(State* L, int min_frames) {
       }
       TValue nlimit, nstep, ninit;
       if (!try_to_number(base[a + 1], &nlimit))
-        panic("'for' limit must be a number");
+        runerror(L, "'for' limit must be a number");
       if (!try_to_number(base[a + 2], &nstep))
-        panic("'for' step must be a number");
+        runerror(L, "'for' step must be a number");
       if (!try_to_number(base[a], &ninit))
-        panic("'for' initial value must be a number");
+        runerror(L, "'for' initial value must be a number");
       double step = nstep.to_number();
       base[a + 1] = TValue::number(nlimit.to_number());
       base[a + 2] = TValue::number(step);
@@ -1376,6 +1455,9 @@ int interpret(State* L, int min_frames) {
       for (int i = 0; i <= nargs; ++i)
         call_vals[static_cast<size_t>(i)] = th->stack[static_cast<size_t>(call_base + i)];
       TValue callee = call_vals[0];
+      const char* tail_name_ptr = nullptr;
+      debug_funcnamefromcode(&th->frames[fi], &tail_name_ptr);
+      std::string tail_name = tail_name_ptr ? tail_name_ptr : "";
       L->close_upvals(th, dest);
       L->ensure_stack(dest + 1 + nargs + 8);
       for (int i = 0; i <= nargs; ++i)
@@ -1386,7 +1468,8 @@ int interpret(State* L, int min_frames) {
       debug_on_return(L, th);
       if (callee.is_function()) {
         if (callee.as_closure()->is_c) {
-          int st = run_c_call(L, callee.as_closure(), dest, nargs, nresults, true);
+          int st = run_c_call(L, callee.as_closure(), dest, nargs, nresults, true,
+                              tail_name.empty() ? nullptr : tail_name.c_str());
           if (st == LUA_YIELD)
             return LUA_YIELD;
           if (static_cast<int>(th->frames.size()) < entry_depth)
@@ -1472,7 +1555,8 @@ int finish_continue_frame(State* L, bool ok, const char* err_msg) {
     int nret = th->top - base;
     if (nret < 0)
       nret = 0;
-    outs.push_back(TValue::boolean(true));
+    if (cfr.cont_kind != CallFrame::ContKind::DoFile)
+      outs.push_back(TValue::boolean(true));
     for (int i = 0; i < nret; ++i)
       outs.push_back(th->stack[static_cast<size_t>(base + i)]);
   } else {

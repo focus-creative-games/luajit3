@@ -4,6 +4,7 @@
 #include "runtime/table.hpp"
 #include "runtime/userdata.hpp"
 #include "vm/interpreter.hpp"
+#include "vm/ldebug.hpp"
 #include "vm/state.hpp"
 
 #include <algorithm>
@@ -148,7 +149,7 @@ TValue meta_index(State* L, const TValue& table, const TValue& key) {
     }
     TValue mm = get_metamethod(L, t, "__index");
     if (mm.is_nil())
-      panic("attempt to index a non-table value");
+      typeerror(L, t, -1, "index");
     if (mm.is_function()) {
       TValue args[2] = {t, key};
       TValue out;
@@ -185,7 +186,7 @@ void meta_newindex(State* L, const TValue& table, const TValue& key, const TValu
     }
     TValue mm = get_metamethod(L, t, "__newindex");
     if (mm.is_nil())
-      panic("attempt to index a non-table value");
+      typeerror(L, t, -1, "index");
     if (mm.is_function()) {
       TValue args[3] = {t, key, value};
       TValue out;
@@ -246,9 +247,9 @@ bool meta_eq(State* L, const TValue& a, const TValue& b, bool* out_eq) {
 }
 
 bool meta_lt(State* L, const TValue& a, const TValue& b, bool* out_lt) {
-  TValue na, nb;
-  if (try_to_number(a, &na) && try_to_number(b, &nb)) {
-    *out_lt = na.to_number() < nb.to_number();
+  // PUC: only raw numbers / raw strings compare; no string→number coercion.
+  if (a.is_number() && b.is_number()) {
+    *out_lt = a.to_number() < b.to_number();
     return true;
   }
   if (a.is_string() && b.is_string()) {
@@ -259,7 +260,7 @@ bool meta_lt(State* L, const TValue& a, const TValue& b, bool* out_lt) {
   if (mm.is_nil())
     mm = get_metamethod(L, b, "__lt");
   if (mm.is_nil() || !mm.is_function())
-    panic("attempt to compare incompatible types");
+    compareerror(L, a, b);
   TValue args[2] = {a, b};
   TValue out;
   call_mm(L, mm, args, 2, &out, 1);
@@ -268,9 +269,8 @@ bool meta_lt(State* L, const TValue& a, const TValue& b, bool* out_lt) {
 }
 
 bool meta_le(State* L, const TValue& a, const TValue& b, bool* out_le) {
-  TValue na, nb;
-  if (try_to_number(a, &na) && try_to_number(b, &nb)) {
-    *out_le = na.to_number() <= nb.to_number();
+  if (a.is_number() && b.is_number()) {
+    *out_le = a.to_number() <= b.to_number();
     return true;
   }
   if (a.is_string() && b.is_string()) {
@@ -302,8 +302,14 @@ bool meta_concat(State* L, const TValue& a, const TValue& b, TValue* out) {
   TValue mm = get_metamethod(L, a, "__concat");
   if (mm.is_nil())
     mm = get_metamethod(L, b, "__concat");
-  if (mm.is_nil() || !mm.is_function())
-    panic("attempt to concatenate incompatible types");
+  if (mm.is_nil() || !mm.is_function()) {
+    // Prefer the non-string/non-number operand for the message.
+    if (!(a.is_string() || a.is_number()))
+      runerror(L, "attempt to concatenate a " + obj_type_name(L, a) + " value" +
+                      varinfo_reg(L, -1));
+    runerror(L, "attempt to concatenate a " + obj_type_name(L, b) + " value" +
+                    varinfo_reg(L, -1));
+  }
   TValue args[2] = {a, b};
   call_mm(L, mm, args, 2, out, 1);
   return true;
@@ -326,7 +332,7 @@ bool meta_len(State* L, const TValue& a, TValue* out) {
   }
   TValue mm = get_metamethod(L, a, "__len");
   if (mm.is_nil() || !mm.is_function())
-    panic("attempt to get length of incompatible type");
+    typeerror(L, a, -1, "get length of");
   TValue args[1] = {a};
   call_mm(L, mm, args, 1, out, 1);
   return true;
@@ -337,8 +343,18 @@ int meta_call(State* L, int func_idx, int nargs, int nresults) {
   if (f.is_function())
     return call_closure(L, f.as_closure(), nargs, nresults);
   TValue mm = get_metamethod(L, f, "__call");
-  if (!mm.is_function())
-    panic("attempt to call a non-function value");
+  if (!mm.is_function()) {
+    CallFrame* fr = nullptr;
+    for (int i = static_cast<int>(L->current->frames.size()) - 1; i >= 0; --i) {
+      CallFrame& c = L->current->frames[static_cast<size_t>(i)];
+      if (c.proto && c.cl && !c.cl->is_c) {
+        fr = &c;
+        break;
+      }
+    }
+    int reg = fr ? (func_idx - fr->base) : -1;
+    typeerror(L, f, reg, "call");
+  }
   // Insert mm before func: shift args
   L->ensure_stack(func_idx + 2 + nargs);
   for (int i = nargs; i >= 0; --i)

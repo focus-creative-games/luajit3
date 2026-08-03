@@ -55,7 +55,7 @@ struct Ctx {
   }
 };
 
-void walk_block(Block& b, Ctx& ctx);
+void walk_block(Block& b, Ctx& ctx, bool allow_last_label = true, bool pop_locals = true);
 
 void walk_expr(Expr& e, Ctx& ctx) {
   switch (e.kind) {
@@ -141,9 +141,10 @@ void walk_stmt(AstNode& s, Ctx& ctx) {
   case AstKind::Repeat: {
     auto& n = static_cast<RepeatStmt&>(s);
     ctx.loop_depth++;
+    // Body locals remain visible in `until`; labels are not "last" (until
+    // extends the block, so a trailing label still sits in local scopes).
     size_t before = ctx.locals.size();
-    for (auto& st : n.body->stmts)
-      walk_stmt(*st, ctx);
+    walk_block(*n.body, ctx, /*allow_last_label=*/false, /*pop_locals=*/false);
     walk_expr(*n.cond, ctx);
     ctx.locals.resize(before);
     ctx.loop_depth--;
@@ -238,7 +239,7 @@ void walk_stmt(AstNode& s, Ctx& ctx) {
   }
 }
 
-void walk_block(Block& b, Ctx& ctx) {
+void walk_block(Block& b, Ctx& ctx, bool allow_last_label, bool pop_locals) {
   size_t before = ctx.locals.size();
   ctx.label_scopes.emplace_back();
   const size_t scope_idx = ctx.label_scopes.size() - 1;
@@ -251,11 +252,13 @@ void walk_block(Block& b, Ctx& ctx) {
         panic("label '" + n.name + "' already defined");
       // PUC: if label is the last non-void statement in the block (only labels
       // follow), gotos may target it without entering this block's locals.
-      bool last = true;
-      for (size_t j = i + 1; j < b.stmts.size(); ++j) {
-        if (b.stmts[j]->kind != AstKind::Label) {
-          last = false;
-          break;
+      bool last = allow_last_label;
+      if (last) {
+        for (size_t j = i + 1; j < b.stmts.size(); ++j) {
+          if (b.stmts[j]->kind != AstKind::Label) {
+            last = false;
+            break;
+          }
         }
       }
       if (last) {
@@ -289,7 +292,8 @@ void walk_block(Block& b, Ctx& ctx) {
   }
   ctx.gotos = std::move(remain);
   ctx.label_scopes.pop_back();
-  ctx.locals.resize(before);
+  if (pop_locals)
+    ctx.locals.resize(before);
 }
 
 } // namespace

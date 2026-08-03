@@ -2,62 +2,63 @@
 
 **Suite:** `tests/lua-5.3.4-tests/`  
 **Tarball sha256:** `b80771238271c72565e5a1183292ef31bd7166414cd0c43a8eb79845fa7f599f`  
-**Hard gate:** `luatier -e "_U=true" all.lua` → `final OK`
+**Hard gate:** `luatier -e "_U=true" all.lua` → `final OK` — **PASSED** (2026-08-03)
 
 | File | Basic `_U` | Notes |
 |------|------------|-------|
-| all.lua (harness) | WIP | reaches `db.lua`; PowerShell: `'-e' '_U=true' 'all.lua'` |
+| all.lua (harness) | OK | prints `final OK !!!` |
 | main.lua | OK | under `_U` soft path |
-| gc.lua | OK | weak tables, `__gc`, ephemerons, finalizer errors |
-| db.lua | WIP | `getinfo`/`short_src`/`linedefined` in; namewhat/hooks/getlocal next |
-| calls.lua | WIP | not reached yet |
-| strings.lua | WIP | via olddofile |
-| literals.lua | WIP | via olddofile |
-| tpack.lua | WIP | string.pack/unpack |
-| attrib.lua | WIP | package |
-| locals.lua | WIP | |
-| constructs.lua | WIP | |
-| code.lua | WIP | dump strip |
-| nextvar.lua | WIP | |
-| pm.lua | WIP | patterns |
-| utf8.lua | WIP | |
-| api.lua | WIP | C API / userdata |
-| events.lua | WIP | |
-| vararg.lua | WIP | |
-| closure.lua | WIP | |
-| coroutine.lua | WIP | |
-| goto.lua | WIP | |
-| errors.lua | WIP | |
-| math.lua | WIP | |
-| sort.lua | WIP | |
-| bitwise.lua | WIP | |
-| verybig.lua | skip under `_soft` | |
-| files.lua | WIP | io |
+| gc.lua | OK | weak tables, `__gc`, ephemerons |
+| db.lua | OK | via dump/undump dofile |
+| calls.lua | OK | |
+| strings.lua | OK | via olddofile |
+| literals.lua | OK | via olddofile |
+| tpack.lua | OK | |
+| attrib.lua | OK | |
+| locals.lua | OK | |
+| constructs.lua | OK | |
+| code.lua | OK | |
+| nextvar.lua | OK | |
+| pm.lua | OK | |
+| utf8.lua | OK | |
+| api.lua | OK | |
+| events.lua | OK | |
+| vararg.lua | OK | |
+| closure.lua | OK | |
+| coroutine.lua | OK | |
+| goto.lua | OK | |
+| errors.lua | OK | |
+| math.lua | OK | |
+| sort.lua | OK | unpack too-many / in-place sort / move |
+| bitwise.lua | OK | hex strings with `e` digit |
+| verybig.lua | OK | early return under `_soft`; SETLIST flush |
+| files.lua | OK | io.lines/read/write/date |
 | big.lua | skip under `_soft` | |
 
-**Complete suite (no `_U`):** not started; needs working `package.loadlib` + suite `libs/`.
+**Unit tests:** `luatier_tests` green.
 
-## Recent fixes (2026-08-02)
+**Complete suite (no `_U`):** not started; needs working `package.loadlib` + suite `libs/`, and non-`_soft`/`_port` paths (big.lua, popen, …).
 
-### GC / tables
-- Weak-key clear uses tombstones (keep `used`) so open-addressing probe chains stay intact.
-- Atomic order: clear weak values → resurrect finalizables → clear weak values/keys again.
-- Mark stack: strict `top`-only for current C call (weak `__gc`); full Lua windows for suspended threads.
-- `_ENV` name resolves to the chunk upvalue (not `_G["_ENV"]`).
-- `__gc` errors clear `collecting_`; finalizers push above `thread_live_top`.
+## Recent fixes (2026-08-03)
 
-### Debug / load
-- `debug.getinfo` with `S`/`L`/`f`/`l`/`u`, `linedefined`/`lastlinedefined`, `activelines`, `chunkid`.
-- `load` default chunkname is the source string (Lua 5.3).
-- Parser tracks function `lastline` for `lastlinedefined`.
+### Table / sort
+- `table.unpack` rejects ranges with ≥ `INT_MAX` results (`too many results to unpack`).
+- `table.move` overflow / wrap-around checks; PUC-style in-place quicksort with invalid-order detection.
+- Table constructors flush `SETLIST` every 50 fields (LFIELDS_PER_FLUSH).
+
+### Numbers / bitwise
+- Hex integer parse: `e`/`E` are digits in `0x…` (not decimal exponents) — fixes `0xfffffffffffffffe`.
+
+### IO / OS
+- `io.close` / `io.type` / `io.lines` / `io.flush` / `io.tmpfile` / `file:setvbuf`.
+- `io.write`/`io.read` use default files; multi-format read (`l`/`L`/`n`/`a`/count).
+- `os.date`/`os.time` PUC-style (UTC `!`, `*t`, conversion-specifier validation).
+- `os.tmpname` generates unique non-existent names.
+
+### Errors / debug
+- `arg_type_error` resolves `io.write` via globals; TAILCALL→C preserves invoked name (`'sin'`).
 
 ### Tooling
-- Vendor suite under `tests/lua-5.3.4-tests/`; `scripts/run_puc_tests.{ps1,sh}`.
-- MSBuild may leave a stale `luatier.exe`; delete and rebuild `luatier_cli` if behavior looks old.
+- MSBuild may leave a stale `luatier.exe`; touch `src/main.cpp` or `--clean-first` after lib changes.
 
-## Known issues
-
-- `db.lua` still fails after short_src tests (`name`/`namewhat`, line hooks, getlocal, …).
-- Complete suite / `loadlib` not started.
-
-Update this table as files go green.
+Update this table as the complete (non-`_U`) suite progresses.

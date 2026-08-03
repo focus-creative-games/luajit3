@@ -5,6 +5,8 @@
 #include "runtime/table.hpp"
 #include "runtime/userdata.hpp"
 #include "runtime/value.hpp"
+#include "vm/bytecode.hpp"
+#include "vm/ldebug.hpp"
 #include "vm/state.hpp"
 
 #include <cmath>
@@ -22,8 +24,10 @@ inline void push_string(State* L, std::string_view s) {
 }
 
 inline void set_global(State* L, const char* name, CFunction f) {
+  Closure* cl = closure_new_c(L, f);
+  cl->cname = name;
   L->globals->set(L, TValue::obj(ValueTag::String, L->intern(name)),
-                  TValue::obj(ValueTag::Function, closure_new_c(L, f)));
+                  TValue::obj(ValueTag::Function, cl));
 }
 
 inline void set_global_value(State* L, const char* name, const TValue& v) {
@@ -31,8 +35,10 @@ inline void set_global_value(State* L, const char* name, const TValue& v) {
 }
 
 inline void set_field(State* L, Table* t, const char* name, CFunction f) {
+  Closure* cl = closure_new_c(L, f);
+  cl->cname = name;
   t->set(L, TValue::obj(ValueTag::String, L->intern(name)),
-         TValue::obj(ValueTag::Function, closure_new_c(L, f)));
+         TValue::obj(ValueTag::Function, cl));
 }
 
 inline void set_field_value(State* L, Table* t, const char* name, const TValue& v) {
@@ -56,6 +62,13 @@ inline LjString* check_string(State* L, int idx) {
   return L->at(idx)->as_string();
 }
 
+// String library methods used as obj:method() should say "bad self".
+inline LjString* check_string_self(State* L, int idx) {
+  if (idx > L->gettop() || !L->at(idx)->is_string())
+    panic("bad self");
+  return L->at(idx)->as_string();
+}
+
 inline Table* check_table(State* L, int idx) {
   check_any(L, idx, "check_table");
   if (!L->at(idx)->is_table())
@@ -63,19 +76,95 @@ inline Table* check_table(State* L, int idx) {
   return L->at(idx)->as_table();
 }
 
+[[noreturn]] inline void arg_type_error(State* L, int idx, const char* expected) {
+  std::string got = obj_type_name(L, *L->at(idx));
+  const char* fname = "?";
+  bool is_method = false;
+  Thread* th = L->current;
+  const char* nm = nullptr;
+  Closure* target = nullptr;
+  if (th && !th->frames.empty() && !th->frames.back().invoked_name.empty())
+    nm = th->frames.back().invoked_name.c_str();
+  if (th && !th->frames.empty()) {
+    CallFrame& fr = th->frames.back();
+    if (fr.cl && fr.cl->is_c)
+      target = fr.cl;
+    if (!nm && th->frames.size() >= 2) {
+      CallFrame* caller = &th->frames[th->frames.size() - 2];
+      const char* what = debug_funcnamefromcode(caller, &nm);
+      if (what && std::strcmp(what, "method") == 0)
+        is_method = true;
+    } else if (th->frames.size() >= 2) {
+      CallFrame* caller = &th->frames[th->frames.size() - 2];
+      const char* dummy = nullptr;
+      const char* what = debug_funcnamefromcode(caller, &dummy);
+      if (what && std::strcmp(what, "method") == 0)
+        is_method = true;
+    }
+  }
+  // PUC pushglobalfuncname: search globals for a dotted path to this C function.
+  std::string dotted;
+  if (target && L->globals) {
+    auto find_in = [&](Table* tab, const std::string& prefix) -> bool {
+      for (auto& n : tab->hash) {
+        if (!n.used || !n.key.is_string() || !n.value.is_function())
+          continue;
+        if (n.value.as_closure() != target)
+          continue;
+        dotted = prefix + std::string(n.key.as_string()->view());
+        return true;
+      }
+      return false;
+    };
+    if (!find_in(L->globals, "")) {
+      for (auto& n : L->globals->hash) {
+        if (!n.used || !n.key.is_string() || !n.value.is_table())
+          continue;
+        std::string pref = std::string(n.key.as_string()->view()) + ".";
+        if (find_in(n.value.as_table(), pref))
+          break;
+      }
+    }
+  }
+  if (nm)
+    fname = nm;
+  else if (!dotted.empty())
+    fname = dotted.c_str();
+  else if (target && target->cname)
+    fname = target->cname;
+
+  int arg = idx;
+  if (is_method) {
+    arg--;
+    if (arg == 0)
+      panic(std::string("calling '") + fname + "' on bad self (" + expected +
+            " expected, got " + got + ")");
+  }
+  panic(std::string("bad argument #") + std::to_string(arg) + " to '" + fname + "' (" +
+        expected + " expected, got " + got + ")");
+}
+
 inline int64_t check_int(State* L, int idx) {
   check_any(L, idx, "check_int");
   TValue* v = L->at(idx);
-  if (v->is_int())
-    return v->as_int();
-  // Lua 5.3: integer-valued floats are accepted by luaL_checkinteger.
-  if (v->is_float()) {
-    double d = v->as_float();
-    if (std::floor(d) == d && d >= static_cast<double>(INT64_MIN) &&
-        d <= static_cast<double>(INT64_MAX))
-      return static_cast<int64_t>(d);
-  }
-  panic("integer expected");
+  auto from_number = [&](const TValue& n) -> int64_t {
+    if (n.is_int())
+      return n.as_int();
+    if (n.is_float()) {
+      double d = n.as_float();
+      if (std::floor(d) == d && d >= static_cast<double>(INT64_MIN) &&
+          d <= static_cast<double>(INT64_MAX))
+        return static_cast<int64_t>(d);
+      panic("number has no integer representation");
+    }
+    arg_type_error(L, idx, "integer");
+  };
+  if (v->is_number())
+    return from_number(*v);
+  TValue n;
+  if (try_to_number(*v, &n))
+    return from_number(n);
+  arg_type_error(L, idx, "integer");
 }
 
 // luaL_optinteger: missing or nil → def.
@@ -87,9 +176,13 @@ inline int64_t opt_int(State* L, int idx, int64_t def) {
 
 inline double check_number(State* L, int idx) {
   check_any(L, idx, "check_number");
-  if (!L->at(idx)->is_number())
-    panic("number expected");
-  return L->at(idx)->to_number();
+  TValue* v = L->at(idx);
+  if (v->is_number())
+    return v->to_number();
+  TValue n;
+  if (try_to_number(*v, &n) && n.is_number())
+    return n.to_number();
+  arg_type_error(L, idx, "number");
 }
 
 inline bool opt_bool(State* L, int idx, bool def) {

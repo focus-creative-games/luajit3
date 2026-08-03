@@ -36,11 +36,13 @@ struct CallFrame {
   bool hooked = false; // true while a debug hook is running for this frame
   bool tailcall = false; // entered via OP_TAILCALL (debug.getinfo istailcall)
   bool finalizer = false; // __gc finalizer call (namewhat "metamethod")
+  // Symbolic name resolved at call site (esp. TAILCALL→C, where Lua frame is gone).
+  std::string invoked_name;
   int protect_top = 0;
   int protect_frames = 0;
   // Yieldable C call (pcall/xpcall): continuation after the protected body
   // returns or errors across a yield. cont_ctx holds xpcall's message handler.
-  enum class ContKind : uint8_t { None, PCall, XPCall } cont_kind = ContKind::None;
+  enum class ContKind : uint8_t { None, PCall, XPCall, DoFile } cont_kind = ContKind::None;
   TValue cont_ctx{};
   int cont_res_base = 0; // absolute stack index of protected-call results
 
@@ -81,6 +83,8 @@ struct Thread : GcObject {
   // Original object from error(obj); used by pcall/xpcall instead of only the string.
   TValue err_obj{};
   bool err_obj_set = false;
+  // Register (frame-relative) for the next typeerror/varinfo, or -1.
+  int err_reg = -1;
   // After yield: values returned to resume; resume args fill CALL at yield_func_idx.
   std::vector<TValue> yield_vals;
   int yield_func_idx = 0;

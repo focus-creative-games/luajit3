@@ -40,6 +40,7 @@ set(LUATIER_SOURCES
   src/vm/bytecode.cpp
   src/vm/interpreter.cpp
   src/vm/debug_hook.cpp
+  src/vm/ldebug.cpp
   src/vm/state.cpp
   src/vm/builtins.cpp
   src/lib/linit.cpp
@@ -75,6 +76,11 @@ target_include_directories(luatier PUBLIC
 add_executable(luatier_cli src/main.cpp)
 target_link_libraries(luatier_cli PRIVATE luatier)
 set_target_properties(luatier_cli PROPERTIES OUTPUT_NAME luatier)
+# PUC allows ~200 syntactic nestings; our recursive parser/sema/lowering frames
+# are heavier than lparser.c, so raise the Windows default 1MB stack.
+if(MSVC)
+  target_link_options(luatier_cli PRIVATE /STACK:8388608)
+endif()
 
 if(LUATIER_BUILD_TESTS)
   enable_testing()
@@ -101,6 +107,9 @@ if(LUATIER_BUILD_TESTS)
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/tests
   )
+  if(MSVC)
+    target_link_options(luatier_tests PRIVATE /STACK:8388608)
+  endif()
   add_test(NAME luatier_tests COMMAND luatier_tests)
   add_test(NAME luatier_cli_version COMMAND luatier_cli --version)
 endif()

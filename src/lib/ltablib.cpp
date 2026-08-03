@@ -4,8 +4,8 @@
 #include "vm/interpreter.hpp"
 #include "vm/meta.hpp"
 
-#include <algorithm>
-#include <vector>
+#include <climits>
+#include <ctime>
 
 namespace luatier {
 using namespace lib;
@@ -134,12 +134,21 @@ static int tab_move(State* L) {
   if (L->gettop() >= 5 && !dest.is_table())
     panic("table expected");
   if (e >= f) {
-    if (values_equal(dest, a) && tpos > e) {
-      for (int64_t i = e; i >= f; --i)
-        seti(L, dest, tpos + (i - f), geti(L, a, i));
+    // PUC: f > 0 || e < LUA_MAXINTEGER + f  (reject overflow of e - f + 1)
+    if (f <= 0 &&
+        static_cast<uint64_t>(e) - static_cast<uint64_t>(f) >=
+            static_cast<uint64_t>(INT64_MAX))
+      panic("too many elements to move");
+    int64_t n = e - f + 1;
+    if (tpos > INT64_MAX - n + 1)
+      panic("destination wrap around");
+    bool same = values_equal(dest, a);
+    if (tpos > e || tpos <= f || !same) {
+      for (int64_t i = 0; i < n; ++i)
+        seti(L, dest, tpos + i, geti(L, a, f + i));
     } else {
-      for (int64_t i = f; i <= e; ++i)
-        seti(L, dest, tpos + (i - f), geti(L, a, i));
+      for (int64_t i = n - 1; i >= 0; --i)
+        seti(L, dest, tpos + i, geti(L, a, f + i));
     }
   }
   L->settop(0);
@@ -164,49 +173,133 @@ static int tab_unpack(State* L) {
     panic("table expected");
   int64_t i = opt_int(L, 2, 1);
   int64_t j = opt_int(L, 3, aux_getn(L, t));
-  L->settop(0);
-  if (j < i)
+  if (i > j)
     return 0;
-  for (int64_t k = i; k <= j; ++k)
+  // PUC: n = e - i (count - 1); reject if n >= INT_MAX or !checkstack(++n)
+  uint64_t n = static_cast<uint64_t>(j) - static_cast<uint64_t>(i);
+  if (n >= static_cast<uint64_t>(INT_MAX) - 1)
+    panic("too many results to unpack");
+  int nres = static_cast<int>(n + 1);
+  L->settop(0);
+  for (int64_t k = i; k < j; ++k)
     L->push(geti(L, t, k));
-  return static_cast<int>(j - i + 1);
+  L->push(geti(L, t, j));
+  return nres;
 }
 
-struct SortCtx {
-  State* L = nullptr;
-  TValue cmp;
-};
+// --- PUC-style quicksort (ltablib.c), in-place via geti/seti ---
+using IdxT = unsigned int;
 
-static int sort_compare(const TValue& a, const TValue& b, SortCtx* ctx) {
-  if (ctx->cmp.is_nil()) {
-    if (!a.is_number() || !b.is_number())
-      panic("attempt to compare two non-number values");
-    return a.to_number() < b.to_number() ? -1 : (a.to_number() > b.to_number() ? 1 : 0);
+static bool sort_comp_idx(State* L, IdxT ai, IdxT bi) {
+  TValue t = *L->at(1);
+  TValue a = geti(L, t, static_cast<int64_t>(ai));
+  TValue b = geti(L, t, static_cast<int64_t>(bi));
+  TValue cmp = *L->at(2);
+  if (cmp.is_nil()) {
+    bool lt = false;
+    meta_lt(L, a, b, &lt);
+    return lt;
   }
-  ctx->L->push(ctx->cmp);
-  ctx->L->push(a);
-  ctx->L->push(b);
-  call_closure(ctx->L, ctx->cmp.as_closure(), 2, 1);
-  bool lt = ctx->L->at(1)->is_truthy();
-  ctx->L->settop(0);
-  return lt ? -1 : 1;
+  if (!cmp.is_function())
+    panic("bad argument #2 to 'sort' (function expected)");
+  L->push(cmp);
+  L->push(a);
+  L->push(b);
+  call_closure(L, cmp.as_closure(), 2, 1);
+  bool lt = L->at(L->gettop())->is_truthy();
+  L->settop(2); // keep table + cmp
+  return lt;
+}
+
+static void sort_swap(State* L, IdxT i, IdxT j) {
+  TValue t = *L->at(1);
+  TValue ai = geti(L, t, static_cast<int64_t>(i));
+  TValue aj = geti(L, t, static_cast<int64_t>(j));
+  seti(L, t, static_cast<int64_t>(i), aj);
+  seti(L, t, static_cast<int64_t>(j), ai);
+}
+
+static IdxT sort_partition(State* L, IdxT lo, IdxT up) {
+  IdxT i = lo;
+  IdxT j = up - 1;
+  for (;;) {
+    while (sort_comp_idx(L, ++i, up - 1)) {
+      if (i == up - 1)
+        panic("invalid order function for sorting");
+    }
+    while (sort_comp_idx(L, up - 1, --j)) {
+      if (j < i)
+        panic("invalid order function for sorting");
+    }
+    if (j < i) {
+      sort_swap(L, up - 1, i);
+      return i;
+    }
+    sort_swap(L, i, j);
+  }
+}
+
+static IdxT choose_pivot(IdxT lo, IdxT up, unsigned int rnd) {
+  IdxT r4 = (up - lo) / 4;
+  return rnd % (r4 * 2) + (lo + r4);
+}
+
+static unsigned int randomize_pivot() {
+  clock_t c = clock();
+  time_t t = time(nullptr);
+  return static_cast<unsigned int>(c) + static_cast<unsigned int>(t);
+}
+
+static void auxsort(State* L, IdxT lo, IdxT up, unsigned int rnd) {
+  while (lo < up) {
+    if (sort_comp_idx(L, up, lo))
+      sort_swap(L, lo, up);
+    if (up - lo == 1)
+      return;
+    IdxT p;
+    constexpr unsigned RANLIMIT = 100u;
+    if (up - lo < RANLIMIT || rnd == 0)
+      p = (lo + up) / 2;
+    else
+      p = choose_pivot(lo, up, rnd);
+    if (sort_comp_idx(L, p, lo))
+      sort_swap(L, p, lo);
+    else if (sort_comp_idx(L, up, p))
+      sort_swap(L, p, up);
+    if (up - lo == 2)
+      return;
+    sort_swap(L, p, up - 1);
+    p = sort_partition(L, lo, up);
+    IdxT n;
+    if (p - lo < up - p) {
+      auxsort(L, lo, p - 1, rnd);
+      n = p - lo;
+      lo = p + 1;
+    } else {
+      auxsort(L, p + 1, up, rnd);
+      n = up - p;
+      up = p - 1;
+    }
+    if ((up - lo) / 128 > n)
+      rnd = randomize_pivot();
+  }
 }
 
 static int tab_sort(State* L) {
   TValue t = *L->at(1);
   if (!t.is_table())
-    panic("table expected");
-  TValue cmp = L->gettop() >= 2 ? *L->at(2) : TValue::nil();
+    panic("bad argument #1 to 'table.sort' (table expected, got " + obj_type_name(L, t) + ")");
   int64_t n = aux_getn(L, t);
-  std::vector<TValue> arr(static_cast<size_t>(n));
-  for (int64_t i = 1; i <= n; ++i)
-    arr[static_cast<size_t>(i - 1)] = geti(L, t, i);
-  SortCtx ctx{L, cmp};
-  std::stable_sort(arr.begin(), arr.end(), [&](const TValue& a, const TValue& b) {
-    return sort_compare(a, b, &ctx) < 0;
-  });
-  for (int64_t i = 1; i <= n; ++i)
-    seti(L, t, i, arr[static_cast<size_t>(i - 1)]);
+  if (n > 1) {
+    if (n >= INT_MAX)
+      panic("array too big");
+    if (L->gettop() >= 2 && !L->at(2)->is_nil() && !L->at(2)->is_function())
+      panic("bad argument #2 to 'sort' (function expected)");
+    while (L->gettop() < 2)
+      L->push(TValue::nil());
+    L->settop(2);
+    auxsort(L, 1, static_cast<IdxT>(n), 0);
+  }
   return 0;
 }
 

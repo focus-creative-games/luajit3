@@ -1,5 +1,6 @@
 #include "frontend/lowering.hpp"
 
+#include "common/common.hpp"
 #include "runtime/string.hpp"
 
 #include <algorithm>
@@ -10,6 +11,10 @@
 namespace luatier {
 
 namespace {
+
+struct FuncState;
+[[noreturn]] void error_limit(FuncState& fs, int limit, const char* what);
+void check_limit(FuncState& fs, int v, int limit, const char* what);
 
 struct Local {
   std::string name;
@@ -80,6 +85,7 @@ struct FuncState {
     freereg += n;
     reg_hwm = std::max(reg_hwm, freereg);
     maxstack = std::max(maxstack, freereg);
+    check_limit(*this, freereg, MAXSTACK - 1, "registers");
   }
   int new_reg() {
     int r = freereg;
@@ -104,6 +110,7 @@ struct FuncState {
     return const_index(TValue::obj(ValueTag::String, L->intern(s)));
   }
   int push_local(const std::string& name, int reg, int line) {
+    check_limit(*this, nactvar + 1, MAXVARS, "local variables");
     Local loc;
     loc.name = name;
     loc.reg = reg;
@@ -207,6 +214,19 @@ struct FuncState {
   }
 };
 
+[[noreturn]] void error_limit(FuncState& fs, int limit, const char* what) {
+  int line = fs.proto ? fs.proto->linedefined : 0;
+  std::string where =
+      (line == 0) ? "main function" : ("function at line " + std::to_string(line));
+  panic(std::string("too many ") + what + " (limit is " + std::to_string(limit) + ") in " +
+        where);
+}
+
+void check_limit(FuncState& fs, int v, int limit, const char* what) {
+  if (v > limit)
+    error_limit(fs, limit, what);
+}
+
 struct Expdesc {
   enum Kind { Void, Relocable, Nonrelocable, Constant, Local, Upval, Global, Indexed, Call } kind =
       Void;
@@ -222,7 +242,7 @@ struct Expdesc {
 
 void expr(FuncState& fs, Expdesc& e, Expr& node);
 void statement(FuncState& fs, AstNode& node);
-void block(FuncState& fs, Block& b);
+void block(FuncState& fs, Block& b, bool allow_last_label = true, bool close = true);
 
 // Rewrite the most recent CALL as TAILCALL (return f(...)).
 bool patch_last_call_to_tailcall(FuncState& fs) {
@@ -290,6 +310,7 @@ int add_upval(FuncState& fs, const std::string& name, bool instack, int idx) {
     if (u.instack == instack && u.idx == static_cast<uint8_t>(idx))
       return static_cast<int>(i);
   }
+  check_limit(fs, static_cast<int>(fs.proto->upvalues.size()) + 1, MAXUPVAL, "upvalues");
   if (instack && fs.prev)
     mark_local_captured(*fs.prev, idx);
   UpvalDesc u;
@@ -513,7 +534,9 @@ void expr(FuncState& fs, Expdesc& e, Expr& node) {
       op = OpCode::LEN;
     else if (n.op == UnOp::Bnot)
       op = OpCode::BNOT;
-    fs.code_abc(op, dest, r, 0);
+    fs.code_abc(op, dest, r, 0, n.line > 0 ? n.line : -1);
+    if (n.line > 0)
+      fs.lastline = n.line;
     fs.free_reg(r);
     e.kind = Expdesc::Nonrelocable;
     e.reg = dest;
@@ -678,8 +701,12 @@ void expr(FuncState& fs, Expdesc& e, Expr& node) {
       dest = rc;
     else
       dest = fs.new_reg();
-    fs.code_abc(bin_arith_op(n.op), dest, rb, rc);
-    fs.freereg = std::max(fs.freereg, dest + 1);
+    // Attribute the arithmetic op to the operator's line (not the RHS).
+    int op_line = n.line > 0 ? n.line : fs.lastline;
+    fs.code_abc(bin_arith_op(n.op), dest, rb, rc, op_line);
+    fs.lastline = op_line;
+    // Drop temps above dest (rhs may have bumped freereg past dest+1).
+    fs.freereg = dest + 1;
     e.kind = Expdesc::Nonrelocable;
     e.reg = dest;
     break;
@@ -771,7 +798,11 @@ void expr(FuncState& fs, Expdesc& e, Expr& node) {
       fs.freereg = dest + 1;
     }
     int b_field = (last_is_vararg || last_is_multret_call) ? 0 : (fs.freereg - base);
-    fs.code_abc(OpCode::CALL, base, static_cast<uint8_t>(b_field), 2); // 1 result by default
+    // CALL line is the callee (PUC: a\n(\n23) errors on line of `a`).
+    int call_line = n.line > 0 ? n.line : -1;
+    fs.code_abc(OpCode::CALL, base, static_cast<uint8_t>(b_field), 2, call_line);
+    if (call_line > 0)
+      fs.lastline = call_line;
     fs.freereg = base + 1;
     e.kind = Expdesc::Call;
     e.info = base;
@@ -782,8 +813,10 @@ void expr(FuncState& fs, Expdesc& e, Expr& node) {
     auto& n = static_cast<ExprTable&>(node);
     int r = fs.new_reg();
     fs.code_abc(OpCode::NEWTABLE, r, 0, 0);
-    // Array fields go into registers R[r+1]... then SETLIST (supports trailing multret).
-    int arr = 0;
+    // Array fields go into registers R[r+1]... then SETLIST in blocks of 50
+    // (PUC LFIELDS_PER_FLUSH) so large constructors stay within MAXSTACK.
+    int na = 0;       // total array elements so far
+    int tostore = 0;  // pending elements since last flush
     bool arr_multret = false;
     for (size_t fi = 0; fi < n.fields.size(); ++fi) {
       auto& f = n.fields[fi];
@@ -794,7 +827,7 @@ void expr(FuncState& fs, Expdesc& e, Expr& node) {
         expr(fs, v, *f.value);
         int rv = exp2reg(fs, v);
         fs.code_abc(OpCode::SETTABLE, r, k, rv);
-        fs.freereg = r + 1 + arr;
+        fs.freereg = r + 1 + tostore;
       } else if (f.key) {
         Expdesc k, v;
         expr(fs, k, *f.key);
@@ -802,7 +835,7 @@ void expr(FuncState& fs, Expdesc& e, Expr& node) {
         expr(fs, v, *f.value);
         int rv = exp2reg(fs, v);
         fs.code_abc(OpCode::SETTABLE, r, rk, rv);
-        fs.freereg = r + 1 + arr;
+        fs.freereg = r + 1 + tostore;
       } else {
         bool last_array = true;
         for (size_t j = fi + 1; j < n.fields.size(); ++j) {
@@ -811,7 +844,7 @@ void expr(FuncState& fs, Expdesc& e, Expr& node) {
             break;
           }
         }
-        int dest = r + 1 + arr;
+        int dest = r + 1 + tostore;
         fs.freereg = dest;
         if (last_array && f.value->kind == AstKind::ExprVararg) {
           fs.reserve(1);
@@ -831,14 +864,21 @@ void expr(FuncState& fs, Expdesc& e, Expr& node) {
         int rv = exp2reg(fs, v);
         if (rv != dest)
           fs.code_abc(OpCode::MOVE, dest, rv, 0);
-        ++arr;
+        ++tostore;
+        ++na;
         fs.freereg = dest + 1;
+        if (tostore == 50) {
+          int c = (na - 1) / 50 + 1;
+          fs.code_abc(OpCode::SETLIST, r, 50, static_cast<uint8_t>(c));
+          tostore = 0;
+          fs.freereg = r + 1;
+        }
       }
     }
-    if (arr > 0 || arr_multret) {
-      int b = arr_multret ? 0 : arr;
-      // C=1 => flush block starting at index 1
-      fs.code_abc(OpCode::SETLIST, r, static_cast<uint8_t>(b), 1);
+    if (tostore > 0 || arr_multret) {
+      int b = arr_multret ? 0 : tostore;
+      int c = (na == 0) ? 1 : ((na - 1) / 50 + 1);
+      fs.code_abc(OpCode::SETLIST, r, static_cast<uint8_t>(b), static_cast<uint8_t>(c));
     }
     fs.freereg = r + 1;
     e.kind = Expdesc::Nonrelocable;
@@ -928,7 +968,7 @@ void storevar(FuncState& fs, Expdesc& var, int expr_reg) {
   }
 }
 
-void block(FuncState& fs, Block& b) {
+void block(FuncState& fs, Block& b, bool allow_last_label, bool close) {
   int saved = static_cast<int>(fs.locals.size());
   fs.block_entry_nactvar.push_back(fs.nactvar);
   const size_t pending_before = fs.pending_gotos.size();
@@ -948,11 +988,13 @@ void block(FuncState& fs, Block& b) {
       auto& n = static_cast<LabelStmt&>(s);
       if (defined_here.count(n.name))
         panic("label already defined: " + n.name);
-      bool last = true;
-      for (size_t j = i + 1; j < b.stmts.size(); ++j) {
-        if (b.stmts[j]->kind != AstKind::Label) {
-          last = false;
-          break;
+      bool last = allow_last_label;
+      if (last) {
+        for (size_t j = i + 1; j < b.stmts.size(); ++j) {
+          if (b.stmts[j]->kind != AstKind::Label) {
+            last = false;
+            break;
+          }
         }
       }
       int nv = last ? fs.block_entry_nactvar.back() : fs.nactvar;
@@ -1010,7 +1052,8 @@ void block(FuncState& fs, Block& b) {
   }
 
   fs.block_entry_nactvar.pop_back();
-  fs.leave_block(saved);
+  if (close)
+    fs.leave_block(saved);
 }
 
 void statement(FuncState& fs, AstNode& node) {
@@ -1290,8 +1333,8 @@ void statement(FuncState& fs, AstNode& node) {
     int loop = fs.pc();
     int breaks_before = static_cast<int>(fs.break_list.size());
     fs.loop_break_level.push_back(fs.nactvar);
-    for (auto& s : n.body->stmts)
-      statement(fs, *s);
+    // Labels/gotos in the body; keep locals open for the until condition.
+    block(fs, *n.body, /*allow_last_label=*/false, /*close=*/false);
     // Condition may reference body locals — evaluate before closing.
     Expdesc c;
     expr(fs, c, *n.cond);
@@ -1405,6 +1448,9 @@ void statement(FuncState& fs, AstNode& node) {
   }
   case AstKind::FunctionDecl: {
     auto& n = static_cast<FunctionDecl&>(node);
+    int fline = n.line > 0 ? n.line : fs.lastline;
+    if (n.line > 0)
+      fs.lastline = n.line;
     Expdesc e;
     expr(fs, e, *n.fn);
     int er = exp2reg(fs, e);
@@ -1415,20 +1461,20 @@ void statement(FuncState& fs, AstNode& node) {
       search_var(fs, n.name_path[0], var);
       storevar(fs, var, er);
     } else {
-      // a.b.c = fn
+      // a.b.c = fn — attribute indexing errors to the `function` line.
       Expdesc t;
       search_var(fs, n.name_path[0], t);
       int reg = exp2reg(fs, t);
       for (size_t i = 1; i + 1 < n.name_path.size(); ++i) {
         int k = fs.new_reg();
-        fs.code_abx(OpCode::LOADK, k, fs.string_k(n.name_path[i]));
+        fs.code_abx(OpCode::LOADK, k, fs.string_k(n.name_path[i]), fline);
         int d = fs.new_reg();
-        fs.code_abc(OpCode::GETTABLE, d, reg, k);
+        fs.code_abc(OpCode::GETTABLE, d, reg, k, fline);
         reg = d;
       }
       int k = fs.new_reg();
-      fs.code_abx(OpCode::LOADK, k, fs.string_k(n.name_path.back()));
-      fs.code_abc(OpCode::SETTABLE, reg, k, er);
+      fs.code_abx(OpCode::LOADK, k, fs.string_k(n.name_path.back()), fline);
+      fs.code_abc(OpCode::SETTABLE, reg, k, er, fline);
     }
     fs.freereg = fs.nactvar;
     break;
@@ -1518,9 +1564,13 @@ void statement(FuncState& fs, AstNode& node) {
     // Locals end after the body; do not LOADNIL every iteration (PUC leaves
     // stale values — also keeps count/line hooks aligned).
     fs.leave_block(nlocals_before, /*clear_dead=*/false);
-    fs.lastline = node.line;
+    // Attribute the generator call to the iterator expression (PUC lineerror).
+    int call_line = node.line;
+    if (!n.iters.empty() && n.iters.back() && n.iters.back()->line > 0)
+      call_line = n.iters.back()->line;
+    fs.lastline = call_line;
     fs.fix_sbx(jprep, fs.pc());
-    fs.code_abc(OpCode::TFORCALL, base, 0, nvars);
+    fs.code_abc(OpCode::TFORCALL, base, 0, nvars, call_line);
     int tforloop = fs.code_asbx(OpCode::TFORLOOP, base + 2, 0);
     // fix_sbx(pc, dest) encodes sbx = dest - (pc + 1); pass absolute dest.
     fs.fix_sbx(tforloop, loopbody);

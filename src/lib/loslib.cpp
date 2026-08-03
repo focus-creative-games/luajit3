@@ -3,11 +3,15 @@
 #include "lib/lib_util.hpp"
 
 #include <chrono>
+#include <cmath>
+#include <climits>
 #include <clocale>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <string>
+#include <vector>
 
 #ifdef _WIN32
 #include <direct.h>
@@ -31,24 +35,6 @@ static int os_clock(State* L) {
   return 1;
 }
 
-static int os_time(State* L) {
-  std::time_t t = std::time(nullptr);
-  if (L->gettop() >= 1 && L->at(1)->is_table()) {
-    std::tm tm{};
-    tm.tm_year = static_cast<int>(L->at(1)->as_table()->get(TValue::obj(ValueTag::String, L->intern("year"))).to_number()) - 1900;
-    tm.tm_mon = static_cast<int>(L->at(1)->as_table()->get(TValue::obj(ValueTag::String, L->intern("month"))).to_number()) - 1;
-    tm.tm_mday = static_cast<int>(L->at(1)->as_table()->get(TValue::obj(ValueTag::String, L->intern("day"))).to_number());
-    tm.tm_hour = static_cast<int>(L->at(1)->as_table()->get(TValue::obj(ValueTag::String, L->intern("hour"))).to_number());
-    tm.tm_min = static_cast<int>(L->at(1)->as_table()->get(TValue::obj(ValueTag::String, L->intern("min"))).to_number());
-    tm.tm_sec = static_cast<int>(L->at(1)->as_table()->get(TValue::obj(ValueTag::String, L->intern("sec"))).to_number());
-    t = std::mktime(&tm);
-  } else if (L->gettop() >= 1 && L->at(1)->is_number())
-    t = static_cast<std::time_t>(L->at(1)->to_number());
-  L->settop(0);
-  L->push(TValue::integer(static_cast<int64_t>(t)));
-  return 1;
-}
-
 static int os_difftime(State* L) {
   double t2 = check_number(L, 1);
   double t1 = check_number(L, 2);
@@ -57,31 +43,161 @@ static int os_difftime(State* L) {
   return 1;
 }
 
+#if defined(_WIN32)
+static const char kStrftimeOptions[] =
+    "aAbBcdHIjmMpSUwWxXyYzZ%||#c#x#d#H#I#j#m#M#S#U#w#W#y#Y";
+#else
+static const char kStrftimeOptions[] =
+    "aAbBcCdDeFgGhHIjmMnprRStTuUVwWxXyYzZ%||EcECExEXEyEYOdOeOHOIOmOMOSOuOUOVOwOWOy";
+#endif
+
+static constexpr int kMaxDateField = INT_MAX / 2;
+static constexpr size_t kSizeTimeFmt = 250;
+
+static void set_date_field(State* L, Table* t, const char* key, int value) {
+  t->set(L, TValue::obj(ValueTag::String, L->intern(key)), TValue::integer(value));
+}
+
+static void set_date_bool_field(State* L, Table* t, const char* key, int value) {
+  if (value < 0)
+    return;
+  t->set(L, TValue::obj(ValueTag::String, L->intern(key)), TValue::boolean(value != 0));
+}
+
+static void set_all_date_fields(State* L, Table* t, std::tm* stm) {
+  set_date_field(L, t, "sec", stm->tm_sec);
+  set_date_field(L, t, "min", stm->tm_min);
+  set_date_field(L, t, "hour", stm->tm_hour);
+  set_date_field(L, t, "day", stm->tm_mday);
+  set_date_field(L, t, "month", stm->tm_mon + 1);
+  set_date_field(L, t, "year", stm->tm_year + 1900);
+  set_date_field(L, t, "wday", stm->tm_wday + 1);
+  set_date_field(L, t, "yday", stm->tm_yday + 1);
+  set_date_bool_field(L, t, "isdst", stm->tm_isdst);
+}
+
+static const char* check_strftime_option(const char* conv, size_t convlen, char* cc) {
+  const char* option = kStrftimeOptions;
+  int oplen = 1;
+  cc[0] = '%';
+  for (; *option != '\0' && static_cast<size_t>(oplen) <= convlen; option += oplen) {
+    if (*option == '|')
+      ++oplen;
+    else if (std::memcmp(conv, option, static_cast<size_t>(oplen)) == 0) {
+      std::memcpy(cc + 1, conv, static_cast<size_t>(oplen));
+      cc[oplen + 1] = '\0';
+      return conv + oplen;
+    }
+  }
+  std::string bad = "%";
+  bad.append(conv, convlen);
+  panic("invalid conversion specifier '" + bad + "'");
+}
+
+static int64_t check_time(State* L, int idx) {
+  int64_t t = check_int(L, idx);
+  if (static_cast<std::time_t>(t) != t)
+    panic("value out-of-bound");
+  return t;
+}
+
 static int os_date(State* L) {
-  std::string fmt = L->gettop() >= 1 ? std::string(opt_string(L, 1, "%c")) : "%c";
-  std::time_t t = L->gettop() >= 2 ? static_cast<std::time_t>(check_int(L, 2))
-                                   : std::time(nullptr);
-  if (fmt == "*t") {
-    std::tm* tm = std::localtime(&t);
-    Table* tab = table_new(L, 0, 16);
-    tab->set(L, TValue::obj(ValueTag::String, L->intern("year")), TValue::integer(tm->tm_year + 1900));
-    tab->set(L, TValue::obj(ValueTag::String, L->intern("month")), TValue::integer(tm->tm_mon + 1));
-    tab->set(L, TValue::obj(ValueTag::String, L->intern("day")), TValue::integer(tm->tm_mday));
-    tab->set(L, TValue::obj(ValueTag::String, L->intern("hour")), TValue::integer(tm->tm_hour));
-    tab->set(L, TValue::obj(ValueTag::String, L->intern("min")), TValue::integer(tm->tm_min));
-    tab->set(L, TValue::obj(ValueTag::String, L->intern("sec")), TValue::integer(tm->tm_sec));
-    tab->set(L, TValue::obj(ValueTag::String, L->intern("wday")), TValue::integer(tm->tm_wday + 1));
-    tab->set(L, TValue::obj(ValueTag::String, L->intern("yday")), TValue::integer(tm->tm_yday + 1));
-    tab->set(L, TValue::obj(ValueTag::String, L->intern("isdst")), TValue::boolean(tm->tm_isdst != 0));
+  std::string fmt = L->gettop() >= 1 ? std::string(check_string(L, 1)->view()) : "%c";
+  std::time_t t = L->gettop() >= 2 ? static_cast<std::time_t>(check_time(L, 2))
+                                     : std::time(nullptr);
+  const char* s = fmt.data();
+  size_t slen = fmt.size();
+  const char* se = s + slen;
+  std::tm tmr{};
+  std::tm* stm = nullptr;
+  if (slen > 0 && s[0] == '!') {
+    stm = gmtime(&t);
+    ++s;
+  } else {
+    stm = localtime(&t);
+  }
+  if (!stm)
+    panic("time result cannot be represented in this installation");
+  tmr = *stm;
+  stm = &tmr;
+  if (std::strcmp(s, "*t") == 0) {
+    Table* tab = table_new(L, 0, 9);
+    set_all_date_fields(L, tab, stm);
     L->settop(0);
     L->push(TValue::obj(ValueTag::Table, tab));
     return 1;
   }
-  char buf[256];
-  if (std::strftime(buf, sizeof(buf), fmt.c_str(), std::localtime(&t)) == 0)
-    panic("invalid date format");
+  std::string out;
+  out.reserve(fmt.size() + 64);
+  while (s < se) {
+    if (*s != '%') {
+      out.push_back(*s++);
+      continue;
+    }
+    ++s;
+    char cc[8];
+    s = check_strftime_option(s, static_cast<size_t>(se - s), cc);
+    char buff[kSizeTimeFmt];
+    size_t reslen = std::strftime(buff, sizeof(buff), cc, stm);
+    out.append(buff, reslen);
+  }
   L->settop(0);
-  push_string(L, buf);
+  push_string(L, out);
+  return 1;
+}
+
+static int get_date_bool_field(State* L, Table* t, const char* key) {
+  TValue v = t->get(TValue::obj(ValueTag::String, L->intern(key)));
+  if (v.is_nil())
+    return -1;
+  return v.is_truthy() ? 1 : 0;
+}
+
+static int get_date_field(State* L, Table* t, const char* key, int def, int delta) {
+  TValue v = t->get(TValue::obj(ValueTag::String, L->intern(key)));
+  if (v.is_nil()) {
+    if (def < 0)
+      panic(std::string("field '") + key + "' missing in date table");
+    return def - delta;
+  }
+  if (!v.is_number())
+    panic(std::string("field '") + key + "' is not an integer");
+  if (v.is_float()) {
+    double d = v.as_float();
+    if (std::floor(d) != d)
+      panic(std::string("field '") + key + "' is not an integer");
+  }
+  int64_t res = v.is_int() ? v.as_int() : static_cast<int64_t>(v.as_float());
+  if (res < -kMaxDateField || res > kMaxDateField)
+    panic(std::string("field '") + key + "' is out-of-bound");
+  return static_cast<int>(res) - delta;
+}
+
+static int os_time(State* L) {
+  std::time_t t;
+  if (L->gettop() < 1 || L->at(1)->is_nil()) {
+    t = std::time(nullptr);
+  } else if (L->at(1)->is_table()) {
+    Table* tab = L->at(1)->as_table();
+    std::tm ts{};
+    ts.tm_sec = get_date_field(L, tab, "sec", 0, 0);
+    ts.tm_min = get_date_field(L, tab, "min", 0, 0);
+    ts.tm_hour = get_date_field(L, tab, "hour", 12, 0);
+    ts.tm_mday = get_date_field(L, tab, "day", -1, 0);
+    ts.tm_mon = get_date_field(L, tab, "month", -1, 1);
+    ts.tm_year = get_date_field(L, tab, "year", -1, 1900);
+    ts.tm_isdst = get_date_bool_field(L, tab, "isdst");
+    t = std::mktime(&ts);
+    set_all_date_fields(L, tab, &ts);
+  } else if (L->at(1)->is_number()) {
+    t = static_cast<std::time_t>(check_time(L, 1));
+  } else {
+    arg_type_error(L, 1, "table or number");
+  }
+  if (t == static_cast<std::time_t>(-1))
+    panic("time result cannot be represented in this installation");
+  L->settop(0);
+  L->push(TValue::integer(static_cast<int64_t>(t)));
   return 1;
 }
 
@@ -160,11 +276,23 @@ static int os_exit(State* L) {
 }
 
 static int os_tmpname(State* L) {
+  // Prefer unique non-existent names (PUC tmpnam). Fixed cwd names break
+  // os.rename when leftovers remain from prior runs.
   static int counter = 0;
-  std::string name = "luatiertmp_" + std::to_string(++counter) + ".tmp";
-  L->settop(0);
-  push_string(L, name);
-  return 1;
+  for (int attempt = 0; attempt < 128; ++attempt) {
+    std::string name = "luatiertmp_" + std::to_string(++counter) + "_" +
+                       std::to_string(static_cast<long long>(std::time(nullptr))) + "_" +
+                       std::to_string(attempt) + ".tmp";
+    FILE* probe = std::fopen(name.c_str(), "r");
+    if (probe) {
+      std::fclose(probe);
+      continue;
+    }
+    L->settop(0);
+    push_string(L, name);
+    return 1;
+  }
+  panic("unable to generate a unique filename");
 }
 
 static int os_execute(State* L) {

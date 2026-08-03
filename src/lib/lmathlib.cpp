@@ -1,6 +1,7 @@
 #include "lib/libs.hpp"
 
 #include "lib/lib_util.hpp"
+#include "runtime/value.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -16,28 +17,57 @@ static std::mt19937& rng() {
   return gen;
 }
 
+// PUC pushnumint: float that fits exactly in an integer → integer, else float.
+static void push_num_int(State* L, double d) {
+  int64_t n;
+  if (float_to_integer(d, &n))
+    L->push(TValue::integer(n));
+  else
+    L->push(TValue::number(d));
+}
+
+static bool number_less(const TValue& a, const TValue& b) {
+  return number_lt(a, b);
+}
+
 static int math_abs(State* L) {
-  double x = check_number(L, 1);
-  L->settop(0);
-  L->push(TValue::number(std::fabs(x)));
+  check_any(L, 1, "abs");
+  TValue v = *L->at(1);
+  if (v.is_int()) {
+    int64_t n = v.as_int();
+    if (n < 0)
+      n = static_cast<int64_t>(0u - static_cast<uint64_t>(n));
+    L->settop(0);
+    L->push(TValue::integer(n));
+  } else {
+    double x = check_number(L, 1);
+    L->settop(0);
+    L->push(TValue::number(std::fabs(x)));
+  }
   return 1;
 }
 
 static int math_floor(State* L) {
-  double x = check_number(L, 1);
-  bool toint = L->gettop() >= 2 && L->at(2)->is_truthy();
+  check_any(L, 1, "floor");
+  if (L->at(1)->is_int()) {
+    L->settop(1);
+    return 1;
+  }
+  double d = std::floor(check_number(L, 1));
   L->settop(0);
-  if (toint)
-    L->push(TValue::integer(static_cast<int64_t>(std::floor(x))));
-  else
-    L->push(TValue::number(std::floor(x)));
+  push_num_int(L, d);
   return 1;
 }
 
 static int math_ceil(State* L) {
-  double x = check_number(L, 1);
+  check_any(L, 1, "ceil");
+  if (L->at(1)->is_int()) {
+    L->settop(1);
+    return 1;
+  }
+  double d = std::ceil(check_number(L, 1));
   L->settop(0);
-  L->push(TValue::number(std::ceil(x)));
+  push_num_int(L, d);
   return 1;
 }
 
@@ -84,14 +114,11 @@ static int math_acos(State* L) {
 }
 
 static int math_atan(State* L) {
+  // PUC: atan(y [, x]) → atan2(y, x or 1)
   double y = check_number(L, 1);
-  bool two = L->gettop() >= 2;
-  double x = two ? check_number(L, 2) : 0;
+  double x = (L->gettop() >= 2 && !L->at(2)->is_nil()) ? check_number(L, 2) : 1.0;
   L->settop(0);
-  if (two)
-    L->push(TValue::number(std::atan2(y, x)));
-  else
-    L->push(TValue::number(std::atan(y)));
+  L->push(TValue::number(std::atan2(y, x)));
   return 1;
 }
 
@@ -104,26 +131,52 @@ static int math_exp(State* L) {
 
 static int math_log(State* L) {
   double x = check_number(L, 1);
+  const bool has_base = L->gettop() >= 2 && !L->at(2)->is_nil();
+  double base = has_base ? check_number(L, 2) : 0.0;
   L->settop(0);
-  if (L->gettop() >= 2) {
-    double base = check_number(L, 2);
-    L->push(TValue::number(std::log(x) / std::log(base)));
-  } else
-    L->push(TValue::number(std::log(x)));
+  double res;
+  if (!has_base)
+    res = std::log(x);
+  else if (base == 2.0)
+    res = std::log2(x);
+  else if (base == 10.0)
+    res = std::log10(x);
+  else
+    res = std::log(x) / std::log(base);
+  L->push(TValue::number(res));
   return 1;
 }
 
 static int math_modf(State* L) {
-  double x = check_number(L, 1);
-  double ip;
-  double fp = std::modf(x, &ip);
+  check_any(L, 1, "modf");
+  if (L->at(1)->is_int()) {
+    L->settop(1); // integer is its own integer part
+    L->push(TValue::number(0.0));
+    return 2;
+  }
+  double n = check_number(L, 1);
+  double ip = (n < 0) ? std::ceil(n) : std::floor(n);
   L->settop(0);
-  L->push(TValue::number(ip));
-  L->push(TValue::number(fp));
+  push_num_int(L, ip);
+  L->push(TValue::number((n == ip) ? 0.0 : (n - ip)));
   return 2;
 }
 
 static int math_fmod(State* L) {
+  if (L->gettop() >= 2 && L->at(1)->is_int() && L->at(2)->is_int()) {
+    int64_t a = L->at(1)->as_int();
+    int64_t d = L->at(2)->as_int();
+    if (static_cast<uint64_t>(d) + 1u <= 1u) { // d == 0 or d == -1
+      if (d == 0)
+        panic("bad argument #2 to 'fmod' (zero)");
+      L->settop(0);
+      L->push(TValue::integer(0)); // avoid overflow with minint % -1
+      return 1;
+    }
+    L->settop(0);
+    L->push(TValue::integer(a % d));
+    return 1;
+  }
   double x = check_number(L, 1);
   double y = check_number(L, 2);
   L->settop(0);
@@ -154,40 +207,58 @@ static int math_rad(State* L) {
 }
 
 static int math_max(State* L) {
-  if (L->gettop() < 1)
-    panic("math.max: value expected");
-  double m = L->at(1)->to_number();
-  for (int i = 2; i <= L->gettop(); ++i)
-    m = std::max(m, L->at(i)->to_number());
+  int n = L->gettop();
+  if (n < 1)
+    panic("value expected");
+  int imax = 1;
+  for (int i = 2; i <= n; ++i) {
+    if (number_less(*L->at(imax), *L->at(i)))
+      imax = i;
+  }
+  TValue best = *L->at(imax);
   L->settop(0);
-  L->push(TValue::number(m));
+  L->push(best);
   return 1;
 }
 
 static int math_min(State* L) {
-  if (L->gettop() < 1)
-    panic("math.min: value expected");
-  double m = L->at(1)->to_number();
-  for (int i = 2; i <= L->gettop(); ++i)
-    m = std::min(m, L->at(i)->to_number());
+  int n = L->gettop();
+  if (n < 1)
+    panic("value expected");
+  int imin = 1;
+  for (int i = 2; i <= n; ++i) {
+    if (number_less(*L->at(i), *L->at(imin)))
+      imin = i;
+  }
+  TValue best = *L->at(imin);
   L->settop(0);
-  L->push(TValue::number(m));
+  L->push(best);
   return 1;
 }
 
 static int math_tointeger(State* L) {
-  TValue v = L->gettop() >= 1 ? *L->at(1) : TValue::nil();
+  if (L->gettop() < 1) {
+    L->push(TValue::nil());
+    return 1;
+  }
+  TValue v = *L->at(1);
   L->settop(0);
   if (v.is_int()) {
     L->push(v);
     return 1;
   }
-  if (v.is_float()) {
-    double x = v.as_float();
-    if (x == std::floor(x) && x >= static_cast<double>(std::numeric_limits<int64_t>::min()) &&
-        x <= static_cast<double>(std::numeric_limits<int64_t>::max())) {
-      L->push(TValue::integer(static_cast<int64_t>(x)));
+  TValue n;
+  if (try_to_number(v, &n)) {
+    if (n.is_int()) {
+      L->push(n);
       return 1;
+    }
+    if (n.is_float()) {
+      int64_t i;
+      if (float_to_integer(n.as_float(), &i)) {
+        L->push(TValue::integer(i));
+        return 1;
+      }
     }
   }
   L->push(TValue::nil());
@@ -195,12 +266,9 @@ static int math_tointeger(State* L) {
 }
 
 static int math_type(State* L) {
-  if (L->gettop() < 1) {
-    L->push(TValue::nil());
-    return 1;
-  }
+  if (L->gettop() < 1)
+    panic("value expected");
   TValue v = *L->at(1);
-  // Push on top without settop(0): results are taken as the topmost nret values.
   if (v.is_int())
     push_string(L, "integer");
   else if (v.is_float())
@@ -220,32 +288,43 @@ static int math_ult(State* L) {
 
 static int math_random(State* L) {
   int top = L->gettop();
+  if (top > 2)
+    panic("wrong number of arguments");
+  // Match PUC: r in [0,1), then scale.
+  double r = std::generate_canonical<double, 53>(rng());
   if (top == 0) {
     L->settop(0);
-    std::uniform_real_distribution<double> dist(0.0, 1.0);
-    L->push(TValue::number(dist(rng())));
+    L->push(TValue::number(r));
     return 1;
   }
+  int64_t low, up;
   if (top == 1) {
-    int64_t u = check_int(L, 1);
-    L->settop(0);
-    std::uniform_int_distribution<int64_t> dist(1, u);
-    L->push(TValue::integer(dist(rng())));
-    return 1;
+    low = 1;
+    up = check_int(L, 1);
+  } else {
+    low = check_int(L, 1);
+    up = check_int(L, 2);
   }
-  int64_t lo = check_int(L, 1);
-  int64_t hi = check_int(L, 2);
-  if (lo > hi)
-    std::swap(lo, hi);
+  if (low > up)
+    panic("interval is empty");
+  // PUC: low >= 0 || up <= LUA_MAXINTEGER + low
+  if (low < 0) {
+    int64_t lim = static_cast<int64_t>(
+        static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) + static_cast<uint64_t>(low));
+    if (up > lim)
+      panic("interval too large");
+  }
   L->settop(0);
-  std::uniform_int_distribution<int64_t> dist(lo, hi);
-  L->push(TValue::integer(dist(rng())));
+  r *= static_cast<double>(up - low) + 1.0;
+  L->push(TValue::integer(static_cast<int64_t>(r) + low));
   return 1;
 }
 
 static int math_randomseed(State* L) {
-  int64_t seed = check_int(L, 1);
-  rng().seed(static_cast<uint32_t>(seed));
+  // PUC: seed from number (may be float), discard first rand.
+  double seed = check_number(L, 1);
+  rng().seed(static_cast<uint32_t>(static_cast<int64_t>(seed)));
+  (void)rng()();
   return 0;
 }
 

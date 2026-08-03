@@ -1,5 +1,8 @@
 #include "frontend/parser.hpp"
 
+#include "common/common.hpp"
+#include "vm/ldebug.hpp"
+
 namespace luatier {
 
 namespace {
@@ -14,6 +17,52 @@ std::unique_ptr<T> make_at(int line, Args&&... args) {
 } // namespace
 
 Parser::Parser(Lexer lex) : lex_(std::move(lex)) {}
+
+void Parser::enterlevel() {
+  ++nCcalls_;
+  if (nCcalls_ > LUAI_MAXCCALLS)
+    error("too many C levels");
+}
+
+void Parser::leavelevel() {
+  if (nCcalls_ > 0)
+    --nCcalls_;
+}
+
+void Parser::enterfunc(int linedefined) {
+  nactvar_stack_.push_back(nactvar_);
+  func_line_stack_.push_back(func_line_);
+  nactvar_ = 0;
+  func_line_ = linedefined;
+}
+
+void Parser::leavefunc() {
+  if (!nactvar_stack_.empty()) {
+    nactvar_ = nactvar_stack_.back();
+    nactvar_stack_.pop_back();
+  } else {
+    nactvar_ = 0;
+  }
+  if (!func_line_stack_.empty()) {
+    func_line_ = func_line_stack_.back();
+    func_line_stack_.pop_back();
+  } else {
+    func_line_ = 0;
+  }
+}
+
+void Parser::new_localvar(const std::string& /*name*/) {
+  ++nactvar_;
+  if (nactvar_ > MAXVARS) {
+    int line = peek().line;
+    std::string where = (func_line_ == 0)
+                            ? "main function"
+                            : ("function at line " + std::to_string(func_line_));
+    panic(format_chunkid(lex_.chunk_name()) + ":" + std::to_string(line) +
+          ": too many local variables (limit is " + std::to_string(MAXVARS) + ") in " +
+          where);
+  }
+}
 
 Token Parser::peek() {
   if (has_unget_)
@@ -50,7 +99,8 @@ Token Parser::expect(TokenKind k, const char* msg) {
 
 void Parser::error(const std::string& msg) {
   auto t = peek();
-  panic(lex_.chunk_name() + ":" + std::to_string(t.line) + ": " + msg);
+  panic(format_chunkid(lex_.chunk_name()) + ":" + std::to_string(t.line) + ": " + msg +
+        " near " + token_to_near(t));
 }
 
 std::unique_ptr<Chunk> parse(std::string_view src, const std::string& name) {
@@ -96,6 +146,7 @@ std::vector<ExprPtr> Parser::parse_expr_list() {
 }
 
 AstPtr Parser::parse_stmt() {
+  LevelGuard lg(*this);
   int line = peek().line;
   if (match(TokenKind::KwIf)) {
     auto s = std::make_unique<IfStmt>();
@@ -203,9 +254,7 @@ AstPtr Parser::parse_stmt() {
       s->is_method = true;
       s->name_path.push_back(expect(TokenKind::Identifier, "expected method").text);
     }
-    s->fn = parse_function_body(s->line);
-    if (s->is_method)
-      s->fn->params.insert(s->fn->params.begin(), "self");
+    s->fn = parse_function_body(s->line, s->is_method);
     return s;
   }
   if (match(TokenKind::KwLocal)) {
@@ -213,71 +262,97 @@ AstPtr Parser::parse_stmt() {
       auto s = std::make_unique<LocalFunction>();
       s->line = line;
       s->name = expect(TokenKind::Identifier, "expected name").text;
-      s->fn = parse_function_body(s->line);
+      new_localvar(s->name);
+      s->fn = parse_function_body(s->line, false);
       return s;
     }
     auto s = std::make_unique<LocalDecl>();
     s->line = line;
     s->names.push_back(expect(TokenKind::Identifier, "expected name").text);
-    while (match(TokenKind::Comma))
+    new_localvar(s->names.back());
+    while (match(TokenKind::Comma)) {
       s->names.push_back(expect(TokenKind::Identifier, "expected name").text);
+      new_localvar(s->names.back());
+    }
     if (match(TokenKind::Eq))
       s->values = parse_expr_list();
     return s;
   }
 
-  // expression statement / assignment
-  auto e = parse_expr();
+  // PUC exprstat/primaryexp: only NAME or '(' may start a statement expression.
+  if (!check(TokenKind::Identifier) && !check(TokenKind::LParen))
+    error("unexpected symbol");
+  auto e = parse_suffix(parse_primary());
   if (check(TokenKind::Comma) || check(TokenKind::Eq)) {
     auto s = std::make_unique<Assign>();
     s->line = line;
     s->vars.push_back(std::move(e));
-    while (match(TokenKind::Comma))
-      s->vars.push_back(parse_expr());
+    int nvars = 1;
+    while (match(TokenKind::Comma)) {
+      // PUC assignment(): checklimit(nvars + nCcalls, LUAI_MAXCCALLS, "C levels")
+      if (nvars + nCcalls_ > LUAI_MAXCCALLS)
+        error("too many C levels");
+      ++nvars;
+      // LHS is suffixedexp, not a full expression (PUC).
+      if (!check(TokenKind::Identifier) && !check(TokenKind::LParen))
+        error("unexpected symbol");
+      s->vars.push_back(parse_suffix(parse_primary()));
+    }
     expect(TokenKind::Eq, "expected '='");
     s->values = parse_expr_list();
     return s;
   }
   if (e->kind != AstKind::ExprCall)
-    error("unexpected expression statement");
+    error("syntax error");
   auto s = std::make_unique<CallStmt>();
   s->line = line;
   s->call = std::move(e);
   return s;
 }
 
-std::unique_ptr<ExprFunction> Parser::parse_function_body(int defline) {
+std::unique_ptr<ExprFunction> Parser::parse_function_body(int defline, bool is_method) {
+  enterfunc(defline);
   auto fn = std::make_unique<ExprFunction>();
   fn->line = defline;
+  if (is_method) {
+    fn->params.push_back("self");
+    new_localvar("self");
+  }
   expect(TokenKind::LParen, "expected '('");
   if (!check(TokenKind::RParen)) {
     if (match(TokenKind::DotDotDot)) {
       fn->is_vararg = true;
     } else {
       fn->params.push_back(expect(TokenKind::Identifier, "expected name").text);
+      new_localvar(fn->params.back());
       while (match(TokenKind::Comma)) {
         if (match(TokenKind::DotDotDot)) {
           fn->is_vararg = true;
           break;
         }
         fn->params.push_back(expect(TokenKind::Identifier, "expected name").text);
+        new_localvar(fn->params.back());
       }
     }
   }
   expect(TokenKind::RParen, "expected ')'");
   fn->body = parse_block();
   fn->lastline = expect(TokenKind::KwEnd, "expected 'end'").line;
+  leavefunc();
   return fn;
 }
 
-ExprPtr Parser::parse_expr() { return parse_or(); }
+ExprPtr Parser::parse_expr() {
+  LevelGuard lg(*this);
+  return parse_or();
+}
 
 ExprPtr Parser::parse_or() {
   auto e = parse_and();
   while (check(TokenKind::KwOr)) {
     int line = peek().line;
     next();
-    auto n = make_at<ExprBin>(e->line > 0 ? e->line : line);
+    auto n = make_at<ExprBin>(line);
     n->op = BinOp::Or;
     n->lhs = std::move(e);
     n->rhs = parse_and();
@@ -290,7 +365,7 @@ ExprPtr Parser::parse_and() {
   while (check(TokenKind::KwAnd)) {
     int line = peek().line;
     next();
-    auto n = make_at<ExprBin>(e->line > 0 ? e->line : line);
+    auto n = make_at<ExprBin>(line);
     n->op = BinOp::And;
     n->lhs = std::move(e);
     n->rhs = parse_compare();
@@ -301,6 +376,7 @@ ExprPtr Parser::parse_and() {
 ExprPtr Parser::parse_compare() {
   auto e = parse_bor();
   for (;;) {
+    int line = peek().line;
     BinOp op;
     if (match(TokenKind::EqEq))
       op = BinOp::Eq;
@@ -316,7 +392,7 @@ ExprPtr Parser::parse_compare() {
       op = BinOp::Ge;
     else
       break;
-    auto n = std::make_unique<ExprBin>();
+    auto n = make_at<ExprBin>(line);
     n->op = op;
     n->lhs = std::move(e);
     n->rhs = parse_bor();
@@ -326,8 +402,10 @@ ExprPtr Parser::parse_compare() {
 }
 ExprPtr Parser::parse_bor() {
   auto e = parse_bxor();
-  while (match(TokenKind::Pipe)) {
-    auto n = std::make_unique<ExprBin>();
+  while (check(TokenKind::Pipe)) {
+    int line = peek().line;
+    next();
+    auto n = make_at<ExprBin>(line);
     n->op = BinOp::Bor;
     n->lhs = std::move(e);
     n->rhs = parse_bxor();
@@ -337,8 +415,10 @@ ExprPtr Parser::parse_bor() {
 }
 ExprPtr Parser::parse_bxor() {
   auto e = parse_band();
-  while (match(TokenKind::Tilde)) {
-    auto n = std::make_unique<ExprBin>();
+  while (check(TokenKind::Tilde)) {
+    int line = peek().line;
+    next();
+    auto n = make_at<ExprBin>(line);
     n->op = BinOp::Bxor;
     n->lhs = std::move(e);
     n->rhs = parse_band();
@@ -348,8 +428,10 @@ ExprPtr Parser::parse_bxor() {
 }
 ExprPtr Parser::parse_band() {
   auto e = parse_shift();
-  while (match(TokenKind::Amp)) {
-    auto n = std::make_unique<ExprBin>();
+  while (check(TokenKind::Amp)) {
+    int line = peek().line;
+    next();
+    auto n = make_at<ExprBin>(line);
     n->op = BinOp::Band;
     n->lhs = std::move(e);
     n->rhs = parse_shift();
@@ -360,6 +442,7 @@ ExprPtr Parser::parse_band() {
 ExprPtr Parser::parse_shift() {
   auto e = parse_concat();
   for (;;) {
+    int line = peek().line;
     BinOp op;
     if (match(TokenKind::LtLt))
       op = BinOp::Shl;
@@ -367,7 +450,7 @@ ExprPtr Parser::parse_shift() {
       op = BinOp::Shr;
     else
       break;
-    auto n = std::make_unique<ExprBin>();
+    auto n = make_at<ExprBin>(line);
     n->op = op;
     n->lhs = std::move(e);
     n->rhs = parse_concat();
@@ -377,8 +460,11 @@ ExprPtr Parser::parse_shift() {
 }
 ExprPtr Parser::parse_concat() {
   auto e = parse_add();
-  if (match(TokenKind::DotDot)) {
-    auto n = std::make_unique<ExprBin>();
+  if (check(TokenKind::DotDot)) {
+    LevelGuard lg(*this);
+    int line = peek().line;
+    next();
+    auto n = make_at<ExprBin>(line);
     n->op = BinOp::Concat;
     n->lhs = std::move(e);
     n->rhs = parse_concat(); // right assoc
@@ -389,6 +475,7 @@ ExprPtr Parser::parse_concat() {
 ExprPtr Parser::parse_add() {
   auto e = parse_mul();
   for (;;) {
+    int line = peek().line;
     BinOp op;
     if (match(TokenKind::Plus))
       op = BinOp::Add;
@@ -396,7 +483,7 @@ ExprPtr Parser::parse_add() {
       op = BinOp::Sub;
     else
       break;
-    auto n = std::make_unique<ExprBin>();
+    auto n = make_at<ExprBin>(line);
     n->op = op;
     n->lhs = std::move(e);
     n->rhs = parse_mul();
@@ -407,6 +494,7 @@ ExprPtr Parser::parse_add() {
 ExprPtr Parser::parse_mul() {
   auto e = parse_unary();
   for (;;) {
+    int line = peek().line;
     BinOp op;
     if (match(TokenKind::Star))
       op = BinOp::Mul;
@@ -418,7 +506,7 @@ ExprPtr Parser::parse_mul() {
       op = BinOp::Mod;
     else
       break;
-    auto n = std::make_unique<ExprBin>();
+    auto n = make_at<ExprBin>(line);
     n->op = op;
     n->lhs = std::move(e);
     n->rhs = parse_unary();
@@ -441,6 +529,7 @@ ExprPtr Parser::parse_unary() {
   else
     is_un = false;
   if (is_un) {
+    LevelGuard lg(*this);
     int line = peek().line;
     next();
     auto n = make_at<ExprUn>(line);
@@ -459,8 +548,11 @@ ExprPtr Parser::parse_power() {
   auto e = parse_primary();
   if (allow_suffix)
     e = parse_suffix(std::move(e));
-  if (match(TokenKind::Caret)) {
-    auto n = std::make_unique<ExprBin>();
+  if (check(TokenKind::Caret)) {
+    LevelGuard lg(*this);
+    int line = peek().line;
+    next();
+    auto n = make_at<ExprBin>(line);
     n->op = BinOp::Pow;
     n->lhs = std::move(e);
     n->rhs = parse_unary();
@@ -615,7 +707,10 @@ ExprPtr Parser::parse_table() {
     if (!match(TokenKind::Comma) && !match(TokenKind::Semi))
       break;
   }
-  expect(TokenKind::RBrace, "expected '}'");
+  if (!check(TokenKind::RBrace)) {
+    error("'}' expected (to close '{' at line " + std::to_string(line) + ")");
+  }
+  next(); // consume '}'
   return tab;
 }
 

@@ -183,6 +183,8 @@ void Table::set_int(State* L, int64_t i, const TValue& value) {
 void Table::set(State* L, const TValue& key, const TValue& value) {
   if (key.is_nil())
     panic("table index is nil");
+  if (key.is_float() && key.as_float() != key.as_float())
+    panic("table index is NaN");
   TValue lookup = key;
   int64_t i = 0;
   if (key_as_integer(key, &i)) {

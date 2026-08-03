@@ -23,14 +23,14 @@ namespace luatier {
 using namespace lib;
 
 static int str_len(State* L) {
-  size_t n = check_string(L, 1)->len;
+  size_t n = check_string_self(L, 1)->len;
   L->settop(0);
   L->push(TValue::integer(static_cast<int64_t>(n)));
   return 1;
 }
 
 static int str_sub(State* L) {
-  std::string_view s = check_string(L, 1)->view();
+  std::string_view s = check_string_self(L, 1)->view();
   int64_t i = check_int(L, 2);
   int64_t j = L->gettop() >= 3 ? check_int(L, 3) : static_cast<int64_t>(s.size());
   if (i < 0)

@@ -12,6 +12,7 @@ struct Table;
 
 struct Userdata : GcObject {
   Table* metatable = nullptr;
+  TValue uservalue{}; // Lua 5.3: associated value (often a table)
   std::vector<char> data;
 };
 

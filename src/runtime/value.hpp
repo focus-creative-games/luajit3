@@ -100,6 +100,14 @@ struct TValue {
 };
 
 bool values_equal(const TValue& a, const TValue& b);
+
+// PUC lua_numbertointeger: float → int only if value is an integral in [minint, maxint].
+bool float_to_integer(double d, int64_t* out);
+
+// PUC LTnum / LEnum: correct int↔float ordering beyond 2^53.
+bool number_lt(const TValue& a, const TValue& b);
+bool number_le(const TValue& a, const TValue& b);
+
 std::string value_to_string(const TValue& v);
 
 // Parse strings the same way as tonumber; returns false for non-number strings.

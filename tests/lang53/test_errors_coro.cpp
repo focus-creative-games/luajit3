@@ -8,20 +8,21 @@ int test_lang53_errors_coro() {
 
   // pcall / error / assert
   f += expect_int(G, "local ok,err=pcall(function() error('boom') end); return ok and 1 or 0", 0);
-  f += expect_str(G, "local ok,err=pcall(function() error('xyz') end); return err", "xyz");
+  f += expect_str(G, "local ok,err=pcall(function() error('xyz', 0) end); return err", "xyz");
   f += expect_int(G, "local ok,v=pcall(function() return 42 end); return ok and v or 0", 42);
   f += expect_int(G,
                   "local ok,a,b=pcall(function() return 1,2 end); "
                   "return (ok and a+b) or 0",
                   3);
   f += expect_int(G,
-                  "local ok,err=xpcall(function() error('e') end, function(m) return 'h:'..m end); "
+                  "local ok,err=xpcall(function() error('e', 0) end, function(m) return 'h:'..m end); "
                   "return (ok and 0) or ((err=='h:e') and 1 or 0)",
                   1);
   f += expect_int(G, "local ok=pcall(function() assert(false,'nope') end); return ok and 1 or 0", 0);
-  f += expect_str(G,
-                  "local ok,err=pcall(function() assert(false,'nope') end); return err",
-                  "nope");
+  f += expect_int(G,
+                  "local ok,err=pcall(function() assert(false,'nope') end); "
+                  "return (not ok and type(err)=='string' and err:find('nope',1,true)) and 1 or 0",
+                  1);
 
   // Coroutines
   f += expect_int(G,

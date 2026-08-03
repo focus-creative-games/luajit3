@@ -17,6 +17,7 @@ struct Closure : GcObject {
   bool is_c = false;
   Proto* proto = nullptr;
   CFunction cfunc = nullptr;
+  const char* cname = nullptr; // debug name for C functions (e.g. "sin")
   std::vector<UpVal*> upvals;
 };
 

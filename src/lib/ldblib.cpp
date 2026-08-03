@@ -3,6 +3,7 @@
 #include "lib/lib_util.hpp"
 #include "vm/debug_hook.hpp"
 #include "vm/interpreter.hpp"
+#include "vm/ldebug.hpp"
 #include "vm/meta.hpp"
 
 #include <algorithm>
@@ -15,53 +16,12 @@ using namespace lib;
 
 namespace {
 
-constexpr int kIdSize = 60;
+constexpr int kIdSize = 60 - 1; // LUA_IDSIZE (60) minus trailing NUL
 constexpr const char* kDefaultWhat = "Slnuft";
 constexpr const char* kValidWhat = "nSlutTfL";
 
 std::string chunkid(std::string_view source) {
-  // Match luaO_chunkid (Lua 5.3): bufflen includes trailing NUL conceptually.
-  std::string out;
-  out.reserve(static_cast<size_t>(kIdSize));
-
-  if (!source.empty() && source[0] == '=') {
-    size_t len = source.size() - 1;
-    if (len <= static_cast<size_t>(kIdSize))
-      out.assign(source.substr(1));
-    else
-      out.assign(source.substr(1, static_cast<size_t>(kIdSize)));
-    return out;
-  }
-
-  if (!source.empty() && source[0] == '@') {
-    size_t len = source.size() - 1;
-    if (len <= static_cast<size_t>(kIdSize)) {
-      out.assign(source.substr(1));
-    } else {
-      out.append("...");
-      out.append(source.substr(source.size() - static_cast<size_t>(kIdSize - 3)));
-    }
-    return out;
-  }
-
-  // String source (including empty chunkname "") → [string "..."]
-  out.append("[string \"");
-  size_t budget = static_cast<size_t>(kIdSize) - 11; // "[string \"\"]" + room
-  size_t len = source.size();
-  size_t nl = source.find('\n');
-  if (nl != std::string_view::npos)
-    len = nl;
-  if (len < budget && nl == std::string_view::npos) {
-    out.append(source.substr(0, len));
-  } else {
-    if (len > budget)
-      len = budget;
-    if (len > 0)
-      out.append(source.substr(0, len));
-    out.append("...");
-  }
-  out.append("\"]");
-  return out;
+  return format_chunkid(source);
 }
 
 void validate_what(std::string_view what) {
@@ -1062,6 +1022,30 @@ static int debug_setmetatable(State* L) {
   return 1;
 }
 
+static int debug_getuservalue(State* L) {
+  TValue* v = L->at(1);
+  L->settop(0);
+  if (v->is_userdata())
+    L->push(v->as_userdata()->uservalue);
+  else
+    L->push(TValue::nil());
+  return 1;
+}
+
+static int debug_setuservalue(State* L) {
+  TValue* v = L->at(1);
+  if (v->tag() == ValueTag::LightUserdata)
+    panic("light userdata");
+  if (!v->is_userdata())
+    panic("userdata expected");
+  TValue uv = L->gettop() >= 2 ? *L->at(2) : TValue::nil();
+  v->as_userdata()->uservalue = uv;
+  L->gc.barrier(v->as_gc(), uv);
+  L->settop(0);
+  L->push(*v);
+  return 1;
+}
+
 static int open_debug_module(State* L) {
   Table* dbg = new_lib(L, 16);
   set_field(L, dbg, "getinfo", debug_getinfo);
@@ -1077,6 +1061,8 @@ static int open_debug_module(State* L) {
   set_field(L, dbg, "getregistry", debug_getregistry);
   set_field(L, dbg, "getmetatable", debug_getmetatable);
   set_field(L, dbg, "setmetatable", debug_setmetatable);
+  set_field(L, dbg, "getuservalue", debug_getuservalue);
+  set_field(L, dbg, "setuservalue", debug_setuservalue);
   L->settop(0);
   L->push(TValue::obj(ValueTag::Table, dbg));
   return 1;
