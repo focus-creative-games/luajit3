@@ -10,20 +10,41 @@
 namespace lj3 {
 using namespace lib;
 
+static void concat_addfield(Table* t, int64_t i, std::string& out) {
+  TValue v = t->get_int(i);
+  if (!v.is_string()) {
+    const char* tn = "nil";
+    if (v.is_bool())
+      tn = "boolean";
+    else if (v.is_number())
+      tn = "number";
+    else if (v.is_table())
+      tn = "table";
+    else if (v.is_function())
+      tn = "function";
+    else if (v.is_userdata())
+      tn = "userdata";
+    else if (v.is_thread())
+      tn = "thread";
+    panic(std::string("invalid value (") + tn + ") at index " + std::to_string(i) +
+          " in table for 'concat'");
+  }
+  out.append(v.as_string()->view());
+}
+
 static int tab_concat(State* L) {
   Table* t = check_table(L, 1);
   std::string sep = L->gettop() >= 2 ? std::string(check_string(L, 2)->view()) : "";
   int64_t i = L->gettop() >= 3 ? check_int(L, 3) : 1;
-  int64_t j = L->gettop() >= 4 ? check_int(L, 4) : table_length(t);
+  int64_t last = L->gettop() >= 4 ? check_int(L, 4) : table_length(t);
   std::string out;
-  for (int64_t k = i; k <= j; ++k) {
-    if (k > i)
-      out += sep;
-    TValue v = t->get_int(k);
-    if (v.is_nil())
-      panic("invalid value (nil) at index " + std::to_string(k) + " in table for 'concat'");
-    out += value_to_string(v);
+  // PUC: i < last then optional last element — avoids ++ overflowing maxinteger.
+  for (; i < last; ++i) {
+    concat_addfield(t, i, out);
+    out += sep;
   }
+  if (i == last)
+    concat_addfield(t, i, out);
   L->settop(0);
   push_string(L, out);
   return 1;

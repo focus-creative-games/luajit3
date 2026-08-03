@@ -6,12 +6,14 @@
 #include "vm/interpreter.hpp"
 #include "vm/meta.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <vector>
 
 #ifndef LUA_OK
 #define LUA_OK 0
@@ -29,38 +31,121 @@
 namespace lj3 {
 using namespace lib;
 
-static Closure* bind_env_closure(State* L, Proto* p) {
+static Closure* bind_env_closure(State* L, Proto* p, const TValue* env) {
   Closure* cl = closure_new_lua(L, p);
-  if (!p->upvalues.empty()) {
+  // PUC: all upvalues start closed/nil; the first is set to env (or _G).
+  for (size_t i = 0; i < cl->upvals.size(); ++i) {
     auto* uv = L->gc.create<UpVal>(GcKind::UpVal);
     uv->open = false;
-    uv->closed = TValue::obj(ValueTag::Table, L->globals);
+    uv->closed = TValue::nil();
     uv->thread = nullptr;
     uv->stack_index = -1;
-    cl->upvals[0] = uv;
+    cl->upvals[i] = uv;
+  }
+  if (!cl->upvals.empty()) {
+    cl->upvals[0]->closed =
+        env ? *env : TValue::obj(ValueTag::Table, L->globals);
   }
   return cl;
 }
 
 static int load_chunk(State* L, std::string_view source, std::string_view chunk_name,
-                      Table* env) {
-  if (is_proto_dump(source)) {
+                      const TValue* env, std::string_view mode) {
+  const bool binary = is_proto_dump(source);
+  if (binary) {
+    if (!mode.empty() && mode.find('b') == std::string_view::npos)
+      panic("attempt to load a binary chunk");
     Proto* p = undump_proto(L, std::string(source), std::string(chunk_name));
-    Closure* cl = bind_env_closure(L, p);
-    if (env && !p->upvalues.empty())
-      cl->upvals[0]->closed = TValue::obj(ValueTag::Table, env);
+    Closure* cl = bind_env_closure(L, p, env);
     L->push(TValue::obj(ValueTag::Function, cl));
     return LUA_OK;
   }
-  return L->load_string(std::string(source), std::string(chunk_name));
+  if (!mode.empty() && mode.find('t') == std::string_view::npos)
+    panic("attempt to load a text chunk");
+  int st = L->load_string(std::string(source), std::string(chunk_name));
+  if (st == LUA_OK && L->gettop() >= 1 && L->at(1)->is_function()) {
+    Closure* cl = L->at(1)->as_closure();
+    if (!cl->is_c && cl->proto && !cl->upvals.empty() && cl->upvals[0] && env)
+      cl->upvals[0]->closed = *env;
+  }
+  return st;
+}
+
+// PUC load: call reader until it returns nil/empty; pieces must be strings.
+static std::string read_via_function(State* L, Closure* reader) {
+  std::string out;
+  Thread* th = L->current;
+  const int protect_frames = static_cast<int>(th->frames.size());
+  const int saved_base = th->stack_base;
+  for (;;) {
+    int call_base = th->top;
+    for (auto& fr : th->frames) {
+      if (fr.proto)
+        call_base = std::max(call_base, fr.base + fr.proto->maxstack);
+      else if (fr.cl && fr.cl->is_c)
+        call_base = std::max(call_base, fr.base + 1);
+    }
+    L->ensure_stack(call_base + 2);
+    th->stack[static_cast<size_t>(call_base)] = TValue::obj(ValueTag::Function, reader);
+    th->top = call_base + 1;
+    try {
+      call_closure(L, reader, 0, 1);
+    } catch (const Lj3Error&) {
+      while (static_cast<int>(th->frames.size()) > protect_frames) {
+        L->close_upvals(th, th->frames.back().base);
+        th->frames.pop_back();
+      }
+      th->stack_base = saved_base;
+      th->top = call_base;
+      throw;
+    }
+    TValue piece = th->stack[static_cast<size_t>(call_base)];
+    th->top = call_base;
+    if (piece.is_nil())
+      break;
+    if (!piece.is_string())
+      panic("reader function must return a string");
+    auto sv = piece.as_string()->view();
+    if (sv.empty())
+      break;
+    out.append(sv);
+  }
+  return out;
 }
 
 static int base_print(State* L) {
-  int n = L->gettop();
-  for (int i = 1; i <= n; ++i) {
-    if (i > 1)
+  // PUC luaB_print: call global tostring for each argument.
+  // Snapshot args first: reentrant tostring calls must not see a shifting C window.
+  const int n = L->gettop();
+  std::vector<TValue> args(static_cast<size_t>(n));
+  for (int i = 1; i <= n; ++i)
+    args[static_cast<size_t>(i - 1)] = *L->at(i);
+
+  TValue ts = L->globals->get(TValue::obj(ValueTag::String, L->intern("tostring")));
+  if (!ts.is_function())
+    panic("attempt to call a nil value");
+  for (int i = 0; i < n; ++i) {
+    // Call above the live C window (same rule as debug hooks / metamethods).
+    Thread* th = L->current;
+    int call_base = th->top;
+    for (auto& fr : th->frames) {
+      if (fr.proto)
+        call_base = std::max(call_base, fr.base + fr.proto->maxstack);
+      else if (fr.cl && fr.cl->is_c)
+        call_base = std::max(call_base, fr.base + 1);
+    }
+    L->ensure_stack(call_base + 3);
+    th->stack[static_cast<size_t>(call_base)] = ts;
+    th->stack[static_cast<size_t>(call_base + 1)] = args[static_cast<size_t>(i)];
+    th->top = call_base + 2;
+    call_closure(L, ts.as_closure(), 1, 1);
+    TValue r = th->stack[static_cast<size_t>(call_base)];
+    if (!r.is_string())
+      panic("'tostring' must return a string");
+    if (i > 0)
       std::cout << '\t';
-    std::cout << value_to_string(*L->at(i));
+    std::cout << r.as_string()->view();
+    th->top = L->current->stack_base + n; // restore print's C window top
   }
   std::cout << '\n';
   return 0;
@@ -115,7 +200,20 @@ static int base_tonumber(State* L) {
 }
 
 static int base_tostring(State* L) {
-  std::string s = value_to_string(*L->at(1));
+  if (L->gettop() < 1)
+    panic("value expected");
+  TValue v = *L->at(1);
+  TValue mm = get_metamethod(L, v, "__tostring");
+  if (mm.is_function()) {
+    L->settop(0);
+    L->push(mm);
+    L->push(v);
+    call_closure(L, mm.as_closure(), 1, 1);
+    if (!L->at(1)->is_string())
+      panic("'__tostring' must return a string");
+    return 1;
+  }
+  std::string s = value_to_string(v);
   L->settop(0);
   push_string(L, s);
   return 1;
@@ -241,7 +339,7 @@ static int base_xpcall(State* L) {
 }
 
 static int base_getmetatable(State* L) {
-  Table* mt = get_metatable(*L->at(1));
+  Table* mt = get_metatable(L, *L->at(1));
   L->settop(0);
   if (!mt)
     L->push(TValue::nil());
@@ -429,31 +527,55 @@ static int base_ipairs(State* L) {
 }
 
 static int base_load(State* L) {
-  std::string_view chunk;
+  std::string source;
   std::string chunk_name;
-  Table* env = nullptr;
+  std::string mode = "bt";
+  TValue env_val = TValue::nil();
+  bool has_env = false;
 
   if (L->at(1)->is_function()) {
-    // load(reader) not implemented — use string only
-    panic("load: function reader not supported");
-  }
-  if (!L->at(1)->is_string())
+    Closure* reader = L->at(1)->as_closure();
+    // Capture optional args before reader calls clobber the C window.
+    if (L->gettop() >= 2 && !L->at(2)->is_nil())
+      chunk_name = std::string(L->at(2)->as_string()->view());
+    else
+      chunk_name = "=(load)";
+    if (L->gettop() >= 3 && !L->at(3)->is_nil())
+      mode = std::string(L->at(3)->as_string()->view());
+    // PUC: env is present unless the argument is absent (nil is a valid env).
+    if (L->gettop() >= 4) {
+      env_val = *L->at(4);
+      has_env = true;
+    }
+    try {
+      source = read_via_function(L, reader);
+    } catch (const Lj3Error& e) {
+      L->settop(0);
+      L->push(TValue::nil());
+      push_string(L, e.what());
+      return 2;
+    }
+  } else if (L->at(1)->is_string()) {
+    source = std::string(L->at(1)->as_string()->view());
+    // Lua 5.3: default chunkname is the source string itself.
+    if (L->gettop() >= 2 && !L->at(2)->is_nil())
+      chunk_name = std::string(L->at(2)->as_string()->view());
+    else
+      chunk_name = source;
+    if (L->gettop() >= 3 && !L->at(3)->is_nil())
+      mode = std::string(L->at(3)->as_string()->view());
+    // PUC: env is present unless the argument is absent (nil is a valid env).
+    if (L->gettop() >= 4) {
+      env_val = *L->at(4);
+      has_env = true;
+    }
+  } else {
     panic("load: string or function expected");
-  chunk = L->at(1)->as_string()->view();
-  // Lua 5.3: default chunkname is the source string itself (not "=(load)").
-  if (L->gettop() >= 2 && !L->at(2)->is_nil())
-    chunk_name = std::string(L->at(2)->as_string()->view());
-  else
-    chunk_name = std::string(chunk);
-  if (L->gettop() >= 4 && !L->at(4)->is_nil()) {
-    if (!L->at(4)->is_table())
-      panic("load: environment must be a table");
-    env = L->at(4)->as_table();
   }
 
   try {
     L->settop(0);
-    int st = load_chunk(L, chunk, chunk_name, env);
+    int st = load_chunk(L, source, chunk_name, has_env ? &env_val : nullptr, mode);
     if (st != LUA_OK) {
       TValue err = L->pop();
       L->push(TValue::nil());
@@ -473,11 +595,15 @@ static int base_loadfile(State* L) {
   std::string filename = (L->gettop() >= 1 && !L->at(1)->is_nil())
                              ? std::string(L->at(1)->as_string()->view())
                              : "";
-  Table* env = nullptr;
-  if (L->gettop() >= 3 && !L->at(3)->is_nil()) {
-    if (!L->at(3)->is_table())
-      panic("loadfile: environment must be a table");
-    env = L->at(3)->as_table();
+  std::string mode = "bt";
+  if (L->gettop() >= 2 && !L->at(2)->is_nil())
+    mode = std::string(L->at(2)->as_string()->view());
+  TValue env_val = TValue::nil();
+  bool has_env = false;
+  // PUC: env is present unless the argument is absent (nil is a valid env).
+  if (L->gettop() >= 3) {
+    env_val = *L->at(3);
+    has_env = true;
   }
 
   std::ifstream in(filename, std::ios::binary);
@@ -494,7 +620,7 @@ static int base_loadfile(State* L) {
 
   try {
     L->settop(0);
-    int st = load_chunk(L, source, chunk_name, env);
+    int st = load_chunk(L, source, chunk_name, has_env ? &env_val : nullptr, mode);
     if (st != LUA_OK) {
       TValue err = L->pop();
       L->push(TValue::nil());
@@ -521,7 +647,14 @@ static int base_dofile(State* L) {
   TValue f = *L->at(1);
   L->settop(0);
   L->push(f);
+  // Clear stack_base while the chunk runs so GC marks Lua register windows.
+  // dofile is a C call; leaving stack_base!=0 made strict C-top marking free
+  // live temps (seen when dofile('literals.lua') followed GC-heavy strings.lua).
+  Thread* th = L->current;
+  const int saved_base = th->stack_base;
+  th->stack_base = 0;
   call_closure(L, f.as_closure(), 0, LUA_MULTRET);
+  th->stack_base = saved_base;
   return L->gettop();
 }
 

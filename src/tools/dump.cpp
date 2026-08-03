@@ -19,7 +19,11 @@ std::string dump_proto(const Proto* p) {
   for (size_t i = 0; i < p->constants.size(); ++i)
     os << "  k[" << i << "] " << value_to_string(p->constants[i]) << "\n";
   for (size_t i = 0; i < p->code.size(); ++i)
-    os << "  [" << i << "] " << disassemble_ins(p->code[i]) << "\n";
+    os << "  [" << i << "] L" << (i < p->lineinfo.size() ? p->lineinfo[i] : -1) << " "
+       << disassemble_ins(p->code[i]) << "\n";
+  for (size_t i = 0; i < p->locvars.size(); ++i)
+    os << "  local[" << i << "] " << p->locvars[i].name << " r" << p->locvars[i].reg << " pc["
+       << p->locvars[i].startpc << "," << p->locvars[i].endpc << ")\n";
   for (auto* ch : p->protos)
     os << dump_proto(ch);
   return os.str();

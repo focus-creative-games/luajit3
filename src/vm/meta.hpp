@@ -30,7 +30,7 @@ bool meta_len(State* L, const TValue& a, TValue* out);
 // Stack: func at func_idx, nargs args after it. Returns status.
 int meta_call(State* L, int func_idx, int nargs, int nresults);
 
-Table* get_metatable(const TValue& v);
+Table* get_metatable(State* L, const TValue& v);
 void set_metatable(State* L, TValue& v, Table* mt);
 
 } // namespace lj3

@@ -185,6 +185,11 @@ void open_package_lib(State* L) {
   searchers->set_int(L, 1, TValue::obj(ValueTag::Function, closure_new_c(L, searcher_preload)));
   searchers->set_int(L, 2, TValue::obj(ValueTag::Function, closure_new_c(L, searcher_lua)));
 
+  // PUC: package.loaded._G / package so traceback can name globals (pcall, etc.).
+  loaded->set(L, TValue::obj(ValueTag::String, L->intern("_G")),
+              TValue::obj(ValueTag::Table, L->globals));
+  loaded->set(L, TValue::obj(ValueTag::String, L->intern("package")),
+              TValue::obj(ValueTag::Table, pkg));
   set_field_value(L, pkg, "loaded", TValue::obj(ValueTag::Table, loaded));
   set_field_value(L, pkg, "preload", TValue::obj(ValueTag::Table, preload));
   set_field_value(L, pkg, "searchers", TValue::obj(ValueTag::Table, searchers));

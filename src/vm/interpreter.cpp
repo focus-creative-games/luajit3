@@ -3,6 +3,7 @@
 #include "jit/hotness.hpp"
 #include "runtime/string.hpp"
 #include "tools/profile.hpp"
+#include "vm/debug_hook.hpp"
 #include "vm/meta.hpp"
 
 #include <cmath>
@@ -75,12 +76,24 @@ TValue arith_raw(OpCode op, const TValue& a_in, const TValue& b_in) {
     if (!to_integer(a, &x) || !to_integer(b, &y))
       panic("number has no integer representation");
     int64_t r = 0;
+    // PUC luaV_shiftl: |disp| >= 64 → 0; negative disp reverses direction; bit ops via unsigned.
+    auto shiftl = [](int64_t v, int64_t disp) -> int64_t {
+      constexpr int64_t NBITS = 64;
+      if (disp < 0) {
+        if (disp <= -NBITS)
+          return 0;
+        return static_cast<int64_t>(static_cast<uint64_t>(v) >> static_cast<uint64_t>(-disp));
+      }
+      if (disp >= NBITS)
+        return 0;
+      return static_cast<int64_t>(static_cast<uint64_t>(v) << static_cast<uint64_t>(disp));
+    };
     switch (op) {
     case OpCode::BAND: r = x & y; break;
     case OpCode::BOR: r = x | y; break;
     case OpCode::BXOR: r = x ^ y; break;
-    case OpCode::SHL: r = x << (y & 63); break;
-    case OpCode::SHR: r = static_cast<int64_t>(static_cast<uint64_t>(x) >> (y & 63)); break;
+    case OpCode::SHL: r = shiftl(x, y); break;
+    case OpCode::SHR: r = shiftl(x, -y); break;
     default: break;
     }
     return TValue::integer(r);
@@ -125,8 +138,12 @@ TValue do_arith(State* L, OpCode op, const TValue& a, const TValue& b) {
   return arith_raw(op, a, b);
 }
 
-void push_lua_frame(State* L, Closure* cl, int func_idx, int nargs, int nresults) {
+void push_lua_frame(State* L, Closure* cl, int func_idx, int nargs, int nresults,
+                    bool is_tailcall = false) {
   Thread* th = L->current;
+  // Hard cap: a broken upvalue/tailcall must not grow the stack into multi-GB.
+  if (th->frames.size() > 100000)
+    panic("stack overflow");
   Proto* p = cl->proto;
   hotness_on_entry(p);
   CallFrame fr;
@@ -136,18 +153,16 @@ void push_lua_frame(State* L, Closure* cl, int func_idx, int nargs, int nresults
   fr.expected_results = nresults;
   fr.saved_pc = 0;
   fr.kind = FrameKind::InterpLua;
-  fr.nvarargs = 0;
-  fr.vararg_base = -1;
+  fr.tailcall = is_tailcall;
 
   int nfixed = p->numparams;
   int nvar = 0;
   if (p->is_vararg && nargs > nfixed)
     nvar = nargs - nfixed;
 
-  std::vector<TValue> saved_varargs(static_cast<size_t>(nvar));
+  fr.varargs.resize(static_cast<size_t>(nvar));
   for (int i = 0; i < nvar; ++i)
-    saved_varargs[static_cast<size_t>(i)] =
-        th->stack[static_cast<size_t>(func_idx + 1 + nfixed + i)];
+    fr.varargs[static_cast<size_t>(i)] = th->stack[static_cast<size_t>(func_idx + 1 + nfixed + i)];
 
   for (int i = 0; i < nfixed; ++i) {
     if (i < nargs)
@@ -158,27 +173,38 @@ void push_lua_frame(State* L, Closure* cl, int func_idx, int nargs, int nresults
   }
 
   int want = std::max(p->maxstack, nfixed);
-  L->ensure_stack(fr.base + want + nvar + 8);
+  L->ensure_stack(fr.base + want + 8);
   for (int i = nfixed; i < want; ++i)
     th->stack[static_cast<size_t>(fr.base + i)] = TValue::nil();
 
-  if (nvar > 0) {
-    fr.vararg_base = fr.base + want;
-    fr.nvarargs = nvar;
-    for (int i = 0; i < nvar; ++i)
-      th->stack[static_cast<size_t>(fr.vararg_base + i)] = saved_varargs[static_cast<size_t>(i)];
-  }
-
   L->current->top = fr.base + want;
-  th->frames.push_back(fr);
+  th->frames.push_back(std::move(fr));
+  if (is_tailcall)
+    debug_on_tailcall(L, th);
+  else
+    debug_on_call(L, th);
 }
 
-int run_c_call(State* L, Closure* cl, int func_idx, int nargs, int nresults) {
+int run_c_call(State* L, Closure* cl, int func_idx, int nargs, int nresults,
+               bool is_tailcall = false) {
   Thread* th = L->current;
   if (func_idx < 0 || nargs < 0)
     panic("run_c_call: bad func_idx/nargs");
   if (static_cast<int>(th->stack.size()) < func_idx + 1 + nargs)
     panic("run_c_call: stack underflow");
+
+  // Push a C frame so debug levels match PUC (level 0 = C, level 1 = Lua caller).
+  CallFrame cfr;
+  cfr.cl = cl;
+  cfr.proto = nullptr;
+  cfr.base = func_idx;
+  cfr.kind = FrameKind::CApi;
+  cfr.tailcall = is_tailcall;
+  th->frames.push_back(cfr);
+  if (is_tailcall)
+    debug_on_tailcall(L, th);
+  else
+    debug_on_call(L, th);
 
   // Keep the full Lua stack intact so open upvalues remain valid. Expose a
   // C API window where at(1) is the first argument (slot func_idx+1).
@@ -192,6 +218,15 @@ int run_c_call(State* L, Closure* cl, int func_idx, int nargs, int nresults) {
     nret = cl->cfunc(L);
   } catch (const Lj3Error&) {
     th->stack_base = prev_base;
+    // Non-main threads keep the C frame so debug.traceback can show
+    // `error` / the failing C call on a dead coroutine (db.lua).
+    if (th != L->main) {
+      th->top = func_idx;
+      throw;
+    }
+    debug_return_hook(L, th);
+    th->frames.pop_back();
+    debug_on_return(L, th);
     th->top = func_idx;
     // Clear the call frame slot area.
     for (int i = func_idx; i < prev_top; ++i)
@@ -209,6 +244,8 @@ int run_c_call(State* L, Closure* cl, int func_idx, int nargs, int nresults) {
   for (int i = 0; i < nret; ++i)
     results[static_cast<size_t>(i)] = *L->at(ctop - nret + i + 1);
 
+  // Yield: keep the C frame on the stack (PUC CallInfo stays) so traceback can
+  // see `coroutine.yield` and resume can finish the call.
   if (L->yield_pending) {
     th->yield_vals = std::move(results);
     th->yield_func_idx = func_idx;
@@ -219,6 +256,10 @@ int run_c_call(State* L, Closure* cl, int func_idx, int nargs, int nresults) {
     L->yield_pending = false;
     return LUA_YIELD;
   }
+
+  debug_return_hook(L, th);
+  th->frames.pop_back();
+  debug_on_return(L, th);
 
   th->stack_base = prev_base;
   int want = (nresults == LUA_MULTRET) ? nret : nresults;
@@ -249,9 +290,10 @@ int call_closure(State* L, Closure* cl, int nargs, int nresults) {
   return interpret(L);
 }
 
-int interpret(State* L) {
+int interpret(State* L, int min_frames) {
   Thread* th = L->current;
-  const int entry_depth = static_cast<int>(th->frames.size());
+  const int entry_depth =
+      (min_frames < 0) ? static_cast<int>(th->frames.size()) : min_frames;
 
   // Use frame index (not CallFrame&) so reentrant call_closure / meta calls that
   // push_back on th->frames cannot leave a dangling reference after reallocation.
@@ -261,13 +303,26 @@ int interpret(State* L) {
     Closure* cl = fr0.cl;
     Proto* p = fr0.proto;
     if (fr0.saved_pc >= static_cast<int>(p->code.size())) {
+      debug_return_hook(L, th);
       th->frames.pop_back();
+      debug_on_return(L, th);
       if (static_cast<int>(th->frames.size()) < entry_depth)
         return LUA_OK;
       continue;
     }
 
-    Instruction ins = p->code[static_cast<size_t>(fr0.saved_pc++)];
+    // Match PUC vmfetch: advance saved_pc first, then line/count hooks see
+    // currentpc = saved_pc - 1 (the instruction about to run).
+    auto& fr_fetch = th->frames[fi];
+    const int insn_pc = fr_fetch.saved_pc;
+    if (insn_pc >= static_cast<int>(p->code.size()))
+      continue;
+    Instruction ins = p->code[static_cast<size_t>(insn_pc)];
+    fr_fetch.saved_pc = insn_pc + 1;
+    debug_trace_exec(L, th, fi, p, insn_pc);
+    auto& fr1 = th->frames[fi];
+    cl = fr1.cl;
+    p = fr1.proto;
     OpCode op = static_cast<OpCode>(op_get(ins));
     int a = op_a(ins);
     int b = op_b(ins);
@@ -277,7 +332,7 @@ int interpret(State* L) {
       auto& fr = th->frames[fi];
       cl = fr.cl;
       p = fr.proto;
-      L->ensure_stack(fr.base + p->maxstack + fr.nvarargs + 8);
+      L->ensure_stack(fr.base + p->maxstack + static_cast<int>(fr.varargs.size()) + 8);
       // Do not raise th->top to maxstack here: CALL/RETURN MULTRET rely on top
       // marking the end of the variable result range. GC uses thread_live_top().
       return th->stack.data() + fr.base;
@@ -602,11 +657,13 @@ int interpret(State* L) {
     }
     case OpCode::VARARG: {
       auto& fr = th->frames[fi];
-      int nwant = (b == 0) ? fr.nvarargs : (b - 1);
+      const int nvar = static_cast<int>(fr.varargs.size());
+      int nwant = (b == 0) ? nvar : (b - 1);
       L->ensure_stack(fr.base + a + nwant + 8);
+      base = reload();
       for (int i = 0; i < nwant; ++i) {
-        if (i < fr.nvarargs)
-          base[a + i] = th->stack[static_cast<size_t>(fr.vararg_base + i)];
+        if (i < nvar)
+          base[a + i] = fr.varargs[static_cast<size_t>(i)];
         else
           base[a + i] = TValue::nil();
       }
@@ -644,22 +701,31 @@ int interpret(State* L) {
         nargs = 0;
       int nresults = th->frames[fi].expected_results;
       int dest = fbase();
-      TValue f = base[a];
+      int call_base = dest + a;
+      // Snapshot func+args first so close/slide cannot clobber them, and so open
+      // upvalues still see the caller's original locals when closed (PUC order:
+      // close before sliding the new frame into the caller's slots).
+      std::vector<TValue> call_vals(static_cast<size_t>(nargs + 1));
       for (int i = 0; i <= nargs; ++i)
-        th->stack[static_cast<size_t>(dest + i)] = base[a + i];
-      L->ensure_stack(dest + 1 + nargs + 8);
-      th->top = dest + 1 + nargs;
+        call_vals[static_cast<size_t>(i)] = th->stack[static_cast<size_t>(call_base + i)];
+      TValue callee = call_vals[0];
       L->close_upvals(th, dest);
+      L->ensure_stack(dest + 1 + nargs + 8);
+      for (int i = 0; i <= nargs; ++i)
+        th->stack[static_cast<size_t>(dest + i)] = call_vals[static_cast<size_t>(i)];
+      th->top = dest + 1 + nargs;
+      // Proper tail call: replace the frame; no return hook for the caller.
       th->frames.pop_back();
-      if (f.is_function()) {
-        if (f.as_closure()->is_c) {
-          int st = run_c_call(L, f.as_closure(), dest, nargs, nresults);
+      debug_on_return(L, th);
+      if (callee.is_function()) {
+        if (callee.as_closure()->is_c) {
+          int st = run_c_call(L, callee.as_closure(), dest, nargs, nresults, true);
           if (st == LUA_YIELD)
             return LUA_YIELD;
           if (static_cast<int>(th->frames.size()) < entry_depth)
             return LUA_OK;
         } else {
-          push_lua_frame(L, f.as_closure(), dest, nargs, nresults);
+          push_lua_frame(L, callee.as_closure(), dest, nargs, nresults, true);
         }
       } else {
         meta_call(L, dest, nargs, nresults == LUA_MULTRET ? 1 : nresults);
@@ -677,19 +743,23 @@ int interpret(State* L) {
       int dest = fr.base;
       int want = fr.expected_results;
       std::vector<TValue> results(static_cast<size_t>(nret));
+      // Use absolute indices: `base` can be stale after stack reallocation.
       for (int i = 0; i < nret; ++i)
-        results[static_cast<size_t>(i)] = base[a + i];
+        results[static_cast<size_t>(i)] =
+            th->stack[static_cast<size_t>(fr.base + a + i)];
+      debug_return_hook(L, th);
       th->frames.pop_back();
-      if (want == LUA_MULTRET) {
-        for (int i = 0; i < nret; ++i)
-          th->stack[static_cast<size_t>(dest + i)] = results[static_cast<size_t>(i)];
-        L->set_abs_top(dest + nret);
-      } else {
-        for (int i = 0; i < want; ++i)
-          th->stack[static_cast<size_t>(dest + i)] =
-              (i < nret) ? results[static_cast<size_t>(i)] : TValue::nil();
-        L->set_abs_top(dest + want);
-      }
+      debug_on_return(L, th);
+      // Do not use set_abs_top to grow: when top sits low after a 1-result CALL,
+      // growing would nil-fill over the results we are about to (or just) write.
+      int placed = (want == LUA_MULTRET) ? nret : want;
+      if (placed < 0)
+        placed = 0;
+      L->ensure_stack(dest + placed + 8);
+      for (int i = 0; i < placed; ++i)
+        th->stack[static_cast<size_t>(dest + i)] =
+            (i < nret) ? results[static_cast<size_t>(i)] : TValue::nil();
+      th->top = dest + placed;
       if (static_cast<int>(th->frames.size()) < entry_depth)
         return LUA_OK;
       break;

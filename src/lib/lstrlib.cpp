@@ -4,11 +4,17 @@
 #include "lib/lib_util.hpp"
 #include "runtime/closure.hpp"
 #include "vm/interpreter.hpp"
+#include "vm/meta.hpp"
 
 #include <algorithm>
 #include <cctype>
+#include <climits>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -42,19 +48,27 @@ static int str_sub(State* L) {
 }
 
 static int str_rep(State* L) {
-  std::string s(check_string(L, 1)->view());
+  std::string_view s = check_string(L, 1)->view();
   int64_t n = check_int(L, 2);
-  std::string sep = L->gettop() >= 3 ? std::string(check_string(L, 3)->view()) : "";
+  std::string_view sep = L->gettop() >= 3 ? check_string(L, 3)->view() : "";
   if (n <= 0) {
     L->settop(0);
     push_string(L, "");
     return 1;
   }
+  // PUC MAXSIZE (== INT_MAX on LP64). Same overflow guard as luaB_rep.
+  constexpr size_t kMaxSize = static_cast<size_t>((std::numeric_limits<int>::max)());
+  size_t l = s.size();
+  size_t lsep = sep.size();
+  if (l + lsep < l || l + lsep > kMaxSize / static_cast<size_t>(n))
+    panic("resulting string too large");
+  size_t total = static_cast<size_t>(n) * l + (n > 0 ? static_cast<size_t>(n - 1) * lsep : 0);
   std::string out;
+  out.reserve(total);
   for (int64_t i = 0; i < n; ++i) {
     if (i)
-      out += sep;
-    out += s;
+      out.append(sep);
+    out.append(s);
   }
   L->settop(0);
   push_string(L, out);
@@ -89,15 +103,22 @@ static int str_upper(State* L) {
 
 static int str_byte(State* L) {
   std::string_view s = check_string(L, 1)->view();
-  int64_t i = L->gettop() >= 2 ? check_int(L, 2) : 1;
-  int64_t j = L->gettop() >= 3 ? check_int(L, 3) : static_cast<int64_t>(s.size());
-  if (i < 0)
-    i = static_cast<int64_t>(s.size()) + i + 1;
-  if (j < 0)
-    j = static_cast<int64_t>(s.size()) + j + 1;
-  i = std::max<int64_t>(1, i);
-  j = std::min<int64_t>(static_cast<int64_t>(s.size()), j);
+  const int64_t len = static_cast<int64_t>(s.size());
+  auto posrelat = [len](int64_t pos) -> int64_t {
+    if (pos < 0)
+      pos += len + 1;
+    return pos;
+  };
+  // PUC: j defaults to i (not #s) when the 3rd argument is omitted.
+  int64_t i = posrelat(L->gettop() >= 2 ? check_int(L, 2) : 1);
+  int64_t j = posrelat(L->gettop() >= 3 ? check_int(L, 3) : i);
+  if (i < 1)
+    i = 1;
+  if (j > len)
+    j = len;
   L->settop(0);
+  if (i > j)
+    return 0;
   for (int64_t k = i; k <= j; ++k)
     L->push(TValue::integer(static_cast<unsigned char>(s[static_cast<size_t>(k - 1)])));
   return static_cast<int>(j - i + 1);
@@ -115,57 +136,103 @@ static int str_char(State* L) {
 }
 
 static std::string format_quote(const std::string& s) {
+  // PUC addquoted: ", \, and newline → backslash + that byte (newline stays a real LF).
   std::string q = "\"";
-  for (unsigned char c : s) {
-    if (c == '\\' || c == '\"' || c == '\n' || c == '\r') {
+  for (size_t i = 0; i < s.size(); ++i) {
+    unsigned char c = static_cast<unsigned char>(s[i]);
+    if (c == '"' || c == '\\' || c == '\n') {
       q += '\\';
-      if (c == '\n')
-        q += 'n';
-      else if (c == '\r')
-        q += 'r';
-      else
-        q += static_cast<char>(c);
-    } else if (std::isprint(c)) {
       q += static_cast<char>(c);
+    } else if (std::iscntrl(c)) {
+      // Match Lua 5.3: prefer \ddd; keep digit after escapes unambiguous.
+      char buff[8];
+      if (i + 1 < s.size() && std::isdigit(static_cast<unsigned char>(s[i + 1])))
+        std::snprintf(buff, sizeof(buff), "\\%03d", static_cast<int>(c));
+      else
+        std::snprintf(buff, sizeof(buff), "\\%d", static_cast<int>(c));
+      q += buff;
     } else {
-      q += '\\';
-      if (c >= 100)
-        q += static_cast<char>('0' + (c / 100));
-      if (c >= 10)
-        q += static_cast<char>('0' + ((c / 10) % 10));
-      q += static_cast<char>('0' + (c % 10));
+      q += static_cast<char>(c);
     }
   }
   q += '"';
   return q;
 }
 
-static bool format_is_flag(char c) {
-  return c == '-' || c == '+' || c == ' ' || c == '#' || c == '0';
+// PUC num2straux / lua_number2strx: portable %a/%A (MSVC sprintf is too verbose / loses -0).
+static double format_adddigit(char* buff, int n, double x) {
+  double dd = std::floor(x);
+  int d = static_cast<int>(dd);
+  buff[n] = static_cast<char>(d < 10 ? d + '0' : d - 10 + 'a');
+  return x - dd;
 }
 
-static bool format_is_conv(char c) {
-  return c == 'd' || c == 'i' || c == 'u' || c == 'o' || c == 'x' || c == 'X' || c == 'e' ||
-         c == 'E' || c == 'f' || c == 'F' || c == 'g' || c == 'G' || c == 'a' || c == 'A' ||
-         c == 'c' || c == 's' || c == 'p' || c == 'q';
-}
-
-static std::string format_build(const char* spec_start, const char* spec_end, State* L, int& argi) {
-  std::string fmt = "%";
-  for (const char* q = spec_start + 1; q < spec_end - 1; ++q) {
-    if (*q == '*') {
-      int64_t v = check_int(L, argi++);
-      fmt += std::to_string(v);
-    } else {
-      fmt += *q;
+static std::string format_hexfloat(double x, bool upper) {
+  char buff[128];
+  int n = 0;
+  if (x != x || x == HUGE_VAL || x == -HUGE_VAL) {
+    n = std::snprintf(buff, sizeof(buff), "%.14g", x);
+  } else if (x == 0) {
+    // MSVC "%.14g" drops the sign of -0; use signbit explicitly.
+    n = std::snprintf(buff, sizeof(buff), "%s0x0p+0", std::signbit(x) ? "-" : "");
+  } else {
+    int e = 0;
+    double m = std::frexp(x, &e);
+    if (m < 0) {
+      buff[n++] = '-';
+      m = -m;
     }
+    // DBL_MANT_DIG=53 → L_NBFD = ((53-1)%4)+1 = 1
+    constexpr int L_NBFD = ((std::numeric_limits<double>::digits - 1) % 4) + 1;
+    buff[n++] = '0';
+    buff[n++] = 'x';
+    m = format_adddigit(buff, n++, m * static_cast<double>(1 << L_NBFD));
+    e -= L_NBFD;
+    if (m > 0) {
+      buff[n++] = '.';
+      do {
+        m = format_adddigit(buff, n++, m * 16.0);
+      } while (m > 0 && n < 120);
+    }
+    n += std::snprintf(buff + n, sizeof(buff) - static_cast<size_t>(n), "p%+d", e);
   }
-  fmt += spec_end[-1];
-  return fmt;
+  if (n < 0)
+    n = 0;
+  std::string out(buff, static_cast<size_t>(n));
+  if (upper) {
+    for (char& c : out)
+      c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  }
+  return out;
 }
 
-static std::string format_one(const char*& p, const char* end, State* L, int& argi) {
-  const char* spec_start = p;
+// PUC scanformat: flags "-+ #0", width/precision at most 2 digits each.
+static const char* format_scan(const char* strfrmt, const char* end, std::string& form) {
+  static constexpr const char* FLAGS = "-+ #0";
+  const char* p = strfrmt;
+  while (p < end && std::strchr(FLAGS, *p) != nullptr)
+    ++p;
+  if (static_cast<size_t>(p - strfrmt) >= std::strlen(FLAGS) + 1)
+    panic("invalid format (repeated flags)");
+  if (p < end && std::isdigit(static_cast<unsigned char>(*p)))
+    ++p;
+  if (p < end && std::isdigit(static_cast<unsigned char>(*p)))
+    ++p;
+  if (p < end && *p == '.') {
+    ++p;
+    if (p < end && std::isdigit(static_cast<unsigned char>(*p)))
+      ++p;
+    if (p < end && std::isdigit(static_cast<unsigned char>(*p)))
+      ++p;
+  }
+  if (p < end && std::isdigit(static_cast<unsigned char>(*p)))
+    panic("invalid format (width or precision too long)");
+  form.assign("%");
+  form.append(strfrmt, static_cast<size_t>((p - strfrmt) + 1));
+  return p;
+}
+
+static std::string format_one(const char*& p, const char* end, State* L, int& argi, int top) {
   ++p;
   if (p >= end)
     return "%";
@@ -174,92 +241,178 @@ static std::string format_one(const char*& p, const char* end, State* L, int& ar
     return "%";
   }
 
-  while (p < end && format_is_flag(*p))
-    ++p;
-  if (p < end && *p == '*')
-    ++p;
-  else
-    while (p < end && std::isdigit(static_cast<unsigned char>(*p)))
-      ++p;
-  if (p < end && *p == '.') {
-    ++p;
-    if (p < end && *p == '*')
-      ++p;
-    else
-      while (p < end && std::isdigit(static_cast<unsigned char>(*p)))
-        ++p;
-  }
-  while (p < end && (*p == 'h' || *p == 'l' || *p == 'L'))
-    ++p;
+  if (argi > top)
+    panic("no value");
 
-  if (p >= end || !format_is_conv(*p))
-    return std::string(spec_start, p - spec_start);
+  std::string form;
+  p = format_scan(p, end, form);
+  if (p >= end)
+    panic("invalid format");
+  char conv = *p++;
 
-  ++p;
-  const char* spec_end = p;
-  char conv = spec_end[-1];
+  auto snformat = [&](auto arg) -> std::string {
+    int need = std::snprintf(nullptr, 0, form.c_str(), arg);
+    if (need < 0)
+      return {};
+    std::string out(static_cast<size_t>(need) + 1, '\0');
+    std::snprintf(out.data(), out.size(), form.c_str(), arg);
+    out.resize(static_cast<size_t>(need));
+    return out;
+  };
 
   if (conv == 'q') {
-    std::string s = value_to_string(*L->at(argi++));
-    return format_quote(s);
+    const TValue* qv = L->at(argi++);
+    if (qv->is_string())
+      return format_quote(std::string(qv->as_string()->view()));
+    if (qv->is_int()) {
+      int64_t n = qv->as_int();
+      if (n == std::numeric_limits<int64_t>::min()) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "0x%llx", static_cast<unsigned long long>(n));
+        return buf;
+      }
+      return std::to_string(n);
+    }
+    if (qv->is_float())
+      return format_hexfloat(qv->as_float(), false);
+    if (qv->is_nil())
+      return "nil";
+    if (qv->is_bool())
+      return qv->payload ? "true" : "false";
+    panic("value has no literal form");
   }
 
-  std::string fmt = format_build(spec_start, spec_end, L, argi);
   const TValue* val = L->at(argi++);
-  char buf[512];
 
   switch (conv) {
   case 's': {
-    std::string s = value_to_string(*val);
-    std::snprintf(buf, sizeof(buf), fmt.c_str(), s.c_str());
-    return buf;
+    std::string s;
+    if (val->is_string()) {
+      s = std::string(val->as_string()->view());
+    } else {
+      TValue mm = get_metamethod(L, *val, "__tostring");
+      if (mm.is_function()) {
+        int save_top = L->gettop();
+        L->push(mm);
+        L->push(*val);
+        call_closure(L, mm.as_closure(), 1, 1);
+        if (!L->at(L->gettop())->is_string())
+          panic("'__tostring' must return a string");
+        s = std::string(L->at(L->gettop())->as_string()->view());
+        L->settop(save_top);
+      } else {
+        TValue name = get_metamethod(L, *val, "__name");
+        if (name.is_string()) {
+          char buf[128];
+          void* ptr = val->is_table() ? static_cast<void*>(val->as_table())
+                                      : reinterpret_cast<void*>(static_cast<uintptr_t>(val->payload));
+          std::snprintf(buf, sizeof(buf), "%s: %p",
+                        std::string(name.as_string()->view()).c_str(), ptr);
+          s = buf;
+        } else {
+          s = value_to_string(*val);
+        }
+      }
+    }
+    if (form == "%s")
+      return s;
+    if (s.find('\0') != std::string::npos)
+      panic("string contains zeros");
+    // PUC: no precision and long string → keep entire string (avoid %s truncation).
+    if (form.find('.') == std::string::npos && s.size() >= 100)
+      return s;
+    return snformat(s.c_str());
   }
   case 'c': {
-    int ch = val->is_number() ? static_cast<int>(val->to_number()) & 0xFF : 0;
-    std::snprintf(buf, sizeof(buf), fmt.c_str(), ch);
-    return buf;
+    int64_t n = 0;
+    if (val->is_int())
+      n = val->as_int();
+    else if (val->is_number())
+      n = static_cast<int64_t>(val->to_number());
+    else
+      panic("number expected");
+    return snformat(static_cast<int>(n));
   }
   case 'd':
-  case 'i':
-    std::snprintf(buf, sizeof(buf), fmt.c_str(),
-                  static_cast<long long>(val->is_number() ? static_cast<int64_t>(val->to_number()) : 0));
-    return buf;
+  case 'i': {
+    std::string f64 = form;
+    f64.insert(f64.size() - 1, "ll");
+    int64_t n = 0;
+    if (val->is_int())
+      n = val->as_int();
+    else if (val->is_number())
+      n = static_cast<int64_t>(val->to_number());
+    else
+      panic("number has no integer representation");
+    int need = std::snprintf(nullptr, 0, f64.c_str(), static_cast<long long>(n));
+    std::string out(static_cast<size_t>(need) + 1, '\0');
+    std::snprintf(out.data(), out.size(), f64.c_str(), static_cast<long long>(n));
+    out.resize(static_cast<size_t>(need));
+    return out;
+  }
   case 'u':
   case 'o':
   case 'x':
-  case 'X':
-    std::snprintf(buf, sizeof(buf), fmt.c_str(),
-                  static_cast<unsigned long long>(val->is_number()
-                                                      ? static_cast<uint64_t>(val->to_number())
-                                                      : 0));
-    return buf;
+  case 'X': {
+    std::string f64 = form;
+    f64.insert(f64.size() - 1, "ll");
+    uint64_t n = 0;
+    if (val->is_int())
+      n = static_cast<uint64_t>(val->as_int());
+    else if (val->is_number())
+      n = static_cast<uint64_t>(val->to_number());
+    else
+      panic("number has no integer representation");
+    int need = std::snprintf(nullptr, 0, f64.c_str(), static_cast<unsigned long long>(n));
+    std::string out(static_cast<size_t>(need) + 1, '\0');
+    std::snprintf(out.data(), out.size(), f64.c_str(), static_cast<unsigned long long>(n));
+    out.resize(static_cast<size_t>(need));
+    return out;
+  }
+  case 'a':
+  case 'A':
+    if (form != "%a" && form != "%A")
+      panic("modifiers for format '%a'/'%A' not implemented");
+    if (!val->is_number())
+      panic("number expected");
+    return format_hexfloat(val->to_number(), conv == 'A');
   case 'f':
-  case 'F':
   case 'e':
   case 'E':
   case 'g':
   case 'G':
-  case 'a':
-  case 'A':
-    std::snprintf(buf, sizeof(buf), fmt.c_str(), val->is_number() ? val->to_number() : 0.0);
-    return buf;
-  case 'p':
-    std::snprintf(buf, sizeof(buf), fmt.c_str(), static_cast<void*>(nullptr));
-    return buf;
+    if (!val->is_number())
+      panic("number expected");
+    return snformat(val->to_number());
+  case 'p': {
+    void* ptr = nullptr;
+    if (val->is_table())
+      ptr = val->as_table();
+    else if (val->is_function())
+      ptr = val->as_closure();
+    else if (val->is_userdata())
+      ptr = val->as_userdata();
+    else if (val->is_thread())
+      ptr = val->as_thread();
+    else if (val->is_string())
+      ptr = val->as_string();
+    return snformat(ptr);
+  }
   default:
-    return std::string(spec_start, spec_end - spec_start);
+    panic(std::string("invalid option '%") + conv + "' to 'format'");
   }
 }
 
 static int str_format(State* L) {
   std::string_view fmt = check_string(L, 1)->view();
+  int top = L->gettop();
   int argi = 2;
   std::string out;
   const char* p = fmt.data();
   const char* end = p + fmt.size();
   while (p < end) {
     if (*p == '%') {
-      out += format_one(p, end, L, argi);
+      out += format_one(p, end, L, argi, top);
     } else {
       out += *p++;
     }
@@ -729,17 +882,26 @@ static int str_gsub(State* L) {
   return 2;
 }
 
+static UpVal* make_closed_upval(State* L, const TValue& v) {
+  auto* uv = L->gc.create<UpVal>(GcKind::UpVal);
+  uv->open = false;
+  uv->closed = v;
+  uv->thread = nullptr;
+  uv->stack_index = -1;
+  return uv;
+}
+
+// PUC-style gmatch: one C closure with upvalues (s, pattern, position).
 static int gmatch_iter(State* L) {
-  // args: state(table {s, pat, pos}), _control (ignored; pos lives in state[3])
-  if (!L->at(1)->is_table()) {
+  Closure* cl = L->current->frames.empty() ? nullptr : L->current->frames.back().cl;
+  if (!cl || cl->upvals.size() < 3 || !cl->upvals[0] || !cl->upvals[1] || !cl->upvals[2]) {
     L->settop(0);
     L->push(TValue::nil());
     return 1;
   }
-  Table* st = L->at(1)->as_table();
-  TValue sv = st->get_int(1);
-  TValue pv = st->get_int(2);
-  TValue iv = st->get_int(3);
+  TValue sv = cl->upvals[0]->get();
+  TValue pv = cl->upvals[1]->get();
+  TValue iv = cl->upvals[2]->get();
   if (!sv.is_string() || !pv.is_string()) {
     L->settop(0);
     L->push(TValue::nil());
@@ -759,7 +921,7 @@ static int gmatch_iter(State* L) {
   size_t next = ms.match_end;
   if (next == ms.match_start)
     next = ms.match_start + 1;
-  st->set(L, TValue::integer(3), TValue::integer(static_cast<int64_t>(next)));
+  cl->upvals[2]->set(L, TValue::integer(static_cast<int64_t>(next)));
   L->settop(0);
   if (ms.captures.empty()) {
     push_string(L, std::string(ms.s.substr(ms.match_start, ms.match_end - ms.match_start)));
@@ -776,52 +938,261 @@ static int gmatch_iter(State* L) {
 }
 
 static int str_gmatch(State* L) {
-  std::string s(check_string(L, 1)->view());
-  std::string_view pat = check_string(L, 2)->view();
-  Table* st = L->gc.create<Table>(GcKind::Table);
-  st->set(L, TValue::integer(1), TValue::obj(ValueTag::String, L->intern(s)));
-  st->set(L, TValue::integer(2), TValue::obj(ValueTag::String, L->intern(std::string(pat))));
-  st->set(L, TValue::integer(3), TValue::integer(0));
-  L->settop(0);
-  L->push(TValue::obj(ValueTag::Function, closure_new_c(L, gmatch_iter)));
-  L->push(TValue::obj(ValueTag::Table, st));
+  check_string(L, 1);
+  check_string(L, 2);
+  // Keep s and pattern on the stack, then push initial position — same as PUC.
+  L->settop(2);
   L->push(TValue::integer(0));
-  return 3;
-}
-
-static int str_packsize(State* L) {
-  std::string_view fmt = check_string(L, 1)->view();
-  size_t sz = 0;
-  for (char c : fmt) {
-    if (c == 'j' || c == 'J')
-      sz += 8;
-    else if (c == 'n')
-      sz += sizeof(double);
-    else if (c == 'i' || c == 'I')
-      sz += 4;
-    else if (c == 'c')
-      sz += 1;
-  }
+  Closure* cl = closure_new_c(L, gmatch_iter);
+  cl->upvals.resize(3);
+  cl->upvals[0] = make_closed_upval(L, *L->at(1));
+  cl->upvals[1] = make_closed_upval(L, *L->at(2));
+  cl->upvals[2] = make_closed_upval(L, *L->at(3));
   L->settop(0);
-  L->push(TValue::integer(static_cast<int64_t>(sz)));
+  L->push(TValue::obj(ValueTag::Function, cl));
   return 1;
 }
 
+// --- string.pack / packsize / unpack (Lua 5.3) ---
+
+constexpr int kMaxIntSize = 16;
+constexpr char kPackPad = '\0';
+
+struct PackHeader {
+  bool islittle = true;
+  int maxalign = 1;
+};
+
+enum class PackOpt { Int, UInt, Float, Char, String, ZStr, Padding, PadAlign, Nop };
+
+static bool native_little() {
+  const union {
+    uint16_t u;
+    uint8_t c[2];
+  } x = {1};
+  return x.c[0] == 1;
+}
+
+static int pack_maxalign() {
+  struct CD {
+    char c;
+    union {
+      double d;
+      void* p;
+      int64_t i;
+    } u;
+  };
+  return static_cast<int>(offsetof(CD, u));
+}
+
+static int getnum(const char*& fmt, int df) {
+  if (*fmt < '0' || *fmt > '9')
+    return df;
+  int a = 0;
+  do {
+    a = a * 10 + (*fmt++ - '0');
+  } while (*fmt >= '0' && *fmt <= '9' && a <= (std::numeric_limits<int>::max() - 9) / 10);
+  return a;
+}
+
+static int getnumlimit(const char*& fmt, int df) {
+  int sz = getnum(fmt, df);
+  if (sz > kMaxIntSize || sz <= 0)
+    panic("integral size out of limits [1,16]");
+  return sz;
+}
+
+static PackOpt getoption(PackHeader& h, const char*& fmt, int& size) {
+  int opt = static_cast<unsigned char>(*fmt++);
+  size = 0;
+  switch (opt) {
+  case 'b': size = 1; return PackOpt::Int;
+  case 'B': size = 1; return PackOpt::UInt;
+  case 'h': size = static_cast<int>(sizeof(short)); return PackOpt::Int;
+  case 'H': size = static_cast<int>(sizeof(short)); return PackOpt::UInt;
+  case 'l': size = static_cast<int>(sizeof(long)); return PackOpt::Int;
+  case 'L': size = static_cast<int>(sizeof(long)); return PackOpt::UInt;
+  case 'j': size = static_cast<int>(sizeof(int64_t)); return PackOpt::Int;
+  case 'J': size = static_cast<int>(sizeof(int64_t)); return PackOpt::UInt;
+  case 'T': size = static_cast<int>(sizeof(size_t)); return PackOpt::UInt;
+  case 'f': size = static_cast<int>(sizeof(float)); return PackOpt::Float;
+  case 'd': size = static_cast<int>(sizeof(double)); return PackOpt::Float;
+  case 'n': size = static_cast<int>(sizeof(double)); return PackOpt::Float;
+  case 'i': size = getnumlimit(fmt, static_cast<int>(sizeof(int))); return PackOpt::Int;
+  case 'I': size = getnumlimit(fmt, static_cast<int>(sizeof(int))); return PackOpt::UInt;
+  case 's': size = getnumlimit(fmt, static_cast<int>(sizeof(size_t))); return PackOpt::String;
+  case 'c':
+    size = getnum(fmt, -1);
+    if (size == -1)
+      panic("missing size for format option 'c'");
+    return PackOpt::Char;
+  case 'z': return PackOpt::ZStr;
+  case 'x': size = 1; return PackOpt::Padding;
+  case 'X': return PackOpt::PadAlign;
+  case ' ': break;
+  case '<': h.islittle = true; break;
+  case '>': h.islittle = false; break;
+  case '=': h.islittle = native_little(); break;
+  case '!': h.maxalign = getnumlimit(fmt, pack_maxalign()); break;
+  default: panic(std::string("invalid format option '") + static_cast<char>(opt) + "'");
+  }
+  return PackOpt::Nop;
+}
+
+static PackOpt getdetails(PackHeader& h, size_t totalsize, const char*& fmt, int& psize,
+                          int& ntoalign) {
+  PackOpt opt = getoption(h, fmt, psize);
+  int align = psize;
+  if (opt == PackOpt::PadAlign) {
+    if (*fmt == '\0')
+      panic("invalid next option for option 'X'");
+    PackOpt next = getoption(h, fmt, align);
+    if (next == PackOpt::Char || align == 0)
+      panic("invalid next option for option 'X'");
+  }
+  if (align <= 1 || opt == PackOpt::Char) {
+    ntoalign = 0;
+  } else {
+    if (align > h.maxalign)
+      align = h.maxalign;
+    if ((align & (align - 1)) != 0)
+      panic("format asks for alignment not power of 2");
+    ntoalign = (align - static_cast<int>(totalsize & static_cast<size_t>(align - 1))) & (align - 1);
+  }
+  return opt;
+}
+
+static void packint(std::string& out, uint64_t n, bool islittle, int size, bool neg) {
+  size_t base = out.size();
+  out.append(static_cast<size_t>(size), '\0');
+  out[base + (islittle ? 0 : static_cast<size_t>(size - 1))] = static_cast<char>(n & 0xFF);
+  for (int i = 1; i < size; ++i) {
+    n >>= 8;
+    out[base + (islittle ? static_cast<size_t>(i) : static_cast<size_t>(size - 1 - i))] =
+        static_cast<char>(n & 0xFF);
+  }
+  if (neg && size > static_cast<int>(sizeof(int64_t))) {
+    for (int i = static_cast<int>(sizeof(int64_t)); i < size; ++i)
+      out[base + (islittle ? static_cast<size_t>(i) : static_cast<size_t>(size - 1 - i))] =
+          static_cast<char>(0xFF);
+  }
+}
+
+static void copy_endian(char* dest, const char* src, int size, bool islittle) {
+  if (islittle == native_little()) {
+    std::memcpy(dest, src, static_cast<size_t>(size));
+  } else {
+    for (int i = 0; i < size; ++i)
+      dest[i] = src[size - 1 - i];
+  }
+}
+
+static int64_t unpackint(const char* str, bool islittle, int size, bool issigned) {
+  uint64_t res = 0;
+  int limit = (size <= static_cast<int>(sizeof(int64_t))) ? size : static_cast<int>(sizeof(int64_t));
+  for (int i = limit - 1; i >= 0; --i) {
+    res <<= 8;
+    res |= static_cast<uint64_t>(static_cast<unsigned char>(str[islittle ? i : size - 1 - i]));
+  }
+  if (size < static_cast<int>(sizeof(int64_t))) {
+    if (issigned) {
+      uint64_t mask = uint64_t{1} << (size * 8 - 1);
+      res = (res ^ mask) - mask;
+    }
+  } else if (size > static_cast<int>(sizeof(int64_t))) {
+    int mask = (!issigned || static_cast<int64_t>(res) >= 0) ? 0 : 0xFF;
+    for (int i = limit; i < size; ++i) {
+      if (static_cast<unsigned char>(str[islittle ? i : size - 1 - i]) != mask)
+        panic(std::to_string(size) + "-byte integer does not fit into Lua Integer");
+    }
+  }
+  return static_cast<int64_t>(res);
+}
+
 static int str_pack(State* L) {
-  std::string_view fmt = check_string(L, 1)->view();
+  const char* fmt = check_string(L, 1)->view().data();
+  PackHeader h;
+  h.islittle = native_little();
+  h.maxalign = 1;
   std::string out;
-  int arg = 2;
-  for (char c : fmt) {
-    if (c == 'j' || c == 'J') {
-      int64_t v = check_int(L, arg++);
-      for (int i = 0; i < 8; ++i)
-        out.push_back(static_cast<char>((v >> (i * 8)) & 0xFF));
-    } else if (c == 'n') {
-      double v = check_number(L, arg++);
-      uint64_t bits;
-      std::memcpy(&bits, &v, sizeof(v));
-      for (int i = 0; i < 8; ++i)
-        out.push_back(static_cast<char>((bits >> (i * 8)) & 0xFF));
+  size_t totalsize = 0;
+  int arg = 1;
+  while (*fmt != '\0') {
+    int size = 0, ntoalign = 0;
+    PackOpt opt = getdetails(h, totalsize, fmt, size, ntoalign);
+    totalsize += static_cast<size_t>(ntoalign + size);
+    while (ntoalign-- > 0)
+      out.push_back(kPackPad);
+    ++arg;
+    switch (opt) {
+    case PackOpt::Int: {
+      int64_t n = check_int(L, arg);
+      if (size < static_cast<int>(sizeof(int64_t))) {
+        int64_t lim = int64_t{1} << (size * 8 - 1);
+        if (n < -lim || n >= lim)
+          panic("integer overflow");
+      }
+      packint(out, static_cast<uint64_t>(n), h.islittle, size, n < 0);
+      break;
+    }
+    case PackOpt::UInt: {
+      int64_t n = check_int(L, arg);
+      if (size < static_cast<int>(sizeof(int64_t))) {
+        uint64_t umax = (uint64_t{1} << (size * 8)) - 1;
+        if (static_cast<uint64_t>(n) > umax)
+          panic("unsigned overflow");
+      }
+      packint(out, static_cast<uint64_t>(n), h.islittle, size, false);
+      break;
+    }
+    case PackOpt::Float: {
+      double n = check_number(L, arg);
+      char buff[16]{};
+      if (size == static_cast<int>(sizeof(float))) {
+        float f = static_cast<float>(n);
+        std::memcpy(buff, &f, sizeof(f));
+      } else {
+        std::memcpy(buff, &n, sizeof(n));
+      }
+      size_t base = out.size();
+      out.append(static_cast<size_t>(size), '\0');
+      copy_endian(out.data() + base, buff, size, h.islittle);
+      break;
+    }
+    case PackOpt::Char: {
+      std::string_view s = check_string(L, arg)->view();
+      if (s.size() > static_cast<size_t>(size))
+        panic("string longer than given size");
+      out.append(s);
+      out.append(static_cast<size_t>(size) - s.size(), kPackPad);
+      break;
+    }
+    case PackOpt::String: {
+      std::string_view s = check_string(L, arg)->view();
+      if (size < static_cast<int>(sizeof(size_t)) &&
+          s.size() >= (size_t{1} << (size * 8)))
+        panic("string length does not fit in given size");
+      packint(out, static_cast<uint64_t>(s.size()), h.islittle, size, false);
+      out.append(s);
+      totalsize += s.size();
+      break;
+    }
+    case PackOpt::ZStr: {
+      std::string_view s = check_string(L, arg)->view();
+      if (s.find('\0') != std::string_view::npos)
+        panic("string contains zeros");
+      out.append(s);
+      out.push_back('\0');
+      totalsize += s.size() + 1;
+      break;
+    }
+    case PackOpt::Padding:
+      out.push_back(kPackPad);
+      // fallthrough
+    case PackOpt::PadAlign:
+    case PackOpt::Nop:
+      --arg;
+      break;
     }
   }
   L->settop(0);
@@ -829,28 +1200,96 @@ static int str_pack(State* L) {
   return 1;
 }
 
-static int str_unpack(State* L) {
-  std::string_view fmt = check_string(L, 1)->view();
-  std::string_view data = check_string(L, 2)->view();
-  size_t pos = L->gettop() >= 3 ? static_cast<size_t>(check_int(L, 3) - 1) : 0;
+static int str_packsize(State* L) {
+  const char* fmt = check_string(L, 1)->view().data();
+  PackHeader h;
+  h.islittle = native_little();
+  h.maxalign = 1;
+  size_t totalsize = 0;
+  while (*fmt != '\0') {
+    int size = 0, ntoalign = 0;
+    PackOpt opt = getdetails(h, totalsize, fmt, size, ntoalign);
+    size += ntoalign;
+    totalsize += static_cast<size_t>(size);
+    if (opt == PackOpt::String || opt == PackOpt::ZStr)
+      panic("variable-length format");
+  }
   L->settop(0);
-  for (char c : fmt) {
-    if (c == 'j' || c == 'J') {
-      int64_t v = 0;
-      for (int i = 0; i < 8 && pos < data.size(); ++i)
-        v |= static_cast<int64_t>(static_cast<unsigned char>(data[pos++])) << (i * 8);
-      L->push(TValue::integer(v));
-    } else if (c == 'n') {
-      uint64_t bits = 0;
-      for (int i = 0; i < 8 && pos < data.size(); ++i)
-        bits |= static_cast<uint64_t>(static_cast<unsigned char>(data[pos++])) << (i * 8);
-      double v;
-      std::memcpy(&v, &bits, sizeof(v));
-      L->push(TValue::number(v));
+  L->push(TValue::integer(static_cast<int64_t>(totalsize)));
+  return 1;
+}
+
+static int str_unpack(State* L) {
+  const char* fmt = check_string(L, 1)->view().data();
+  std::string_view data = check_string(L, 2)->view();
+  int64_t ipos = L->gettop() >= 3 ? check_int(L, 3) : 1;
+  if (ipos < 0)
+    ipos = static_cast<int64_t>(data.size()) + ipos + 1;
+  if (ipos < 1)
+    ipos = 1;
+  size_t pos = static_cast<size_t>(ipos - 1);
+  if (pos > data.size())
+    panic("initial position out of string");
+  PackHeader h;
+  h.islittle = native_little();
+  h.maxalign = 1;
+  L->settop(0);
+  int n = 0;
+  while (*fmt != '\0') {
+    int size = 0, ntoalign = 0;
+    PackOpt opt = getdetails(h, pos, fmt, size, ntoalign);
+    if (pos + static_cast<size_t>(ntoalign) + static_cast<size_t>(size) > data.size())
+      panic("data string too short");
+    pos += static_cast<size_t>(ntoalign);
+    ++n;
+    switch (opt) {
+    case PackOpt::Int:
+    case PackOpt::UInt: {
+      int64_t res = unpackint(data.data() + pos, h.islittle, size, opt == PackOpt::Int);
+      L->push(TValue::integer(res));
+      break;
     }
+    case PackOpt::Float: {
+      char buff[16]{};
+      copy_endian(buff, data.data() + pos, size, h.islittle);
+      if (size == static_cast<int>(sizeof(float))) {
+        float f;
+        std::memcpy(&f, buff, sizeof(f));
+        L->push(TValue::number(static_cast<double>(f)));
+      } else {
+        double d;
+        std::memcpy(&d, buff, sizeof(d));
+        L->push(TValue::number(d));
+      }
+      break;
+    }
+    case PackOpt::Char:
+      push_string(L, data.substr(pos, static_cast<size_t>(size)));
+      break;
+    case PackOpt::String: {
+      size_t len = static_cast<size_t>(unpackint(data.data() + pos, h.islittle, size, false));
+      if (pos + static_cast<size_t>(size) + len > data.size())
+        panic("data string too short");
+      push_string(L, data.substr(pos + static_cast<size_t>(size), len));
+      pos += len;
+      break;
+    }
+    case PackOpt::ZStr: {
+      size_t len = std::strlen(data.data() + pos);
+      push_string(L, data.substr(pos, len));
+      pos += len + 1;
+      break;
+    }
+    case PackOpt::PadAlign:
+    case PackOpt::Padding:
+    case PackOpt::Nop:
+      --n;
+      break;
+    }
+    pos += static_cast<size_t>(size);
   }
   L->push(TValue::integer(static_cast<int64_t>(pos + 1)));
-  return L->gettop();
+  return n + 1;
 }
 
 void open_string_lib(State* L) {
@@ -873,6 +1312,12 @@ void open_string_lib(State* L) {
   set_field(L, str, "unpack", str_unpack);
   set_field(L, str, "packsize", str_packsize);
   set_global_value(L, "string", TValue::obj(ValueTag::Table, str));
+
+  // PUC createmetatable: string methods via ("..."):sub(...)
+  Table* mt = table_new(L, 0, 1);
+  mt->set(L, TValue::obj(ValueTag::String, L->intern("__index")),
+          TValue::obj(ValueTag::Table, str));
+  L->type_mt[static_cast<size_t>(ValueTag::String)] = mt;
 }
 
 } // namespace lj3

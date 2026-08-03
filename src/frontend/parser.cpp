@@ -2,6 +2,17 @@
 
 namespace lj3 {
 
+namespace {
+
+template <typename T, typename... Args>
+std::unique_ptr<T> make_at(int line, Args&&... args) {
+  auto n = std::make_unique<T>(std::forward<Args>(args)...);
+  n->line = line;
+  return n;
+}
+
+} // namespace
+
 Parser::Parser(Lexer lex) : lex_(std::move(lex)) {}
 
 Token Parser::peek() {
@@ -92,13 +103,16 @@ AstPtr Parser::parse_stmt() {
     do {
       IfStmt::Branch br;
       br.cond = parse_expr();
-      expect(TokenKind::KwThen, "expected 'then'");
+      br.then_line = expect(TokenKind::KwThen, "expected 'then'").line;
       br.body = parse_block();
       s->branches.push_back(std::move(br));
     } while (match(TokenKind::KwElseif));
-    if (match(TokenKind::KwElse))
+    if (check(TokenKind::KwElse)) {
+      s->else_line = peek().line;
+      next();
       s->else_body = parse_block();
-    expect(TokenKind::KwEnd, "expected 'end'");
+    }
+    s->end_line = expect(TokenKind::KwEnd, "expected 'end'").line;
     return s;
   }
   if (match(TokenKind::KwWhile)) {
@@ -107,7 +121,7 @@ AstPtr Parser::parse_stmt() {
     s->cond = parse_expr();
     expect(TokenKind::KwDo, "expected 'do'");
     s->body = parse_block();
-    expect(TokenKind::KwEnd, "expected 'end'");
+    s->end_line = expect(TokenKind::KwEnd, "expected 'end'").line;
     return s;
   }
   if (match(TokenKind::KwRepeat)) {
@@ -131,7 +145,7 @@ AstPtr Parser::parse_stmt() {
         s->step = parse_expr();
       expect(TokenKind::KwDo, "expected 'do'");
       s->body = parse_block();
-      expect(TokenKind::KwEnd, "expected 'end'");
+      s->end_line = expect(TokenKind::KwEnd, "expected 'end'").line;
       return s;
     }
     auto s = std::make_unique<ForIn>();
@@ -143,7 +157,7 @@ AstPtr Parser::parse_stmt() {
     s->iters = parse_expr_list();
     expect(TokenKind::KwDo, "expected 'do'");
     s->body = parse_block();
-    expect(TokenKind::KwEnd, "expected 'end'");
+    s->end_line = expect(TokenKind::KwEnd, "expected 'end'").line;
     return s;
   }
   if (match(TokenKind::KwDo)) {
@@ -260,8 +274,10 @@ ExprPtr Parser::parse_expr() { return parse_or(); }
 
 ExprPtr Parser::parse_or() {
   auto e = parse_and();
-  while (match(TokenKind::KwOr)) {
-    auto n = std::make_unique<ExprBin>();
+  while (check(TokenKind::KwOr)) {
+    int line = peek().line;
+    next();
+    auto n = make_at<ExprBin>(e->line > 0 ? e->line : line);
     n->op = BinOp::Or;
     n->lhs = std::move(e);
     n->rhs = parse_and();
@@ -271,8 +287,10 @@ ExprPtr Parser::parse_or() {
 }
 ExprPtr Parser::parse_and() {
   auto e = parse_compare();
-  while (match(TokenKind::KwAnd)) {
-    auto n = std::make_unique<ExprBin>();
+  while (check(TokenKind::KwAnd)) {
+    int line = peek().line;
+    next();
+    auto n = make_at<ExprBin>(e->line > 0 ? e->line : line);
     n->op = BinOp::And;
     n->lhs = std::move(e);
     n->rhs = parse_compare();
@@ -423,8 +441,9 @@ ExprPtr Parser::parse_unary() {
   else
     is_un = false;
   if (is_un) {
+    int line = peek().line;
     next();
-    auto n = std::make_unique<ExprUn>();
+    auto n = make_at<ExprUn>(line);
     n->op = op;
     n->operand = parse_unary();
     return n;
@@ -432,8 +451,14 @@ ExprPtr Parser::parse_unary() {
   return parse_power();
 }
 ExprPtr Parser::parse_power() {
+  // PUC simpleexp: only NAME / '(' exp ')' / '...' go through suffixedexp.
+  // Literals (nil/true/false/number/string), constructors, and function
+  // definitions do not — so `a = nil\n(function()end)()` is two statements.
+  const bool allow_suffix = check(TokenKind::Identifier) || check(TokenKind::LParen) ||
+                            check(TokenKind::DotDotDot);
   auto e = parse_primary();
-  e = parse_suffix(std::move(e));
+  if (allow_suffix)
+    e = parse_suffix(std::move(e));
   if (match(TokenKind::Caret)) {
     auto n = std::make_unique<ExprBin>();
     n->op = BinOp::Pow;
@@ -446,19 +471,25 @@ ExprPtr Parser::parse_power() {
 
 ExprPtr Parser::parse_suffix(ExprPtr e) {
   for (;;) {
-    if (match(TokenKind::Dot)) {
-      auto n = std::make_unique<ExprField>();
+    if (check(TokenKind::Dot)) {
+      int line = peek().line;
+      next();
+      auto n = make_at<ExprField>(e->line > 0 ? e->line : line);
       n->table = std::move(e);
       n->field = expect(TokenKind::Identifier, "expected field").text;
       e = std::move(n);
-    } else if (match(TokenKind::LBracket)) {
-      auto n = std::make_unique<ExprIndex>();
+    } else if (check(TokenKind::LBracket)) {
+      int line = peek().line;
+      next();
+      auto n = make_at<ExprIndex>(e->line > 0 ? e->line : line);
       n->table = std::move(e);
       n->key = parse_expr();
       expect(TokenKind::RBracket, "expected ']'");
       e = std::move(n);
-    } else if (match(TokenKind::Colon)) {
-      auto n = std::make_unique<ExprCall>();
+    } else if (check(TokenKind::Colon)) {
+      int line = peek().line;
+      next();
+      auto n = make_at<ExprCall>(e->line > 0 ? e->line : line);
       n->is_method = true;
       n->method = expect(TokenKind::Identifier, "expected method").text;
       n->callee = std::move(e);
@@ -468,26 +499,28 @@ ExprPtr Parser::parse_suffix(ExprPtr e) {
         expect(TokenKind::RParen, "expected ')'");
       } else if (check(TokenKind::String)) {
         auto t = next();
-        n->args.push_back(std::make_unique<ExprString>(t.text));
+        n->args.push_back(make_at<ExprString>(t.line, t.text));
       } else if (check(TokenKind::LBrace)) {
         n->args.push_back(parse_table());
       } else {
         error("expected method arguments");
       }
       e = std::move(n);
-    } else if (match(TokenKind::LParen)) {
-      auto n = std::make_unique<ExprCall>();
+    } else if (check(TokenKind::LParen)) {
+      int line = peek().line;
+      next();
+      auto n = make_at<ExprCall>(e->line > 0 ? e->line : line);
       n->callee = std::move(e);
       if (!check(TokenKind::RParen))
         n->args = parse_expr_list();
       expect(TokenKind::RParen, "expected ')'");
       e = std::move(n);
     } else if (check(TokenKind::String) || check(TokenKind::LBrace)) {
-      auto n = std::make_unique<ExprCall>();
+      auto n = make_at<ExprCall>(e->line);
       n->callee = std::move(e);
       if (check(TokenKind::String)) {
         auto t = next();
-        n->args.push_back(std::make_unique<ExprString>(t.text));
+        n->args.push_back(make_at<ExprString>(t.line, t.text));
       } else {
         n->args.push_back(parse_table());
       }
@@ -500,34 +533,49 @@ ExprPtr Parser::parse_suffix(ExprPtr e) {
 }
 
 ExprPtr Parser::parse_primary() {
-  if (match(TokenKind::KwNil))
-    return std::make_unique<ExprNil>();
-  if (match(TokenKind::KwTrue))
-    return std::make_unique<ExprBool>(true);
-  if (match(TokenKind::KwFalse))
-    return std::make_unique<ExprBool>(false);
+  if (check(TokenKind::KwNil)) {
+    int line = peek().line;
+    next();
+    return make_at<ExprNil>(line);
+  }
+  if (check(TokenKind::KwTrue)) {
+    int line = peek().line;
+    next();
+    return make_at<ExprBool>(line, true);
+  }
+  if (check(TokenKind::KwFalse)) {
+    int line = peek().line;
+    next();
+    return make_at<ExprBool>(line, false);
+  }
   if (check(TokenKind::Integer)) {
     auto t = next();
-    return std::make_unique<ExprInt>(t.integer);
+    return make_at<ExprInt>(t.line, t.integer);
   }
   if (check(TokenKind::Number)) {
     auto t = next();
-    return std::make_unique<ExprFloat>(t.number);
+    return make_at<ExprFloat>(t.line, t.number);
   }
   if (check(TokenKind::String)) {
     auto t = next();
-    return std::make_unique<ExprString>(t.text);
+    return make_at<ExprString>(t.line, t.text);
   }
-  if (match(TokenKind::DotDotDot))
-    return std::make_unique<ExprVararg>();
+  if (check(TokenKind::DotDotDot)) {
+    int line = peek().line;
+    next();
+    return make_at<ExprVararg>(line);
+  }
   if (check(TokenKind::Identifier)) {
     auto t = next();
-    return std::make_unique<ExprName>(t.text);
+    return make_at<ExprName>(t.line, t.text);
   }
-  if (match(TokenKind::LParen)) {
+  if (check(TokenKind::LParen)) {
+    int line = peek().line;
+    next();
     auto e = parse_expr();
     expect(TokenKind::RParen, "expected ')'");
-    return std::make_unique<ExprParen>(std::move(e));
+    auto p = make_at<ExprParen>(line, std::move(e));
+    return p;
   }
   if (check(TokenKind::LBrace))
     return parse_table();
@@ -536,12 +584,13 @@ ExprPtr Parser::parse_primary() {
     match(TokenKind::KwFunction);
     return parse_function_body(fl);
   }
-  error("unexpected token in expression");
+  error("unexpected symbol");
 }
 
 ExprPtr Parser::parse_table() {
+  int line = peek().line;
   expect(TokenKind::LBrace, "expected '{'");
-  auto tab = std::make_unique<ExprTable>();
+  auto tab = make_at<ExprTable>(line);
   while (!check(TokenKind::RBrace) && !check(TokenKind::End)) {
     ExprTable::Field f;
     if (match(TokenKind::LBracket)) {

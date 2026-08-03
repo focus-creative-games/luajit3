@@ -1,10 +1,25 @@
 #include "frontend/lexer.hpp"
 
 #include <cctype>
+#include <clocale>
+#include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <unordered_map>
 
 namespace lj3 {
+
+// Source numerals always use '.'; strtod would honor LC_NUMERIC otherwise.
+static double c_strtod(const char* s, char** end) {
+  std::string saved;
+  if (const char* cur = std::setlocale(LC_NUMERIC, nullptr))
+    saved = cur;
+  std::setlocale(LC_NUMERIC, "C");
+  double d = std::strtod(s, end);
+  if (!saved.empty())
+    std::setlocale(LC_NUMERIC, saved.c_str());
+  return d;
+}
 
 const char* token_name(TokenKind k) {
   switch (k) {
@@ -55,12 +70,9 @@ char Lexer::get() {
   if (pos_ >= src_.size())
     return '\0';
   char c = src_[pos_++];
-  if (c == '\n') {
-    line_++;
-    col_ = 1;
-  } else {
+  // Newlines update line via incline(); here only advance column for non-newlines.
+  if (c != '\n' && c != '\r')
     col_++;
-  }
   return c;
 }
 
@@ -72,11 +84,28 @@ bool Lexer::match(char c) {
   return false;
 }
 
+bool Lexer::curr_is_newline() const {
+  char c = peek_char();
+  return c == '\n' || c == '\r';
+}
+
+void Lexer::incline() {
+  char old = get();
+  if (curr_is_newline() && peek_char() != old)
+    get(); // skip \n\r or \r\n
+  line_++;
+  col_ = 1;
+}
+
 void Lexer::skip_whitespace_and_comments() {
   for (;;) {
     char c = peek_char();
-    if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' || c == '\v') {
+    if (c == ' ' || c == '\t' || c == '\f' || c == '\v') {
       get();
+      continue;
+    }
+    if (curr_is_newline()) {
+      incline();
       continue;
     }
     if (c == '-' && peek_char(1) == '-') {
@@ -92,9 +121,13 @@ void Lexer::skip_whitespace_and_comments() {
         if (peek_char() == '[') {
           get();
           for (;;) {
-            char d = get();
-            if (d == '\0')
+            if (eos())
               panic("unfinished long comment");
+            if (curr_is_newline()) {
+              incline();
+              continue;
+            }
+            char d = get();
             if (d == ']') {
               int lvl = 0;
               while (peek_char() == '=') {
@@ -108,7 +141,8 @@ void Lexer::skip_whitespace_and_comments() {
           continue;
         }
       }
-      while (peek_char() && peek_char() != '\n')
+      // Do not treat embedded '\0' as end-of-source (PUC allows null in chunks).
+      while (!eos() && !curr_is_newline())
         get();
       continue;
     }
@@ -149,16 +183,38 @@ Token Lexer::lex_number() {
   }
   t.text = s;
   try {
-    if (s.find('.') == std::string::npos && s.find('e') == std::string::npos &&
-        s.find('E') == std::string::npos && s.find('p') == std::string::npos &&
-        s.find('P') == std::string::npos) {
-      size_t idx = 0;
-      t.integer = static_cast<int64_t>(std::stoll(s, &idx, 0));
-      t.kind = TokenKind::Integer;
-    } else {
-      t.number = std::stod(s);
-      t.kind = TokenKind::Number;
+    const bool pure_int = s.find('.') == std::string::npos &&
+                          s.find('e') == std::string::npos &&
+                          s.find('E') == std::string::npos &&
+                          s.find('p') == std::string::npos &&
+                          s.find('P') == std::string::npos;
+    if (pure_int) {
+      // PUC l_str2int: hex via base 16; decimal is always base 10 (leading 0 ≠ octal).
+      // Hex has no overflow check (0x8000… → mininteger via cast);
+      // decimal above MAXINTEGER becomes a float.
+      try {
+        size_t idx = 0;
+        const bool hex = s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X');
+        unsigned long long u = std::stoull(s, &idx, hex ? 16 : 10);
+        if (idx == s.size()) {
+          if (hex || u <= static_cast<unsigned long long>(INT64_MAX)) {
+            t.integer = static_cast<int64_t>(u);
+            t.kind = TokenKind::Integer;
+          } else {
+            t.number = static_cast<double>(u);
+            t.kind = TokenKind::Number;
+          }
+          return t;
+        }
+      } catch (...) {
+        // fall through to stod
+      }
     }
+    char* end = nullptr;
+    t.number = c_strtod(s.c_str(), &end);
+    if (!end || end == s.c_str() || *end != '\0')
+      panic("malformed number near '" + s + "'");
+    t.kind = TokenKind::Number;
   } catch (...) {
     panic("malformed number near '" + s + "'");
   }
@@ -170,16 +226,45 @@ Token Lexer::lex_string(char quote) {
   t.kind = TokenKind::String;
   t.line = line_;
   t.col = col_;
-  get(); // quote
+  get(); // opening quote
   std::string out;
+  // PUC-style save buffer for "near '...'" (source form, starts with quote).
+  std::string save(1, quote);
+  auto hexval = [](char c) -> int {
+    if (std::isdigit(static_cast<unsigned char>(c)))
+      return c - '0';
+    if (c >= 'a' && c <= 'f')
+      return c - 'a' + 10;
+    return c - 'A' + 10;
+  };
+  auto escerror = [&](const char* msg) {
+    // Include current char in the near-token when still available (PUC esccheck).
+    if (!eos() && !curr_is_newline()) {
+      save.push_back(peek_char());
+      get();
+    }
+    panic(std::string(msg) + " near '" + save + "'");
+  };
   for (;;) {
+    if (eos())
+      panic("unfinished string near '<eof>'");
+    if (curr_is_newline())
+      panic("unfinished string near '" + save + "'");
     char c = get();
-    if (c == '\0' || c == '\n')
-      panic("unfinished string");
+    save.push_back(c);
     if (c == quote)
       break;
     if (c == '\\') {
+      if (eos())
+        panic("unfinished string near '<eof>'");
+      if (curr_is_newline()) {
+        incline();
+        save.back() = '\n'; // keep one newline in near-token
+        out.push_back('\n');
+        continue;
+      }
       char e = get();
+      save.push_back(e);
       switch (e) {
       case 'a': out.push_back('\a'); break;
       case 'b': out.push_back('\b'); break;
@@ -191,32 +276,37 @@ Token Lexer::lex_string(char quote) {
       case '\\': out.push_back('\\'); break;
       case '\'': out.push_back('\''); break;
       case '"': out.push_back('"'); break;
-      case '\n': out.push_back('\n'); break;
       case 'x': {
+        if (eos() || !std::isxdigit(static_cast<unsigned char>(peek_char())))
+          escerror("hexadecimal digit expected");
         char hi = get();
+        save.push_back(hi);
+        if (eos() || !std::isxdigit(static_cast<unsigned char>(peek_char())))
+          escerror("hexadecimal digit expected");
         char lo = get();
-        if (!std::isxdigit(static_cast<unsigned char>(hi)) ||
-            !std::isxdigit(static_cast<unsigned char>(lo)))
-          panic("hex escape too short");
-        auto hex = [](char c) -> int {
-          if (std::isdigit(static_cast<unsigned char>(c)))
-            return c - '0';
-          if (c >= 'a' && c <= 'f')
-            return c - 'a' + 10;
-          return c - 'A' + 10;
-        };
-        out.push_back(static_cast<char>((hex(hi) << 4) | hex(lo)));
+        save.push_back(lo);
+        out.push_back(static_cast<char>((hexval(hi) << 4) | hexval(lo)));
         break;
       }
       case 'u': {
-        if (!match('{'))
-          panic("missing '{' after '\\u'");
-        std::string hex;
-        while (std::isxdigit(static_cast<unsigned char>(peek_char())))
-          hex.push_back(get());
-        if (!match('}') || hex.empty())
-          panic("missing '}' after '\\u{'");
-        unsigned long cp = std::stoul(hex, nullptr, 16);
+        if (peek_char() != '{')
+          escerror("missing '{'");
+        get();
+        save.push_back('{');
+        if (eos() || !std::isxdigit(static_cast<unsigned char>(peek_char())))
+          escerror("hexadecimal digit expected");
+        unsigned long cp = 0;
+        while (std::isxdigit(static_cast<unsigned char>(peek_char()))) {
+          char h = get();
+          save.push_back(h);
+          cp = (cp << 4) + static_cast<unsigned long>(hexval(h));
+          if (cp > 0x10FFFF)
+            panic(std::string("UTF-8 value too large near '") + save + "'");
+        }
+        if (peek_char() != '}')
+          escerror("missing '}'");
+        get();
+        save.push_back('}');
         if (cp <= 0x7F)
           out.push_back(static_cast<char>(cp));
         else if (cp <= 0x7FF) {
@@ -226,22 +316,44 @@ Token Lexer::lex_string(char quote) {
           out.push_back(static_cast<char>(0xE0 | ((cp >> 12) & 0x0F)));
           out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
           out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-        } else if (cp <= 0x10FFFF) {
+        } else {
           out.push_back(static_cast<char>(0xF0 | ((cp >> 18) & 0x07)));
           out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
           out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
           out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-        } else {
-          panic("UTF-8 value out of range");
         }
         break;
       }
       case 'z':
-        while (peek_char() == ' ' || peek_char() == '\t' || peek_char() == '\r' ||
-               peek_char() == '\n' || peek_char() == '\f' || peek_char() == '\v')
-          get();
+        save.pop_back(); // drop 'z' from near-token like PUC removes from buff
+        save.pop_back(); // drop '\\'
+        for (;;) {
+          char w = peek_char();
+          if (w == ' ' || w == '\t' || w == '\f' || w == '\v')
+            get();
+          else if (curr_is_newline())
+            incline();
+          else
+            break;
+        }
         break;
-      default: out.push_back(e); break;
+      default:
+        if (std::isdigit(static_cast<unsigned char>(e))) {
+          int v = e - '0';
+          int nd = 1;
+          for (; nd < 3 && std::isdigit(static_cast<unsigned char>(peek_char())); ++nd) {
+            char d = get();
+            save.push_back(d);
+            v = v * 10 + (d - '0');
+          }
+          if (v > 255)
+            escerror("decimal escape too large");
+          out.push_back(static_cast<char>(v));
+        } else {
+          // Do not consume the next source char into near-token (PUC stops at bad escape).
+          panic(std::string("invalid escape sequence near '") + save + "'");
+        }
+        break;
       }
     } else {
       out.push_back(c);
@@ -258,12 +370,18 @@ Token Lexer::lex_long_string(int level) {
   t.col = col_;
   // opening [ =* [ already consumed by caller partially
   std::string out;
-  if (peek_char() == '\n')
-    get();
+  // Lua 5.3: first newline after [[ is skipped (not part of the value).
+  if (curr_is_newline())
+    incline();
   for (;;) {
+    if (eos())
+      panic("unfinished long string near '<eof>'");
+    if (curr_is_newline()) {
+      incline();
+      out.push_back('\n');
+      continue;
+    }
     char c = get();
-    if (c == '\0')
-      panic("unfinished long string");
     if (c == ']') {
       int lvl = 0;
       size_t save = pos_;
@@ -319,11 +437,11 @@ Token Lexer::lex_one() {
   Token t;
   t.line = line_;
   t.col = col_;
-  char c = peek_char();
-  if (c == '\0') {
+  if (eos()) {
     t.kind = TokenKind::End;
     return t;
   }
+  char c = peek_char();
   if (std::isdigit(static_cast<unsigned char>(c)) ||
       (c == '.' && std::isdigit(static_cast<unsigned char>(peek_char(1)))))
     return lex_number();

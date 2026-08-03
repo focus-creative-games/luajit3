@@ -6,15 +6,47 @@
 #include "vm/interpreter.hpp"
 #include "vm/state.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <cstring>
 
 namespace lj3 {
 
-Table* get_metatable(const TValue& v) {
+// PUC l_strcmp: locale-aware via strcoll, segment-wise across embedded NULs.
+static int string_cmp(const LjString* ls, const LjString* rs) {
+  const char* l = ls->data;
+  size_t ll = ls->len;
+  const char* r = rs->data;
+  size_t lr = rs->len;
+  for (;;) {
+    int temp = std::strcoll(l, r);
+    if (temp != 0)
+      return temp;
+    size_t len = std::strlen(l);
+    if (len == lr)
+      return (len == ll) ? 0 : 1;
+    if (len == ll)
+      return -1;
+    ++len;
+    l += len;
+    ll -= len;
+    r += len;
+    lr -= len;
+  }
+}
+
+Table* get_metatable(State* L, const TValue& v) {
   if (v.is_table())
     return v.as_table()->metatable;
   if (v.is_userdata())
     return v.as_userdata()->metatable;
+  ValueTag t = v.tag();
+  // Int/Float share one "number" metatable (stored in the Float slot).
+  if (t == ValueTag::Int)
+    t = ValueTag::Float;
+  size_t i = static_cast<size_t>(t);
+  if (L && i < L->type_mt.size())
+    return L->type_mt[i];
   return nullptr;
 }
 
@@ -28,7 +60,7 @@ void set_metatable(State* L, TValue& v, Table* mt) {
 }
 
 TValue get_metamethod(State* L, const TValue& obj, const char* name) {
-  Table* mt = get_metatable(obj);
+  Table* mt = get_metatable(L, obj);
   if (!mt)
     return TValue::nil();
   return mt->get(TValue::obj(ValueTag::String, L->intern(name)));
@@ -52,22 +84,43 @@ int64_t table_length(Table* t) {
   }
 }
 
+// Like debug_call_hook: `th->top` may sit inside a Lua frame's maxstack after a
+// CALL, so metamethod calls must start above all live register windows.
+static int live_stack_top(Thread* th) {
+  int limit = th->top;
+  for (auto& fr : th->frames) {
+    if (fr.proto)
+      limit = std::max(limit, fr.base + fr.proto->maxstack);
+    else if (fr.cl && fr.cl->proto)
+      limit = std::max(limit, fr.base + fr.cl->proto->maxstack);
+    else if (fr.cl && fr.cl->is_c)
+      limit = std::max(limit, fr.base + 1);
+  }
+  return limit;
+}
+
 static int call_mm(State* L, const TValue& mm, const TValue* args, int nargs, TValue* out,
                    int nout) {
-  int base = L->gettop();
-  L->push(mm);
+  Thread* th = L->current;
+  const int saved_top = th->top;
+  const int call_base = live_stack_top(th);
+  L->ensure_stack(call_base + 1 + nargs + nout + 8);
+  th->stack[static_cast<size_t>(call_base)] = mm;
   for (int i = 0; i < nargs; ++i)
-    L->push(args[i]);
+    th->stack[static_cast<size_t>(call_base + 1 + i)] = args[i];
+  th->top = call_base + 1 + nargs;
   int st = call_closure(L, mm.as_closure(), nargs, nout);
-  if (st != 0)
+  if (st != 0) {
+    th->top = saved_top;
     return st;
+  }
   for (int i = 0; i < nout; ++i) {
-    if (base + i < L->gettop())
-      out[i] = L->current->stack[static_cast<size_t>(base + i)];
+    if (call_base + i < th->top)
+      out[i] = th->stack[static_cast<size_t>(call_base + i)];
     else
       out[i] = TValue::nil();
   }
-  L->settop(base);
+  th->top = saved_top;
   return 0;
 }
 
@@ -176,7 +229,7 @@ bool meta_lt(State* L, const TValue& a, const TValue& b, bool* out_lt) {
     return true;
   }
   if (a.is_string() && b.is_string()) {
-    *out_lt = a.as_string()->view() < b.as_string()->view();
+    *out_lt = string_cmp(a.as_string(), b.as_string()) < 0;
     return true;
   }
   TValue mm = get_metamethod(L, a, "__lt");
@@ -198,7 +251,7 @@ bool meta_le(State* L, const TValue& a, const TValue& b, bool* out_le) {
     return true;
   }
   if (a.is_string() && b.is_string()) {
-    *out_le = a.as_string()->view() <= b.as_string()->view();
+    *out_le = string_cmp(a.as_string(), b.as_string()) <= 0;
     return true;
   }
   TValue mm = get_metamethod(L, a, "__le");

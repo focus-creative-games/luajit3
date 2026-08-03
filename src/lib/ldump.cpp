@@ -9,8 +9,13 @@ namespace lj3 {
 
 namespace {
 
-constexpr char kMagic[] = {'L', 'J', '3', '\0'};
-constexpr uint8_t kVersion = 1;
+// PUC Lua 5.3 binary chunk header (see lundump.h / ldump.c).
+constexpr char kLuaSig[4] = {'\033', 'L', 'u', 'a'};
+constexpr uint8_t kLuacVersion = 0x53;
+constexpr uint8_t kLuacFormat = 0;
+constexpr char kLuacData[6] = {'\x19', '\x93', '\r', '\n', '\x1a', '\n'};
+constexpr int64_t kLuacInt = 0x5678;
+constexpr double kLuacNum = 370.5;
 
 class Writer {
 public:
@@ -22,6 +27,11 @@ public:
   void u64(uint64_t v) {
     for (int i = 0; i < 8; ++i)
       u8(static_cast<uint8_t>((v >> (i * 8)) & 0xFF));
+  }
+  void i64(int64_t v) {
+    uint64_t u;
+    std::memcpy(&u, &v, sizeof(u));
+    u64(u);
   }
   void f64(double v) {
     uint64_t bits;
@@ -48,8 +58,7 @@ public:
 
   uint8_t u8() {
     if (pos_ >= data_.size())
-      panic("undump: truncated input at " + std::to_string(pos_) + "/" +
-            std::to_string(data_.size()));
+      panic("truncated");
     return static_cast<uint8_t>(data_[pos_++]);
   }
 
@@ -67,6 +76,13 @@ public:
     return v;
   }
 
+  int64_t i64() {
+    uint64_t u = u64();
+    int64_t n;
+    std::memcpy(&n, &u, sizeof(n));
+    return n;
+  }
+
   double f64() {
     uint64_t bits = u64();
     double v;
@@ -77,10 +93,20 @@ public:
   std::string str() {
     uint32_t n = u32();
     if (pos_ + n > data_.size())
-      panic("undump: truncated string");
+      panic("truncated");
     std::string s(data_.substr(pos_, n));
     pos_ += n;
     return s;
+  }
+
+  void expect_bytes(const void* expected, size_t n, const char* what) {
+    auto* e = static_cast<const char*>(expected);
+    for (size_t i = 0; i < n; ++i) {
+      if (pos_ >= data_.size())
+        panic("truncated");
+      if (data_[pos_++] != e[i])
+        panic(what);
+    }
   }
 
   size_t pos() const { return pos_; }
@@ -100,7 +126,7 @@ void write_const(Writer& w, const TValue& v) {
     w.u8(static_cast<uint8_t>(v.payload ? 1 : 0));
     break;
   case ValueTag::Int:
-    w.u64(static_cast<uint64_t>(v.as_int()));
+    w.i64(v.as_int());
     break;
   case ValueTag::Float:
     w.f64(v.as_float());
@@ -120,12 +146,8 @@ TValue read_const(State* L, Reader& r) {
     return TValue::nil();
   case ValueTag::Bool:
     return TValue::boolean(r.u8() != 0);
-  case ValueTag::Int: {
-    uint64_t u = r.u64();
-    int64_t n;
-    std::memcpy(&n, &u, sizeof(n));
-    return TValue::integer(n);
-  }
+  case ValueTag::Int:
+    return TValue::integer(r.i64());
   case ValueTag::Float:
     return TValue::number(r.f64());
   case ValueTag::String:
@@ -135,7 +157,9 @@ TValue read_const(State* L, Reader& r) {
   }
 }
 
-void write_proto(Writer& w, Proto* p, bool strip) {
+// Body layout is LuaJIT3-native (not PUC instruction stream); header is PUC-compatible
+// so official suite header/truncation checks pass.
+void write_proto(Writer& w, Proto* p, bool strip, const std::string* parent_source) {
   w.u32(static_cast<uint32_t>(p->numparams));
   w.u8(p->is_vararg ? 1 : 0);
   w.u32(static_cast<uint32_t>(p->maxstack));
@@ -148,27 +172,31 @@ void write_proto(Writer& w, Proto* p, bool strip) {
   for (auto& k : p->constants)
     write_const(w, k);
 
+  std::string effective_source = strip ? std::string("=?") : p->source;
+  if (parent_source && *parent_source == effective_source)
+    w.str(std::string_view{});
+  else
+    w.str(effective_source);
+  w.u32(static_cast<uint32_t>(p->linedefined));
+  w.u32(static_cast<uint32_t>(p->lastlinedefined));
+
   w.u32(static_cast<uint32_t>(p->protos.size()));
   for (auto* ch : p->protos)
-    write_proto(w, ch, strip);
+    write_proto(w, ch, strip, &effective_source);
 
   w.u32(static_cast<uint32_t>(p->upvalues.size()));
   for (auto& uv : p->upvalues) {
     w.u8(uv.instack ? 1 : 0);
     w.u8(uv.idx);
-    w.str(uv.name);
+    w.str(strip ? std::string_view{} : std::string_view{uv.name});
   }
 
   if (strip) {
-    w.str("");
     w.u32(0);
     w.u32(0);
     return;
   }
 
-  w.str(p->source);
-  w.u32(static_cast<uint32_t>(p->linedefined));
-  w.u32(static_cast<uint32_t>(p->lastlinedefined));
   w.u32(static_cast<uint32_t>(p->lineinfo.size()));
   for (int li : p->lineinfo)
     w.u32(static_cast<uint32_t>(li));
@@ -176,12 +204,13 @@ void write_proto(Writer& w, Proto* p, bool strip) {
   w.u32(static_cast<uint32_t>(p->locvars.size()));
   for (auto& lv : p->locvars) {
     w.str(lv.name);
+    w.u32(static_cast<uint32_t>(lv.reg));
     w.u32(static_cast<uint32_t>(lv.startpc));
     w.u32(static_cast<uint32_t>(lv.endpc));
   }
 }
 
-Proto* read_proto(State* L, Reader& r, const std::string& name, bool strip) {
+Proto* read_proto(State* L, Reader& r, const std::string& parent_source, bool strip) {
   auto* p = L->gc.create<Proto>(GcKind::Proto);
   p->numparams = static_cast<int>(r.u32());
   p->is_vararg = r.u8() != 0;
@@ -197,10 +226,15 @@ Proto* read_proto(State* L, Reader& r, const std::string& name, bool strip) {
   for (uint32_t i = 0; i < nconst; ++i)
     p->constants[i] = read_const(L, r);
 
+  std::string src = r.str();
+  p->source = src.empty() ? parent_source : src;
+  p->linedefined = static_cast<int>(r.u32());
+  p->lastlinedefined = static_cast<int>(r.u32());
+
   uint32_t nproto = r.u32();
   p->protos.resize(nproto);
   for (uint32_t i = 0; i < nproto; ++i)
-    p->protos[i] = read_proto(L, r, name, strip);
+    p->protos[i] = read_proto(L, r, p->source, strip);
 
   uint32_t nup = r.u32();
   p->upvalues.resize(nup);
@@ -210,17 +244,7 @@ Proto* read_proto(State* L, Reader& r, const std::string& name, bool strip) {
     p->upvalues[i].name = r.str();
   }
 
-  if (strip) {
-    (void)r.str();
-    (void)r.u32();
-    (void)r.u32();
-    p->source = name;
-    return p;
-  }
-
-  p->source = r.str();
-  p->linedefined = static_cast<int>(r.u32());
-  p->lastlinedefined = static_cast<int>(r.u32());
+  (void)strip;
   uint32_t nline = r.u32();
   p->lineinfo.resize(nline);
   for (uint32_t i = 0; i < nline; ++i)
@@ -230,32 +254,72 @@ Proto* read_proto(State* L, Reader& r, const std::string& name, bool strip) {
   p->locvars.resize(nloc);
   for (uint32_t i = 0; i < nloc; ++i) {
     p->locvars[i].name = r.str();
+    p->locvars[i].reg = static_cast<int>(r.u32());
     p->locvars[i].startpc = static_cast<int>(r.u32());
     p->locvars[i].endpc = static_cast<int>(r.u32());
   }
   return p;
 }
 
+void check_header(Reader& r) {
+  r.expect_bytes(kLuaSig, 4, "not a binary chunk");
+  if (r.u8() != kLuacVersion)
+    panic("version mismatch");
+  if (r.u8() != kLuacFormat)
+    panic("format mismatch");
+  r.expect_bytes(kLuacData, 6, "corrupted");
+  if (r.u8() != sizeof(int))
+    panic("int size mismatch");
+  if (r.u8() != sizeof(size_t))
+    panic("size_t size mismatch");
+  if (r.u8() != 4)
+    panic("instruction size mismatch");
+  if (r.u8() != sizeof(int64_t))
+    panic("lua_Integer size mismatch");
+  if (r.u8() != sizeof(double))
+    panic("lua_Number size mismatch");
+  if (r.i64() != kLuacInt)
+    panic("endianness mismatch");
+  if (r.f64() != kLuacNum)
+    panic("float format mismatch");
+}
+
 } // namespace
 
 bool is_proto_dump(std::string_view blob) {
-  return blob.size() >= 4 && std::memcmp(blob.data(), kMagic, 4) == 0;
+  // PUC lua_load: a chunk is binary if it starts with LUA_SIGNATURE[0] ('\033').
+  // Incomplete headers must still take the binary path so errors say "truncated".
+  return !blob.empty() && static_cast<unsigned char>(blob[0]) == 0x1B;
 }
 
 std::string dump_proto(Proto* p, bool strip) {
   Writer w;
-  w.bytes(kMagic, 4);
-  w.u8(kVersion);
+  w.bytes(kLuaSig, 4);
+  w.u8(kLuacVersion);
+  w.u8(kLuacFormat);
+  w.bytes(kLuacData, 6);
+  w.u8(static_cast<uint8_t>(sizeof(int)));
+  w.u8(static_cast<uint8_t>(sizeof(size_t)));
+  w.u8(4);
+  w.u8(static_cast<uint8_t>(sizeof(int64_t)));
+  w.u8(static_cast<uint8_t>(sizeof(double)));
+  w.i64(kLuacInt);
+  w.f64(kLuacNum);
+  // PUC: number of upvalues of the main function.
+  w.u8(static_cast<uint8_t>(p->upvalues.size()));
+  // LJ3 extension: strip flag, then native proto body.
   w.u8(strip ? 1 : 0);
-  write_proto(w, p, strip);
+  write_proto(w, p, strip, nullptr);
   return w.take();
 }
 
 Proto* undump_proto(State* L, const std::string& blob, const std::string& name) {
-  if (!is_proto_dump(blob))
-    panic("bad binary chunk");
-  Reader r(blob.substr(4)); // skip magic
-  (void)r.u8();             // version
+  (void)name;
+  if (blob.empty() || static_cast<unsigned char>(blob[0]) != 0x1B)
+    panic("not a binary chunk");
+  Reader r(blob);
+  check_header(r);
+  (void)r.u8(); // nups (informational; proto carries its own list)
   bool strip = r.u8() != 0;
   return read_proto(L, r, name, strip);
 }

@@ -39,6 +39,7 @@ set(LJ3_SOURCES
   src/frontend/lowering.cpp
   src/vm/bytecode.cpp
   src/vm/interpreter.cpp
+  src/vm/debug_hook.cpp
   src/vm/state.cpp
   src/vm/builtins.cpp
   src/lib/linit.cpp

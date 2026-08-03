@@ -100,6 +100,9 @@ private:
   char peek_char(int n = 0) const;
   char get();
   bool match(char c);
+  bool eos() const { return pos_ >= src_.size(); }
+  bool curr_is_newline() const;
+  void incline(); // skip \n / \r / \r\n / \n\r and bump line_
 
   std::string src_;
   std::string name_;

@@ -61,10 +61,9 @@ void State::set_abs_top(int abs_idx) {
   if (abs_idx < 0)
     abs_idx = 0;
   ensure_stack(abs_idx);
-  if (abs_idx > current->top) {
-    for (int i = current->top; i < abs_idx; ++i)
-      current->stack[static_cast<size_t>(i)] = TValue::nil();
-  } else if (abs_idx < current->top) {
+  // Growing top must not wipe slots: callers may have already written return
+  // values / temps above a temporarily low top (after a fixed-result CALL).
+  if (abs_idx < current->top) {
     for (int i = abs_idx; i < current->top; ++i)
       current->stack[static_cast<size_t>(i)] = TValue::nil();
   }

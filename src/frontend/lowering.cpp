@@ -73,8 +73,10 @@ struct FuncState {
       freereg = r;
   }
   int const_index(const TValue& v) {
+    // Bit-identical match so +0.0 and -0.0 stay distinct (values_equal uses IEEE ==).
     for (size_t i = 0; i < proto->constants.size(); ++i) {
-      if (values_equal(proto->constants[i], v))
+      const TValue& k = proto->constants[i];
+      if (k.type == v.type && k.payload == v.payload && k.aux == v.aux)
         return static_cast<int>(i);
     }
     proto->constants.push_back(v);
@@ -94,19 +96,48 @@ struct FuncState {
     (void)line;
     return static_cast<int>(locals.size() - 1);
   }
-  void leave_block(int nlocals_before) {
+  // Record active locals into proto->locvars without emitting clear/close.
+  void flush_locvars_to(int nlocals_before) {
+    std::vector<LocVar> closing;
+    while (static_cast<int>(locals.size()) > nlocals_before) {
+      auto& loc = locals.back();
+      LocVar lv;
+      lv.name = loc.name;
+      lv.reg = loc.reg;
+      lv.startpc = loc.startpc;
+      lv.endpc = pc();
+      closing.push_back(lv);
+      locals.pop_back();
+    }
+    for (auto it = closing.rbegin(); it != closing.rend(); ++it)
+      proto->locvars.push_back(*it);
+    nactvar = 0;
+    for (auto& loc : locals)
+      nactvar = std::max(nactvar, loc.reg + 1);
+  }
+
+  int captured_close_level() const {
+    int close_level = -1;
+    for (auto& l : locals) {
+      if (l.active && l.captured && (close_level < 0 || l.reg < close_level))
+        close_level = l.reg;
+    }
+    return close_level;
+  }
+
+  // clear_dead: when true, emit LOADNIL for dead locals (debug cleanliness).
+  // For-loops pass false so instruction counts match PUC (count hooks / db.lua).
+  void leave_block(int nlocals_before, bool clear_dead = true) {
     int close_level = -1;
     int nil_from = -1;
     int nil_to = -1;
+    std::vector<LocVar> closing;
     while (static_cast<int>(locals.size()) > nlocals_before) {
       auto& loc = locals.back();
       if (loc.captured) {
-        // Close from the lowest captured register upward (Lua: close >= level).
         if (close_level < 0 || loc.reg < close_level)
           close_level = loc.reg;
       } else {
-        // Clear non-captured locals so they do not keep objects alive after the
-        // scope ends (needed for weak-table / __gc tests).
         if (nil_from < 0 || loc.reg < nil_from)
           nil_from = loc.reg;
         if (nil_to < 0 || loc.reg > nil_to)
@@ -114,12 +145,15 @@ struct FuncState {
       }
       LocVar lv;
       lv.name = loc.name;
+      lv.reg = loc.reg;
       lv.startpc = loc.startpc;
       lv.endpc = pc();
-      proto->locvars.push_back(lv);
+      closing.push_back(lv);
       locals.pop_back();
     }
-    if (nil_from >= 0 && close_level < 0) {
+    for (auto it = closing.rbegin(); it != closing.rend(); ++it)
+      proto->locvars.push_back(*it);
+    if (clear_dead && nil_from >= 0 && close_level < 0) {
       // Clear through the high-water mark of temporaries used in this block.
       // freereg may already have been rewound to nactvar, leaving dirty temps.
       int clear_to = std::max(nil_to, reg_hwm - 1);
@@ -132,7 +166,14 @@ struct FuncState {
         nactvar = std::max(nactvar, l.reg + 1);
     // Never reuse register slots for the rest of this function once any
     // captured local has lived there (closed upvalues must not alias new locals).
-    if (close_level >= 0) {
+    // Skip close JMP after a terminal RETURN/TAILCALL — those paths close (or
+    // never fall through). A trailing JMP after TAILCALL is dead but confusing.
+    bool terminal = false;
+    if (!proto->code.empty()) {
+      auto op = static_cast<OpCode>(op_get(proto->code.back()));
+      terminal = (op == OpCode::RETURN || op == OpCode::TAILCALL);
+    }
+    if (close_level >= 0 && !terminal) {
       code_asbx(OpCode::JMP, close_level + 1, 0);
       freereg = std::max(reg_hwm, nactvar);
     } else {
@@ -165,6 +206,20 @@ void expr(FuncState& fs, Expdesc& e, Expr& node);
 void statement(FuncState& fs, AstNode& node);
 void block(FuncState& fs, Block& b);
 
+// Rewrite the most recent CALL as TAILCALL (return f(...)).
+bool patch_last_call_to_tailcall(FuncState& fs) {
+  auto& code = fs.proto->code;
+  for (int pi = static_cast<int>(code.size()) - 1; pi >= 0; --pi) {
+    if (static_cast<OpCode>(op_get(code[static_cast<size_t>(pi)])) != OpCode::CALL)
+      continue;
+    uint8_t ca = op_a(code[static_cast<size_t>(pi)]);
+    uint8_t cb = op_b(code[static_cast<size_t>(pi)]);
+    code[static_cast<size_t>(pi)] = encode_abc(OpCode::TAILCALL, ca, cb, 0);
+    return true;
+  }
+  return false;
+}
+
 // Patch the most recent CALL's C field. nresults==-1 means LUA_MULTRET (C=0).
 uint8_t patch_last_call_results(FuncState& fs, int nresults) {
   auto& code = fs.proto->code;
@@ -184,6 +239,22 @@ void mark_local_captured(FuncState& fs, int reg) {
   for (auto& l : fs.locals)
     if (l.active && l.reg == reg)
       l.captured = true;
+}
+
+int add_upval(FuncState& fs, const std::string& name, bool instack, int idx);
+
+int ensure_env_upval(FuncState& fs) {
+  for (size_t i = 0; i < fs.proto->upvalues.size(); ++i) {
+    if (fs.proto->upvalues[i].name == "_ENV")
+      return static_cast<int>(i);
+  }
+  if (!fs.prev) {
+    if (fs.proto->upvalues.empty() || fs.proto->upvalues[0].name != "_ENV")
+      panic("_ENV upvalue missing in main chunk");
+    return 0;
+  }
+  int parent = ensure_env_upval(*fs.prev);
+  return add_upval(fs, "_ENV", false, parent);
 }
 
 int add_upval(FuncState& fs, const std::string& name, bool instack, int idx) {
@@ -233,7 +304,8 @@ int search_var(FuncState& fs, const std::string& name, Expdesc& e) {
       return 0;
     }
   }
-  // global via _ENV upvalue index 0
+  // global via _ENV upvalue (created on demand; not every function has _ENV)
+  (void)ensure_env_upval(fs);
   e.kind = Expdesc::Global;
   e.info = fs.string_k(name);
   return 0;
@@ -252,10 +324,17 @@ void discharge(FuncState& fs, Expdesc& e) {
     break;
   case Expdesc::Global: {
     e.reg = fs.new_reg();
-    fs.code_abc(OpCode::GETTABUP, e.reg, 0, static_cast<uint8_t>(e.info > 255 ? 255 : e.info));
-    // if const index > 255 use LOADK path — keep indices small for v0.1
-    if (e.info > 255)
-      panic("too many constants");
+    int env = ensure_env_upval(fs);
+    if (e.info <= 255) {
+      fs.code_abc(OpCode::GETTABUP, e.reg, env, e.info);
+    } else {
+      // C field is 8-bit: fall back to GETUPVAL + LOADK + GETTABLE.
+      fs.code_abc(OpCode::GETUPVAL, e.reg, env, 0);
+      int kreg = fs.new_reg();
+      fs.code_abx(OpCode::LOADK, kreg, static_cast<uint16_t>(e.info));
+      fs.code_abc(OpCode::GETTABLE, e.reg, e.reg, kreg);
+      fs.freereg = e.reg + 1;
+    }
     e.kind = Expdesc::Nonrelocable;
     break;
   }
@@ -327,6 +406,8 @@ OpCode bin_arith_op(BinOp op) {
 
 void expr(FuncState& fs, Expdesc& e, Expr& node) {
   e = {};
+  if (node.line > 0)
+    fs.lastline = node.line;
   switch (node.kind) {
   case AstKind::ExprNil:
     expr_const(e, TValue::nil());
@@ -367,6 +448,18 @@ void expr(FuncState& fs, Expdesc& e, Expr& node) {
     auto& n = static_cast<ExprUn&>(node);
     Expdesc o;
     expr(fs, o, *n.operand);
+    // Fold unary minus on constants. PUC intop(-,0,mininteger) wraps to mininteger.
+    if (n.op == UnOp::Neg && o.kind == Expdesc::Constant) {
+      if (o.k.is_int()) {
+        auto u = static_cast<uint64_t>(o.k.as_int());
+        expr_const(e, TValue::integer(static_cast<int64_t>(0u - u)));
+        break;
+      }
+      if (o.k.is_float()) {
+        expr_const(e, TValue::number(-o.k.as_float()));
+        break;
+      }
+    }
     int r = exp2reg(fs, o);
     int dest = fs.new_reg();
     OpCode op = OpCode::UNM;
@@ -385,6 +478,71 @@ void expr(FuncState& fs, Expdesc& e, Expr& node) {
   case AstKind::ExprBin: {
     auto& n = static_cast<ExprBin&>(node);
     if (n.op == BinOp::And || n.op == BinOp::Or) {
+      auto is_rel = [](Expr& x) -> ExprBin* {
+        if (x.kind != AstKind::ExprBin)
+          return nullptr;
+        auto* b = static_cast<ExprBin*>(&x);
+        switch (b->op) {
+        case BinOp::Eq:
+        case BinOp::Ne:
+        case BinOp::Lt:
+        case BinOp::Le:
+        case BinOp::Gt:
+        case BinOp::Ge:
+          return b;
+        default:
+          return nullptr;
+        }
+      };
+      // PUC-style: `cmp and cmp` stays in jump form and materializes one bool.
+      // Value-producing LOADBOOL per comparison is too heavy for count hooks
+      // (db.lua: assert(1000 < a and a < 1012) under count=1).
+      auto* lrel = is_rel(*n.lhs);
+      auto* rrel = is_rel(*n.rhs);
+      if (n.op == BinOp::And && lrel && rrel) {
+        // Preserve freereg floor so we do not clobber an in-progress CALL base.
+        const int free_floor = fs.freereg;
+        auto emit_rel_failjmp = [&](ExprBin& rel, std::vector<int>& jfalse) {
+          fs.freereg = std::max(fs.freereg, free_floor);
+          Expdesc l, r;
+          expr(fs, l, *rel.lhs);
+          int rb = exp2reg(fs, l);
+          expr(fs, r, *rel.rhs);
+          int rc = exp2reg(fs, r);
+          OpCode cmp = OpCode::EQ;
+          int left = rb, right = rc;
+          // A=0: skip next (the fail JMP) when comparison holds.
+          int acond = 0;
+          switch (rel.op) {
+          case BinOp::Eq: cmp = OpCode::EQ; break;
+          case BinOp::Ne: cmp = OpCode::EQ; acond = 1; break;
+          case BinOp::Lt: cmp = OpCode::LT; break;
+          case BinOp::Gt: cmp = OpCode::LT; left = rc; right = rb; break;
+          case BinOp::Le: cmp = OpCode::LE; break;
+          case BinOp::Ge: cmp = OpCode::LE; left = rc; right = rb; break;
+          default: break;
+          }
+          fs.code_abc(cmp, acond, left, right);
+          jfalse.push_back(fs.code_asbx(OpCode::JMP, 0, 0));
+          fs.freereg = free_floor;
+        };
+        std::vector<int> jfalse;
+        emit_rel_failjmp(*lrel, jfalse);
+        emit_rel_failjmp(*rrel, jfalse);
+        fs.freereg = free_floor;
+        int dest = fs.new_reg();
+        fs.code_abc(OpCode::LOADBOOL, dest, 1, 0);
+        int jend = fs.code_asbx(OpCode::JMP, 0, 0);
+        int flab = fs.pc();
+        for (int j : jfalse)
+          fs.fix_sbx(j, flab);
+        fs.code_abc(OpCode::LOADBOOL, dest, 0, 0);
+        fs.fix_sbx(jend, fs.pc());
+        fs.freereg = dest + 1;
+        e.kind = Expdesc::Nonrelocable;
+        e.reg = dest;
+        break;
+      }
       // and: dest=lhs; if not dest then goto end; dest=rhs; end:
       // or:  dest=lhs; if dest then goto end; dest=rhs; end:
       Expdesc l;
@@ -452,22 +610,8 @@ void expr(FuncState& fs, Expdesc& e, Expr& node) {
       default: break;
       }
       int dest = fs.new_reg();
-      fs.code_abc(cmp, acond, left, right);
-      int j = fs.code_asbx(OpCode::JMP, 0, 1); // skip next if false path — Lua style:
-      // EQ: if ((b==c) != a) pc++; then typically JMP
-      // We'll emit: cmp; JMP +1; LOADBOOL dest 0 1; LOADBOOL dest 1 0
-      fs.code_abc(OpCode::LOADBOOL, dest, 0, 1);
-      fs.code_abc(OpCode::LOADBOOL, dest, 1, 0);
-      fs.fix_sbx(j, fs.pc() - 2);
-      // Actually classic Lua:
-      // EQ A B C ; if (B==C)~=A then pc++
-      // JMP 1
-      // LOADBOOL dest 0 1
-      // LOADBOOL dest 1 0
-      // Let me re-emit cleanly:
-      fs.proto->code.resize(static_cast<size_t>(fs.pc() - 4));
-      fs.proto->lineinfo.resize(fs.proto->code.size());
-      fs.freereg = dest;
+      // EQ/LT/LE A B C: if ((B op C) ~= A) then pc++.
+      // Value form: cmp; JMP 1; LOADBOOL dest 0 1; LOADBOOL dest 1 0
       fs.code_abc(cmp, acond, left, right);
       fs.code_asbx(OpCode::JMP, 0, 1);
       fs.code_abc(OpCode::LOADBOOL, dest, 0, 1);
@@ -481,8 +625,17 @@ void expr(FuncState& fs, Expdesc& e, Expr& node) {
     int rb = exp2reg(fs, l);
     expr(fs, r, *n.rhs);
     int rc = exp2reg(fs, r);
-    int dest = fs.new_reg();
+    // Prefer in-place into a temporary operand (PUC-style) so expressions like
+    // `(a+1)+f()` leave the partial result in the next local slot for getlocal.
+    int dest;
+    if (rb >= fs.nactvar)
+      dest = rb;
+    else if (rc >= fs.nactvar)
+      dest = rc;
+    else
+      dest = fs.new_reg();
     fs.code_abc(bin_arith_op(n.op), dest, rb, rc);
+    fs.freereg = std::max(fs.freereg, dest + 1);
     e.kind = Expdesc::Nonrelocable;
     e.reg = dest;
     break;
@@ -662,8 +815,7 @@ void expr(FuncState& fs, Expdesc& e, Expr& node) {
     p->numparams = static_cast<int>(n.params.size());
     p->source = fs.proto->source;
     p->linedefined = node.line;
-    // _ENV upvalue
-    add_upval(child, "_ENV", false, 0);
+    // _ENV is added on demand when the body references globals.
     child.freereg = 0;
     for (auto& param : n.params) {
       int reg = child.new_reg();
@@ -672,12 +824,18 @@ void expr(FuncState& fs, Expdesc& e, Expr& node) {
     block(child, *n.body);
     child.lastline = n.lastline > 0 ? n.lastline : child.lastline;
     child.code_abc(OpCode::RETURN, 0, 1, 0, child.lastline);
+    // Parameters stay active for the whole function; record them now.
+    child.flush_locvars_to(0);
     p->lastlinedefined = n.lastline > 0 ? n.lastline : node.line;
     for (int li : p->lineinfo)
       if (li > p->lastlinedefined)
         p->lastlinedefined = li;
     p->maxstack = std::max(child.maxstack, 2);
     int dest = fs.new_reg();
+    // PUC attributes OP_CLOSURE to the function's `end` line (ls->lastline
+    // after matching END). Needed for db.lua local-A line-hook checks.
+    if (n.lastline > 0)
+      fs.lastline = n.lastline;
     fs.code_abx(OpCode::CLOSURE, dest, static_cast<int>(fs.proto->protos.size() - 1));
     e.kind = Expdesc::Nonrelocable;
     e.reg = dest;
@@ -694,7 +852,16 @@ void storevar(FuncState& fs, Expdesc& var, int expr_reg) {
   } else if (var.kind == Expdesc::Upval) {
     fs.code_abc(OpCode::SETUPVAL, expr_reg, var.info, 0);
   } else if (var.kind == Expdesc::Global) {
-    fs.code_abc(OpCode::SETTABUP, 0, static_cast<uint8_t>(var.info), expr_reg);
+    int env = ensure_env_upval(fs);
+    if (var.info <= 255) {
+      fs.code_abc(OpCode::SETTABUP, env, var.info, expr_reg);
+    } else {
+      int treg = fs.new_reg();
+      fs.code_abc(OpCode::GETUPVAL, treg, env, 0);
+      int kreg = fs.new_reg();
+      fs.code_abx(OpCode::LOADK, kreg, static_cast<uint16_t>(var.info));
+      fs.code_abc(OpCode::SETTABLE, treg, kreg, expr_reg);
+    }
   } else if (var.kind == Expdesc::Indexed) {
     fs.code_abc(OpCode::SETTABLE, var.table, var.key, expr_reg);
   } else {
@@ -713,11 +880,15 @@ void statement(FuncState& fs, AstNode& node) {
   fs.lastline = node.line;
   switch (node.kind) {
   case AstKind::LocalDecl: {
+    // Evaluate RHS before registering names so `local l = table.remove(l,1)`
+    // binds the RHS to the outer `l` (Lua 5.3 scope rules).
+    // Emit each RHS into its destination register (PUC exp2nextreg style).
+    // Reserving all slots first forced temps above locals and overflowed R[255].
     fs.freereg = fs.nactvar;
     auto& n = static_cast<LocalDecl&>(node);
     int nnames = static_cast<int>(n.names.size());
     int base = fs.freereg;
-    fs.reserve(nnames);
+    fs.maxstack = std::max(fs.maxstack, base + nnames);
     int filled = 0;
     for (size_t i = 0; i < n.values.size(); ++i) {
       bool is_last = (i + 1 == n.values.size());
@@ -745,13 +916,14 @@ void statement(FuncState& fs, AstNode& node) {
         fs.freereg = base + nnames;
         break;
       }
-      fs.freereg = std::max(fs.freereg, dest + 1);
+      fs.freereg = dest;
       Expdesc e;
       expr(fs, e, *n.values[i]);
       int er = exp2reg(fs, e);
       if (er != dest)
         fs.code_abc(OpCode::MOVE, dest, er, 0);
       filled = static_cast<int>(i) + 1;
+      fs.freereg = dest + 1;
     }
     for (int i = filled; i < nnames; ++i)
       fs.code_abc(OpCode::LOADNIL, base + i, 0, 0);
@@ -770,7 +942,7 @@ void statement(FuncState& fs, AstNode& node) {
     }
     int nvars = static_cast<int>(vars.size());
     int base = fs.freereg;
-    fs.reserve(nvars);
+    fs.maxstack = std::max(fs.maxstack, base + nvars);
     int filled = 0;
     for (size_t i = 0; i < n.values.size(); ++i) {
       bool is_last = (i + 1 == n.values.size());
@@ -798,13 +970,14 @@ void statement(FuncState& fs, AstNode& node) {
         fs.freereg = base + nvars;
         break;
       }
-      fs.freereg = std::max(fs.freereg, dest + 1);
+      fs.freereg = dest;
       Expdesc e;
       expr(fs, e, *n.values[i]);
       int er = exp2reg(fs, e);
       if (er != dest)
         fs.code_abc(OpCode::MOVE, dest, er, 0);
       filled = static_cast<int>(i) + 1;
+      fs.freereg = dest + 1;
     }
     for (int i = filled; i < nvars; ++i)
       fs.code_abc(OpCode::LOADNIL, base + i, 0, 0);
@@ -826,7 +999,44 @@ void statement(FuncState& fs, AstNode& node) {
     auto& n = static_cast<ReturnStmt&>(node);
     if (n.values.empty()) {
       fs.code_abc(OpCode::RETURN, 0, 1, 0);
+    } else if (n.values.size() == 1 && n.values[0]->kind == AstKind::ExprCall) {
+      // `return f(...)` — proper tail call (PUC OP_TAILCALL).
+      // Close captured locals FIRST (while their stack slots are intact), then
+      // TAILCALL. Sliding the callee onto those slots before close would make
+      // nested closures capture the wrong values (e.g. g's upvalue f becomes g
+      // → infinite recursion / multi-GB stack growth).
+      fs.freereg = fs.nactvar;
+      Expdesc e;
+      expr(fs, e, *n.values[0]);
+      // Insert a close-only JMP immediately before the CALL we are about to patch.
+      auto& code = fs.proto->code;
+      int call_pc = -1;
+      for (int pi = static_cast<int>(code.size()) - 1; pi >= 0; --pi) {
+        if (static_cast<OpCode>(op_get(code[static_cast<size_t>(pi)])) == OpCode::CALL) {
+          call_pc = pi;
+          break;
+        }
+      }
+      int close_level = fs.captured_close_level();
+      if (call_pc >= 0 && close_level >= 0) {
+        Instruction jmp = encode_asbx(OpCode::JMP, static_cast<uint8_t>(close_level + 1), 0);
+        code.insert(code.begin() + call_pc, jmp);
+        fs.proto->lineinfo.insert(fs.proto->lineinfo.begin() + call_pc,
+                                  fs.proto->lineinfo[static_cast<size_t>(call_pc)]);
+        call_pc += 1;
+      }
+      if (call_pc >= 0) {
+        uint8_t ca = op_a(code[static_cast<size_t>(call_pc)]);
+        uint8_t cb = op_b(code[static_cast<size_t>(call_pc)]);
+        code[static_cast<size_t>(call_pc)] = encode_abc(OpCode::TAILCALL, ca, cb, 0);
+      } else {
+        patch_last_call_results(fs, -1);
+        fs.code_abc(OpCode::RETURN, e.info >= 0 ? e.info : fs.nactvar, 0, 0);
+      }
     } else {
+      // Evaluate from nactvar so return values occupy consecutive stack slots
+      // immediately after locals (needed for debug.getlocal of temporaries).
+      fs.freereg = fs.nactvar;
       int base = fs.freereg;
       bool multret = false;
       for (size_t i = 0; i < n.values.size(); ++i) {
@@ -847,15 +1057,13 @@ void statement(FuncState& fs, AstNode& node) {
           multret = true;
           break;
         }
-        if (fs.freereg <= dest)
-          fs.reserve(dest - fs.freereg + 1);
-        int hold = fs.freereg;
+        fs.freereg = dest;
         Expdesc e;
         expr(fs, e, *n.values[i]);
         int r = exp2reg(fs, e);
         if (r != dest)
           fs.code_abc(OpCode::MOVE, dest, r, 0);
-        fs.freereg = std::max(hold, dest + 1);
+        fs.freereg = std::max(fs.freereg, dest + 1);
       }
       if (multret)
         fs.code_abc(OpCode::RETURN, base, 0, 0);
@@ -873,18 +1081,28 @@ void statement(FuncState& fs, AstNode& node) {
       Expdesc c;
       expr(fs, c, *n.branches[i].cond);
       int cr = exp2reg(fs, c);
+      // Attribute the test/jump to `then` (Lua lineinfo for db.lua traces).
+      if (n.branches[i].then_line > 0)
+        fs.lastline = n.branches[i].then_line;
       fs.code_abc(OpCode::TEST, cr, 0, 0);
       int jf = fs.code_asbx(OpCode::JMP, 0, 0);
       fs.freereg = fs.nactvar;
       block(fs, *n.branches[i].body);
+      if (n.end_line > 0)
+        fs.lastline = n.end_line;
       int je = fs.code_asbx(OpCode::JMP, 0, 0);
       escape.push_back(je);
       fs.fix_sbx(jf, fs.pc());
     }
-    if (n.else_body)
+    if (n.else_body) {
+      if (n.else_line > 0)
+        fs.lastline = n.else_line;
       block(fs, *n.else_body);
+    }
     for (int j : escape)
       fs.fix_sbx(j, fs.pc());
+    if (n.end_line > 0)
+      fs.lastline = n.end_line;
     break;
   }
   case AstKind::While: {
@@ -899,9 +1117,18 @@ void statement(FuncState& fs, AstNode& node) {
     int breaks_before = static_cast<int>(fs.break_list.size());
     block(fs, *n.body);
     fs.code_asbx(OpCode::JMP, 0, loop - (fs.pc() + 1));
-    fs.fix_sbx(jf, fs.pc());
+    // Condition-fail lands on `end` line marker; `break` skips it (db.lua).
+    int end_marker_pc = fs.pc();
+    if (n.end_line > 0) {
+      fs.lastline = n.end_line;
+      int r = fs.new_reg();
+      fs.code_abc(OpCode::LOADNIL, r, 0, 0);
+      fs.freereg = fs.nactvar;
+    }
+    int after_while = fs.pc();
+    fs.fix_sbx(jf, n.end_line > 0 ? end_marker_pc : after_while);
     while (static_cast<int>(fs.break_list.size()) > breaks_before) {
-      fs.fix_sbx(fs.break_list.back(), fs.pc());
+      fs.fix_sbx(fs.break_list.back(), after_while);
       fs.break_list.pop_back();
     }
     break;
@@ -954,37 +1181,32 @@ void statement(FuncState& fs, AstNode& node) {
       fs.code_asbx(OpCode::LOADINT, base + 2, 1);
     }
     fs.freereg = base + 3;
+    fs.lastline = node.line;
     int prep = fs.code_asbx(OpCode::FORPREP, base, 0);
     int loop = fs.pc();
     int ireg = fs.new_reg();
     fs.push_local(n.name, ireg, node.line);
-    // FORPREP uses base..base+2 and internal index at base+3
-    // Align with Lua: R(A) index, R(A+1) limit, R(A+2) step, R(A+3) local
-    // Our ireg should be base+3
-    if (ireg != base + 3) {
-      // force
-    }
     fs.locals.back().reg = base + 3;
     fs.nactvar = base + 4;
     fs.freereg = base + 4;
     int breaks_before = static_cast<int>(fs.break_list.size());
     block(fs, *n.body);
+    fs.lastline = node.line;
     fs.code_asbx(OpCode::FORLOOP, base, loop - (fs.pc() + 1));
-    fs.fix_sbx(prep, fs.pc());
-    // fix prep jump to after FORPREP targeting FORLOOP properly:
-    // FORPREP sbx jumps to FORLOOP; FORLOOP jumps back to loop body start
-    fs.fix_sbx(prep, loop - 1); // standard: prep jumps to forloop instruction
-    // Actually Lua: FORPREP A sBx -> pc += sBx (points to FORLOOP), FORLOOP jumps back with sBx
-    // Re-fix: prep should jump to FORLOOP pc
     int forloop_pc = fs.pc() - 1;
     fs.fix_sbx(prep, forloop_pc);
-    fs.proto->code[forloop_pc] =
+    fs.proto->code[static_cast<size_t>(forloop_pc)] =
         encode_asbx(OpCode::FORLOOP, static_cast<uint8_t>(base), loop - (forloop_pc + 1));
+    // Do not emit an end-line LOADNIL: PUC has no extra insn here. The chunk
+    // RETURN (or next statement) inherits lastline=end for line-hook traces.
+    if (n.end_line > 0)
+      fs.lastline = n.end_line;
+    int after_for = fs.pc();
     while (static_cast<int>(fs.break_list.size()) > breaks_before) {
-      fs.fix_sbx(fs.break_list.back(), fs.pc());
+      fs.fix_sbx(fs.break_list.back(), after_for);
       fs.break_list.pop_back();
     }
-    fs.leave_block(static_cast<int>(fs.locals.size()) - 1);
+    fs.leave_block(static_cast<int>(fs.locals.size()) - 1, /*clear_dead=*/false);
     fs.freereg = base;
     break;
   }
@@ -1006,10 +1228,11 @@ void statement(FuncState& fs, AstNode& node) {
     expr(fs, e, *n.fn);
     int er = exp2reg(fs, e);
     if (n.name_path.size() == 1) {
-      Expdesc g;
-      g.kind = Expdesc::Global;
-      g.info = fs.string_k(n.name_path[0]);
-      storevar(fs, g, er);
+      // `function f()` assigns to local/upvalue/global via normal name lookup
+      // (must update an in-scope local f, not always _ENV.f).
+      Expdesc var;
+      search_var(fs, n.name_path[0], var);
+      storevar(fs, var, er);
     } else {
       // a.b.c = fn
       Expdesc t;
@@ -1112,14 +1335,20 @@ void statement(FuncState& fs, AstNode& node) {
     fs.freereg = fs.nactvar;
     int breaks_before = static_cast<int>(fs.break_list.size());
     block(fs, *n.body);
-    fs.leave_block(nlocals_before);
+    // Locals end after the body; do not LOADNIL every iteration (PUC leaves
+    // stale values — also keeps count/line hooks aligned).
+    fs.leave_block(nlocals_before, /*clear_dead=*/false);
+    fs.lastline = node.line;
     fs.fix_sbx(jprep, fs.pc());
     fs.code_abc(OpCode::TFORCALL, base, 0, nvars);
     int tforloop = fs.code_asbx(OpCode::TFORLOOP, base + 2, 0);
     // fix_sbx(pc, dest) encodes sbx = dest - (pc + 1); pass absolute dest.
     fs.fix_sbx(tforloop, loopbody);
+    if (n.end_line > 0)
+      fs.lastline = n.end_line;
+    int after_for = fs.pc();
     while (static_cast<int>(fs.break_list.size()) > breaks_before) {
-      fs.fix_sbx(fs.break_list.back(), fs.pc());
+      fs.fix_sbx(fs.break_list.back(), after_for);
       fs.break_list.pop_back();
     }
     fs.freereg = base;
@@ -1155,6 +1384,7 @@ Proto* lower_chunk(State* L, Chunk& chunk, const std::string& source_name) {
     fs.fix_sbx(g.second, it->second);
   }
   fs.code_abc(OpCode::RETURN, 0, 1, 0);
+  fs.flush_locvars_to(0);
   p->maxstack = std::max(fs.maxstack, 2);
   return p;
 }

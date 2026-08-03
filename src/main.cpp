@@ -7,7 +7,9 @@
 #include "tools/dump.hpp"
 #include "vm/state.hpp"
 
+#include <fstream>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -176,14 +178,33 @@ int main(int argc, char** argv) {
           std::cerr << "dump failed: " << e.what() << "\n";
         }
       }
-      status = dochunk(L, luaL_loadstring(L, op.second.c_str()));
-      if (status != LUA_OK)
-        break;
+      if (!dump_bc) {
+        status = dochunk(L, luaL_loadstring(L, op.second.c_str()));
+        if (status != LUA_OK)
+          break;
+      }
     }
   }
 
   if (status == LUA_OK && script > 0) {
-    status = dochunk(L, luaL_loadfile(L, argv[script]));
+    if (dump_bc) {
+      try {
+        std::ifstream in(argv[script]);
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        auto st2 = lj3::new_state();
+        auto chunk = lj3::parse(ss.str(), argv[script]);
+        lj3::sema_analyze(*chunk);
+        auto* p = lj3::lower_chunk(st2.get(), *chunk, argv[script]);
+        lj3::dump_proto_to_stderr(p);
+      } catch (const std::exception& e) {
+        std::cerr << "dump failed: " << e.what() << "\n";
+      }
+    }
+    // --dump-bc already printed; skip running the chunk (avoids hanging on
+    // scripts whose only purpose is inspection).
+    if (!dump_bc)
+      status = dochunk(L, luaL_loadfile(L, argv[script]));
   }
 
   int code = (status == LUA_OK) ? 0 : 1;

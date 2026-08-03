@@ -22,6 +22,7 @@ struct Closure : GcObject {
 
 struct LocVar {
   std::string name;
+  int reg = 0;
   int startpc = 0;
   int endpc = 0;
 };

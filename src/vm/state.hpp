@@ -7,6 +7,7 @@
 #include "runtime/upvalue.hpp"
 #include "runtime/value.hpp"
 
+#include <array>
 #include <memory>
 #include <string>
 #include <vector>
@@ -28,17 +29,30 @@ struct CallFrame {
   int base = 0;
   int saved_pc = 0;
   int expected_results = 0;
-  int nvarargs = 0;      // extra args beyond numparams
-  int vararg_base = 0;   // absolute stack index of first vararg (or -1)
+  // Extra args beyond numparams (stored off-stack so VARARG multret cannot clobber them).
+  std::vector<TValue> varargs;
   FrameKind kind = FrameKind::InterpLua;
   bool protected_call = false;
+  bool hooked = false; // true while a debug hook is running for this frame
+  bool tailcall = false; // entered via OP_TAILCALL (debug.getinfo istailcall)
+  bool finalizer = false; // __gc finalizer call (namewhat "metamethod")
   int protect_top = 0;
   int protect_frames = 0;
+};
+
+struct DebugHookState {
+  Closure* func = nullptr;
+  int mask = 0;
+  int count = 0;
+  int hookcount = 0;
+  int allowhook = 1;
+  int oldpc = 0;
 };
 
 struct Thread : GcObject {
   std::vector<TValue> stack;
   std::vector<CallFrame> frames;
+  DebugHookState hook;
   UpVal* open_upvals = nullptr;
   int top = 0; // absolute index one past last used slot
   // C-call window: Lua API indices are relative to stack_base (at(1) == stack[stack_base]).
@@ -56,6 +70,8 @@ struct State {
   Thread* current = nullptr;
   Table* globals = nullptr;
   Table* registry = nullptr;
+  // Per-type metatables (PUC G(L)->mt[]): String, number (Float slot; Int shares it), etc.
+  std::array<Table*, static_cast<size_t>(ValueTag::Internal) + 1> type_mt{};
   StringTable strings;
   GC gc;
   bool panic_on_error = false;

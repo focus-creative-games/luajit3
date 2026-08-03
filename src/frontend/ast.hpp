@@ -183,14 +183,18 @@ struct IfStmt final : AstNode {
   struct Branch {
     ExprPtr cond;
     std::unique_ptr<Block> body;
+    int then_line = 0;
   };
   std::vector<Branch> branches;
   std::unique_ptr<Block> else_body;
+  int else_line = 0;
+  int end_line = 0;
   IfStmt() { kind = AstKind::If; }
 };
 struct WhileStmt final : AstNode {
   ExprPtr cond;
   std::unique_ptr<Block> body;
+  int end_line = 0;
   WhileStmt() { kind = AstKind::While; }
 };
 struct RepeatStmt final : AstNode {
@@ -204,12 +208,14 @@ struct ForNum final : AstNode {
   ExprPtr to;
   ExprPtr step;
   std::unique_ptr<Block> body;
+  int end_line = 0;
   ForNum() { kind = AstKind::ForNum; }
 };
 struct ForIn final : AstNode {
   std::vector<std::string> names;
   std::vector<ExprPtr> iters;
   std::unique_ptr<Block> body;
+  int end_line = 0;
   ForIn() { kind = AstKind::ForIn; }
 };
 struct BreakStmt final : AstNode {

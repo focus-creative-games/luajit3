@@ -26,8 +26,11 @@ const char* opcode_name(OpCode op) {
   case OpCode::LE: return "LE";
   case OpCode::TEST: return "TEST";
   case OpCode::JMP: return "JMP";
+  case OpCode::TESTSET: return "TESTSET";
   case OpCode::CALL: return "CALL";
+  case OpCode::TAILCALL: return "TAILCALL";
   case OpCode::RETURN: return "RETURN";
+  case OpCode::SELF: return "SELF";
   case OpCode::CLOSURE: return "CLOSURE";
   case OpCode::GETUPVAL: return "GETUPVAL";
   case OpCode::SETUPVAL: return "SETUPVAL";

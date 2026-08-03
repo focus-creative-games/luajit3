@@ -75,6 +75,11 @@ static int co_resume(State* L) {
         panic("coroutine main is not a function");
       st = call_closure(L, f.as_closure(), nargs, LUA_MULTRET);
     } else if (co->status == Thread::Status::Suspended) {
+      // Finish the yielded C call: drop its frame, then write resume values into
+      // the caller's result slots (same as a normal C return).
+      if (!co->frames.empty() && co->frames.back().kind == FrameKind::CApi &&
+          co->frames.back().proto == nullptr)
+        co->frames.pop_back();
       int dest = co->yield_func_idx;
       int want = co->yield_nresults;
       int nplace = (want == LUA_MULTRET) ? nargs : want;
@@ -90,7 +95,9 @@ static int co_resume(State* L) {
       // Do not use set_abs_top here — growing top nil-fills and would wipe the values.
       co->top = dest + nplace;
       co->status = Thread::Status::Running;
-      st = interpret(L);
+      // min_frames=1: keep running through outer Lua frames after an inner RETURN.
+      // (Default interpret depth would treat the first RETURN as coroutine end.)
+      st = interpret(L, 1);
     } else {
       panic("cannot resume non-suspended coroutine");
     }

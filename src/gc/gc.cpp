@@ -99,9 +99,9 @@ static int lua_frame_high_water(const Thread* th) {
   int limit = 0;
   for (auto& fr : th->frames) {
     if (fr.proto)
-      limit = std::max(limit, fr.base + fr.proto->maxstack + fr.nvarargs);
+      limit = std::max(limit, fr.base + fr.proto->maxstack);
     else if (fr.cl && fr.cl->proto)
-      limit = std::max(limit, fr.base + fr.cl->proto->maxstack + fr.nvarargs);
+      limit = std::max(limit, fr.base + fr.cl->proto->maxstack);
   }
   return limit;
 }
@@ -135,16 +135,24 @@ void GC::mark_roots() {
     mark_object(L_->globals);
   if (L_->registry)
     mark_object(L_->registry);
+  for (Table* mt : L_->type_mt) {
+    if (mt)
+      mark_object(mt);
+  }
   for (auto* th : {L_->main, L_->current}) {
     if (!th)
       continue;
     mark_object(th);
     mark_thread_stack(this, th, /*strict_c_top=*/th == L_->current);
+    if (th->hook.func)
+      mark_object(th->hook.func);
     for (auto& fr : th->frames) {
       if (fr.cl)
         mark_object(fr.cl);
       if (fr.proto)
         mark_object(fr.proto);
+      for (auto& v : fr.varargs)
+        mark_value(v);
     }
     for (UpVal* uv = th->open_upvals; uv; uv = uv->next_open)
       mark_object(uv);
@@ -208,6 +216,16 @@ void GC::propagate_one() {
   case GcKind::Thread: {
     auto* th = static_cast<Thread*>(o);
     mark_thread_stack(this, th, /*strict_c_top=*/th == L_->current);
+    if (th->hook.func)
+      mark_object(th->hook.func);
+    for (auto& fr : th->frames) {
+      if (fr.cl)
+        mark_object(fr.cl);
+      if (fr.proto)
+        mark_object(fr.proto);
+      for (auto& v : fr.varargs)
+        mark_value(v);
+    }
     break;
   }
   case GcKind::Userdata: {
@@ -307,7 +325,7 @@ static int thread_live_top(Thread* th) {
     if (fr.proto)
       limit = std::max(limit, fr.base + fr.proto->maxstack);
     else if (fr.cl && fr.cl->proto)
-      limit = std::max(limit, fr.base + fr.cl->proto->maxstack + fr.nvarargs);
+      limit = std::max(limit, fr.base + fr.cl->proto->maxstack);
   }
   limit = std::max(limit, th->stack_base);
   return limit;
@@ -336,7 +354,22 @@ void GC::run_finalizers() {
         int saved_top = live;
         L_->push(mm);
         L_->push(obj);
-        call_closure(L_, mm.as_closure(), 1, 0);
+        // PUC CIST_FIN: mark the *carrying* frame (caller of __gc) so
+        // debug.getinfo(2) reports namewhat "metamethod" / name "__gc".
+        bool marked_fin = false;
+        if (!th->frames.empty()) {
+          th->frames.back().finalizer = true;
+          marked_fin = true;
+        }
+        try {
+          call_closure(L_, mm.as_closure(), 1, 0);
+        } catch (...) {
+          if (marked_fin && !th->frames.empty())
+            th->frames.back().finalizer = false;
+          throw;
+        }
+        if (marked_fin && !th->frames.empty())
+          th->frames.back().finalizer = false;
         L_->set_abs_top(saved_top);
       } catch (const Lj3Error& e) {
         if (L_->current)
