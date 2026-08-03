@@ -271,7 +271,16 @@ static int os_rename(State* L) {
 }
 
 static int os_exit(State* L) {
-  int code = L->gettop() >= 1 ? static_cast<int>(check_int(L, 1)) : 0;
+  int code = EXIT_SUCCESS;
+  if (L->gettop() >= 1 && !L->at(1)->is_nil()) {
+    if (L->at(1)->is_bool())
+      code = L->at(1)->is_truthy() ? EXIT_SUCCESS : EXIT_FAILURE;
+    else
+      code = static_cast<int>(check_int(L, 1));
+  }
+  // Second arg true: close Lua state before exit (PUC). We don't have a full
+  // lua_close path for the process; process exit is enough for the suite.
+  (void)(L->gettop() >= 2 && L->at(2)->is_truthy());
   std::exit(code);
 }
 
@@ -297,20 +306,15 @@ static int os_tmpname(State* L) {
 
 static int os_execute(State* L) {
   if (L->gettop() < 1 || L->at(1)->is_nil()) {
+    int st = std::system(nullptr);
     L->settop(0);
-    L->push(TValue::boolean(true));
+    L->push(TValue::boolean(st != 0));
     return 1;
   }
   const char* cmd = check_string(L, 1)->view().data();
+  errno = 0;
   int status = std::system(cmd);
-  L->settop(0);
-  if (status == -1) {
-    L->push(TValue::nil());
-    push_string(L, "execute failed");
-    return 2;
-  }
-  L->push(TValue::boolean(status == 0));
-  return 1;
+  return exec_result(L, status);
 }
 
 void open_os_lib(State* L) {

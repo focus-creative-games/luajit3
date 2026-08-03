@@ -13,6 +13,10 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#include <stdio.h> // _popen / _pclose
+#endif
+
 namespace luatier {
 using namespace lib;
 
@@ -24,6 +28,7 @@ struct LFile {
   FILE* fp = nullptr;
   bool close_on_close = true;
   bool is_std = false;
+  bool is_pipe = false;
   bool can_read = true;
   bool can_write = true;
 };
@@ -72,13 +77,14 @@ static FILE* tofile(LFile* f) {
 }
 
 static Userdata* new_file_ud(State* L, FILE* fp, bool close_on_close, bool is_std,
-                             bool can_read = true, bool can_write = true) {
+                             bool can_read = true, bool can_write = true, bool is_pipe = false) {
   Table* mt = file_metatable(L);
   Userdata* u = userdata_new(L, sizeof(LFile), mt);
   auto* lf = lfile_ptr(u);
   lf->fp = fp;
   lf->close_on_close = close_on_close;
   lf->is_std = is_std;
+  lf->is_pipe = is_pipe;
   lf->can_read = can_read;
   lf->can_write = can_write;
   return u;
@@ -476,7 +482,15 @@ static int file_gc(State* L) {
     arg_type_error(L, 1, "FILE*");
   LFile* f = lfile_ptr(L->at(1)->as_userdata());
   if (f->fp && f->close_on_close && !f->is_std) {
-    std::fclose(f->fp);
+    if (f->is_pipe) {
+#if defined(_WIN32)
+      _pclose(f->fp);
+#else
+      pclose(f->fp);
+#endif
+    } else {
+      std::fclose(f->fp);
+    }
     f->fp = nullptr;
   }
   return 0;
@@ -504,6 +518,16 @@ static int file_close(State* L) {
   }
   if (!f->fp)
     panic("attempt to use a closed file");
+  if (f->is_pipe) {
+    FILE* fp = f->fp;
+    f->fp = nullptr;
+#if defined(_WIN32)
+    int st = _pclose(fp);
+#else
+    int st = pclose(fp);
+#endif
+    return exec_result(L, st);
+  }
   if (f->close_on_close)
     std::fclose(f->fp);
   f->fp = nullptr;
@@ -645,6 +669,32 @@ static int io_tmpfile(State* L) {
   return 1;
 }
 
+static bool check_popen_mode(const std::string& mode) {
+  // PUC l_checkmodep: "r" or "w" (optionally with 'b' on some platforms).
+  return mode == "r" || mode == "w" || mode == "rb" || mode == "wb";
+}
+
+static int io_popen(State* L) {
+  std::string cmd = std::string(check_string(L, 1)->view());
+  std::string mode = L->gettop() >= 2 ? std::string(check_string(L, 2)->view()) : "r";
+  if (!check_popen_mode(mode))
+    panic("bad argument #2 to 'popen' (invalid mode)");
+  errno = 0;
+  std::fflush(nullptr);
+#if defined(_WIN32)
+  FILE* fp = _popen(cmd.c_str(), mode.c_str());
+#else
+  FILE* fp = popen(cmd.c_str(), mode.c_str());
+#endif
+  if (!fp)
+    return file_result_fail(L, cmd);
+  bool reading = mode[0] == 'r';
+  Userdata* u = new_file_ud(L, fp, true, false, reading, !reading, true);
+  L->settop(0);
+  L->push(TValue::obj(ValueTag::Userdata, u));
+  return 1;
+}
+
 static int io_read(State* L) {
   TValue cur = get_default_file(L, kIoInput);
   if (!cur.is_userdata())
@@ -735,6 +785,7 @@ void open_io_lib(State* L) {
   set_field(L, io, "lines", io_lines);
   set_field(L, io, "flush", io_flush);
   set_field(L, io, "tmpfile", io_tmpfile);
+  set_field(L, io, "popen", io_popen);
   set_field_value(L, io, "stdin", stdin_ud);
   set_field_value(L, io, "stdout", stdout_ud);
   set_field_value(L, io, "stderr", stderr_ud);

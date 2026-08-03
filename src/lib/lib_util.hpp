@@ -9,8 +9,14 @@
 #include "vm/ldebug.hpp"
 #include "vm/state.hpp"
 
+#include <cerrno>
 #include <cmath>
+#include <cstring>
 #include <string_view>
+
+#if !defined(_WIN32)
+#include <sys/wait.h>
+#endif
 
 namespace luatier {
 namespace lib {
@@ -74,6 +80,35 @@ inline Table* check_table(State* L, int idx) {
   if (!L->at(idx)->is_table())
     panic("table expected");
   return L->at(idx)->as_table();
+}
+
+// PUC luaL_execresult: true/"exit"/0 or nil/"exit"| "signal"/code.
+inline int exec_result(State* L, int stat) {
+  const char* what = "exit";
+  if (stat == -1) {
+    int en = errno;
+    L->settop(0);
+    L->push(TValue::nil());
+    push_string(L, std::strerror(en));
+    L->push(TValue::integer(en));
+    return 3;
+  }
+#if !defined(_WIN32)
+  if (WIFEXITED(stat)) {
+    stat = WEXITSTATUS(stat);
+  } else if (WIFSIGNALED(stat)) {
+    stat = WTERMSIG(stat);
+    what = "signal";
+  }
+#endif
+  L->settop(0);
+  if (what[0] == 'e' && stat == 0)
+    L->push(TValue::boolean(true));
+  else
+    L->push(TValue::nil());
+  push_string(L, what);
+  L->push(TValue::integer(stat));
+  return 3;
 }
 
 [[noreturn]] inline void arg_type_error(State* L, int idx, const char* expected) {

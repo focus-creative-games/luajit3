@@ -41,29 +41,14 @@ static int report(lua_State* L, int status) {
 }
 
 static void create_arg_table(lua_State* L, int argc, char** argv, int script) {
+  // PUC createargtable: arg[i - script] = argv[i] for all i in [0, argc).
+  // So arg[0] is the script (or absent), and arg[-n] reaches argv[0] (progname).
+  if (script >= argc)
+    script = 0;
   lua_newtable(L);
-  // arg[0] = script name (or "")
-  if (script > 0)
-    lua_pushstring(L, argv[script]);
-  else
-    lua_pushstring(L, "");
-  lua_rawseti(L, -2, 0);
-  // positive: args after script; negative: args before script
-  int narg = 0;
-  if (script > 0) {
-    for (int i = script + 1; i < argc; ++i) {
-      lua_pushstring(L, argv[i]);
-      lua_rawseti(L, -2, ++narg);
-    }
-    for (int i = 1; i < script; ++i) {
-      lua_pushstring(L, argv[i]);
-      lua_rawseti(L, -2, i - script);
-    }
-  } else {
-    for (int i = 1; i < argc; ++i) {
-      lua_pushstring(L, argv[i]);
-      lua_rawseti(L, -2, i);
-    }
+  for (int i = 0; i < argc; ++i) {
+    lua_pushstring(L, argv[i]);
+    lua_rawseti(L, -2, i - script);
   }
   lua_setglobal(L, "arg");
 }
