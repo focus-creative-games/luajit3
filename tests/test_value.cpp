@@ -15,6 +15,11 @@ int test_value() {
     std::cerr << "value FAIL: string\n";
     f = 1;
   }
+  auto* s2 = L->intern("hello");
+  if (s != s2 || !values_equal(v, TValue::obj(ValueTag::String, s2))) {
+    std::cerr << "value FAIL: string intern / pointer equal\n";
+    f = 1;
+  }
   if (!values_equal(TValue::integer(3), TValue::number(3.0))) {
     std::cerr << "value FAIL: int/float equal\n";
     f = 1;

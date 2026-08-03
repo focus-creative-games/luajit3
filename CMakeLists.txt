@@ -12,6 +12,22 @@ option(LUATIER_BUILD_TESTS "Build tests" ON)
 
 if(MSVC)
   add_compile_options(/W4 /permissive- /utf-8 /D_CRT_SECURE_NO_WARNINGS)
+  # CMake defaults to /EHsc, which treats extern "C" as non-throwing. Our Lua C
+  # API throws LuatierError across that boundary; under /EHsc MSVC calls
+  # std::terminate → Windows exit 0xc0000409 (seen on Release ctest).
+  foreach(_luatier_eh_var IN ITEMS
+      CMAKE_CXX_FLAGS
+      CMAKE_CXX_FLAGS_DEBUG
+      CMAKE_CXX_FLAGS_RELEASE
+      CMAKE_CXX_FLAGS_RELWITHDEBINFO
+      CMAKE_CXX_FLAGS_MINSIZEREL)
+    if(DEFINED ${_luatier_eh_var})
+      string(REPLACE "/EHsc" "/EHs" _luatier_eh_val "${${_luatier_eh_var}}")
+      set(${_luatier_eh_var} "${_luatier_eh_val}" CACHE STRING "" FORCE)
+    endif()
+  endforeach()
+  unset(_luatier_eh_var)
+  unset(_luatier_eh_val)
 else()
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()

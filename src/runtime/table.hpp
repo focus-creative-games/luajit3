@@ -24,6 +24,7 @@ struct Table : GcObject {
 
   void update_weak_mode(State* L);
   // mask: bit0 clear weak keys, bit1 clear weak values (same as weak_mode bits).
+  // Interned strings stay alive via StringTable strong roots (like former short_intern).
   void clear_weak_entries(uint8_t white, uint8_t mask = 3);
 
   TValue get(const TValue& key) const;

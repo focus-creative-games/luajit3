@@ -72,7 +72,7 @@ void Table::clear_weak_entries(uint8_t white, uint8_t mask) {
 static size_t hash_key(const TValue& k, size_t mod) {
   if (mod == 0)
     return 0;
-  // Strings must hash by content: long strings are not pointer-interned.
+  // Strings hash by cached content hash (all strings are pointer-interned).
   if (k.is_string()) {
     LjString* s = k.as_string();
     return static_cast<size_t>(s->hash % mod);

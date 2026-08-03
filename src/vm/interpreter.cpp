@@ -4,7 +4,9 @@
 #include "jit/hotness.hpp"
 #include "runtime/string.hpp"
 #include "runtime/value.hpp"
+#ifndef NDEBUG
 #include "tools/profile.hpp"
+#endif
 #include "vm/debug_hook.hpp"
 #include "vm/ldebug.hpp"
 #include "vm/meta.hpp"
@@ -684,7 +686,9 @@ int interpret(State* L, int min_frames) {
     L->gc.safepoint();
     // Finalizers / nested calls during GC may reallocate the stack.
     base = reload();
+#ifndef NDEBUG
     runtime_profile().opcodes++;
+#endif
 
     switch (op) {
     case OpCode::MOVE:

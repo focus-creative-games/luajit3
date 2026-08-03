@@ -201,7 +201,8 @@ bool values_equal(const TValue& a, const TValue& b) {
     return x == y; // IEEE: NaN != NaN
   }
   case ValueTag::String:
-    return a.as_string()->view() == b.as_string()->view();
+    // All strings are interned → pointer identity.
+    return a.payload == b.payload;
   default:
     return a.payload == b.payload;
   }

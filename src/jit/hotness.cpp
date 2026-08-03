@@ -6,6 +6,8 @@
 
 namespace luatier {
 
+#if defined(LUATIER_ENABLE_HOTNESS)
+
 namespace {
 std::unordered_map<Proto*, uint64_t> entries;
 std::unordered_map<Proto*, uint64_t> loops;
@@ -29,5 +31,7 @@ void hotness_on_loop(Proto* p) {
 
 uint64_t hotness_entry_count(Proto* p) { return entries[p]; }
 uint64_t hotness_loop_count(Proto* p) { return loops[p]; }
+
+#endif // LUATIER_ENABLE_HOTNESS
 
 } // namespace luatier

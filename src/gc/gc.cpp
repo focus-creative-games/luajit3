@@ -157,8 +157,13 @@ void GC::mark_roots() {
     for (UpVal* uv = th->open_upvals; uv; uv = uv->next_open)
       mark_object(uv);
   }
-  for (auto& kv : L_->strings.short_intern)
-    mark_object(kv.second);
+  // Intern table is a strong root (all live Lua strings are reachable here).
+  // A PUC-style weak string table needs tighter atomic/ephemeron integration;
+  // keep strings immortal via the intern set until State teardown.
+  for (LjString* head : L_->strings.hash) {
+    for (LjString* s = head; s; s = s->hnext)
+      mark_object(s);
+  }
 }
 
 void GC::propagate_one() {
@@ -471,9 +476,7 @@ void GC::sweep() {
       case GcKind::String:
         if (L_) {
           auto* s = static_cast<LjString*>(o);
-          auto it = L_->strings.short_intern.find(std::string(s->view()));
-          if (it != L_->strings.short_intern.end() && it->second == s)
-            L_->strings.short_intern.erase(it);
+          L_->strings.remove(s);
         }
         std::free(o);
         break;
