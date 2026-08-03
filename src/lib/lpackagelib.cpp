@@ -20,14 +20,21 @@ using namespace lib;
 #ifdef _WIN32
 static constexpr const char* k_dirsep = "\\";
 static constexpr const char* k_config = "\\\n;\n?\n!\n-";
+// Approximate PUC Windows defaults (enough to contain "lua" for suite checks).
 static constexpr const char* k_path_default =
-    ".\\?.lua;.\\?\\init.lua;?.lua;?\\init.lua";
-static constexpr const char* k_cpath_default = ".\\?.dll;.\\?\\init.dll";
+    "!\\lua\\?.lua;!\\lua\\?\\init.lua;!\\?.lua;!\\?\\init.lua;!.\\?.lua;!.\\?\\init.lua";
+static constexpr const char* k_cpath_default =
+    "!\\?.dll;!\\..\\lib\\lua\\5.3\\?.dll;!\\loadall.dll;.\\?.dll";
 #else
 static constexpr const char* k_dirsep = "/";
 static constexpr const char* k_config = "/\n;\n?\n!\n-";
-static constexpr const char* k_path_default = "./?.lua;./?/init.lua;?.lua;?/init.lua";
-static constexpr const char* k_cpath_default = "./?.so;./?/init.so";
+// Match PUC luaconf.h Unix defaults (LUA_ROOT=/usr/local/).
+static constexpr const char* k_path_default =
+    "/usr/local/share/lua/5.3/?.lua;/usr/local/share/lua/5.3/?/init.lua;"
+    "/usr/local/lib/lua/5.3/?.lua;/usr/local/lib/lua/5.3/?/init.lua;"
+    "./?.lua;./?/init.lua";
+static constexpr const char* k_cpath_default =
+    "/usr/local/lib/lua/5.3/?.so;/usr/local/lib/lua/5.3/loadall.so;./?.so";
 #endif
 
 static Table* package_table(State* L) {

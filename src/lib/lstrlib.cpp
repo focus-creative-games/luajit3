@@ -338,12 +338,20 @@ static std::string format_one(const char*& p, const char* end, State* L, int& ar
     std::string f64 = form;
     f64.insert(f64.size() - 1, "ll");
     int64_t n = 0;
-    if (val->is_int())
-      n = val->as_int();
-    else if (val->is_number())
-      n = static_cast<int64_t>(val->to_number());
-    else
-      panic("number has no integer representation");
+    TValue num = *val;
+    if (!num.is_number()) {
+      if (!try_to_number(num, &num))
+        panic("number expected");
+    }
+    if (num.is_int())
+      n = num.as_int();
+    else {
+      double d = num.as_float();
+      if (std::floor(d) != d || d < static_cast<double>(INT64_MIN) ||
+          d > static_cast<double>(INT64_MAX))
+        panic("number has no integer representation");
+      n = static_cast<int64_t>(d);
+    }
     int need = std::snprintf(nullptr, 0, f64.c_str(), static_cast<long long>(n));
     std::string out(static_cast<size_t>(need) + 1, '\0');
     std::snprintf(out.data(), out.size(), f64.c_str(), static_cast<long long>(n));
@@ -357,12 +365,19 @@ static std::string format_one(const char*& p, const char* end, State* L, int& ar
     std::string f64 = form;
     f64.insert(f64.size() - 1, "ll");
     uint64_t n = 0;
-    if (val->is_int())
-      n = static_cast<uint64_t>(val->as_int());
-    else if (val->is_number())
-      n = static_cast<uint64_t>(val->to_number());
-    else
-      panic("number has no integer representation");
+    TValue num = *val;
+    if (!num.is_number()) {
+      if (!try_to_number(num, &num))
+        panic("number expected");
+    }
+    if (num.is_int())
+      n = static_cast<uint64_t>(num.as_int());
+    else {
+      double d = num.as_float();
+      if (std::floor(d) != d || d < 0 || d > static_cast<double>(UINT64_MAX))
+        panic("number has no integer representation");
+      n = static_cast<uint64_t>(d);
+    }
     int need = std::snprintf(nullptr, 0, f64.c_str(), static_cast<unsigned long long>(n));
     std::string out(static_cast<size_t>(need) + 1, '\0');
     std::snprintf(out.data(), out.size(), f64.c_str(), static_cast<unsigned long long>(n));

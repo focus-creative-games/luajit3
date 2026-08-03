@@ -10,6 +10,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -166,11 +167,13 @@ static int base_print(State* L) {
     if (!r.is_string())
       panic("'tostring' must return a string");
     if (i > 0)
-      std::cout << '\t';
-    std::cout << r.as_string()->view();
+      std::fputc('\t', stdout);
+    auto sv = r.as_string()->view();
+    std::fwrite(sv.data(), 1, sv.size(), stdout);
     th->top = L->current->stack_base + n; // restore print's C window top
   }
-  std::cout << '\n';
+  std::fputc('\n', stdout);
+  std::fflush(stdout);
   return 0;
 }
 

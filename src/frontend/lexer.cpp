@@ -201,7 +201,7 @@ void Lexer::skip_whitespace_and_comments() {
           get();
           for (;;) {
             if (eos())
-              panic("unfinished long comment");
+              panic("unfinished long comment near <eof>");
             if (curr_is_newline()) {
               incline();
               continue;
@@ -341,7 +341,7 @@ Token Lexer::lex_string(char quote) {
   };
   for (;;) {
     if (eos())
-      panic("unfinished string near '<eof>'");
+      panic("unfinished string near <eof>");
     if (curr_is_newline())
       panic("unfinished string near '" + save + "'");
     char c = get();
@@ -350,7 +350,7 @@ Token Lexer::lex_string(char quote) {
       break;
     if (c == '\\') {
       if (eos())
-        panic("unfinished string near '<eof>'");
+        panic("unfinished string near <eof>");
       if (curr_is_newline()) {
         incline();
         save.back() = '\n'; // keep one newline in near-token
@@ -473,7 +473,7 @@ Token Lexer::lex_long_string(int level) {
     incline();
   for (;;) {
     if (eos())
-      panic("unfinished long string near '<eof>'");
+      panic("unfinished long string near <eof>");
     if (curr_is_newline()) {
       incline();
       out.push_back('\n');

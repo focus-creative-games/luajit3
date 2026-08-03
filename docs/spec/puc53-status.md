@@ -7,7 +7,7 @@
 | File | Basic `_U` | Notes |
 |------|------------|-------|
 | all.lua (harness) | OK | prints `final OK !!!` |
-| main.lua | OK | under `_U` soft path |
+| main.lua | OK | under `_U` soft path; **POSIX CLI** (`-`, `-i`, `-E`, `LUA_*`, Ctrl-C) OK on Linux |
 | gc.lua | OK | weak tables, `__gc`, ephemerons |
 | db.lua | OK | via dump/undump dofile |
 | calls.lua | OK | |
@@ -37,7 +37,7 @@
 
 **Unit tests:** `luatier_tests` green.
 
-**Complete suite (no `_U`):** not started; needs working `package.loadlib` + suite `libs/`, and non-`_soft`/`_port` paths (big.lua, popen, …).
+**Complete suite (no `_U`):** in progress on Linux. `main.lua` (standalone CLI) and `files.lua` (popen) pass without `_port`. Remaining: `big.lua`, `package.loadlib` + suite `libs/`, fuller non-`_soft` paths.
 
 ## Recent fixes (2026-08-03)
 
@@ -57,6 +57,10 @@
 
 ### Errors / debug
 - `arg_type_error` resolves `io.write` via globals; TAILCALL→C preserves invoked name (`'sin'`).
+
+### Standalone CLI (2026-08-03)
+- PUC-style `lua.c` front-end in `src/standalone.cpp`: `-`/`stdin`, `-i` REPL, `-E`, `LUA_INIT`/`LUA_PATH*`, SIGINT hooks.
+- `package.path`/`cpath` from env with `;;` expansion; `debug.debug`; `print` fflush; `string.format %d` string coerce.
 
 ### Tooling
 - MSBuild may leave a stale `luatier.exe`; touch `src/main.cpp` or `--clean-first` after lib changes.

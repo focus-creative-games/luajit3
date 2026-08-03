@@ -101,6 +101,23 @@ void apply_msghandler(State* L, TValue obj) {
   } else {
     TValue mm = get_metamethod(L, obj, "__tostring");
     if (mm.is_function()) {
+      // PUC stack when __tostring runs during msghandler:
+      //   1=__tostring, 2=msghandler(C), 3=error(C), 4=main chunk
+      // Pad two C frames so debug.getinfo(4) reaches the error site.
+      Closure* pad = closure_new_c(L, [](State*) -> int { return 0; });
+      pad->cname = "msghandler";
+      CallFrame f2;
+      f2.cl = pad;
+      f2.kind = FrameKind::CApi;
+      L->current->frames.push_back(f2);
+      Closure* pad_err = closure_new_c(L, [](State*) -> int { return 0; });
+      pad_err->cname = "error";
+      CallFrame f3;
+      f3.cl = pad_err;
+      f3.kind = FrameKind::CApi;
+      f3.invoked_name = "error";
+      L->current->frames.push_back(f3);
+
       L->settop(0);
       L->push(mm);
       L->push(obj);
@@ -110,6 +127,15 @@ void apply_msghandler(State* L, TValue obj) {
           msg = std::string(L->at(1)->as_string()->view());
       } catch (const LuatierError&) {
         L->current->err_obj_set = false;
+      }
+      // Pop padding frames if still present.
+      while (!L->current->frames.empty()) {
+        auto& fr = L->current->frames.back();
+        if (fr.cl == pad_err || fr.cl == pad) {
+          L->current->frames.pop_back();
+          continue;
+        }
+        break;
       }
     }
     if (msg.empty())
@@ -182,12 +208,17 @@ int docall(State* L, int narg, int nres) {
     return st;
   } catch (const LuatierError& e) {
     std::signal(SIGINT, SIG_DFL);
+    TValue emsg = take_err_obj(L, e.what());
+    // Run msghandler before unwinding frames so debug.getinfo still sees
+    // the error site (main.lua error-object __tostring uses getinfo(4)).
+    apply_msghandler(L, emsg);
+    TValue handled = L->gettop() >= 1 ? *L->at(L->gettop()) : emsg;
     while (static_cast<int>(L->current->frames.size()) > protect_frames) {
       L->close_upvals(L->current, L->current->frames.back().base);
       L->current->frames.pop_back();
     }
-    TValue emsg = take_err_obj(L, e.what());
-    apply_msghandler(L, emsg);
+    L->settop(0);
+    L->push(handled);
     return LUA_ERRRUN;
   }
 }
@@ -365,8 +396,6 @@ void l_print(State* L) {
   if (n <= 0)
     return;
   TValue pr = L->globals->get(TValue::obj(ValueTag::String, L->intern("print")));
-  if (!pr.is_function())
-    return;
   std::vector<TValue> results(static_cast<size_t>(n));
   for (int i = 0; i < n; ++i)
     results[static_cast<size_t>(i)] = *L->at(i + 1);
@@ -375,6 +404,8 @@ void l_print(State* L) {
   for (auto& r : results)
     L->push(r);
   try {
+    if (!pr.is_function())
+      panic("attempt to call a " + std::string(type_name(pr)) + " value");
     call_closure(L, pr.as_closure(), n, 0);
   } catch (const LuatierError& e) {
     TValue emsg = take_err_obj(L, e.what());

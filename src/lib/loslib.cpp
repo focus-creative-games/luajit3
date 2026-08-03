@@ -285,13 +285,19 @@ static int os_exit(State* L) {
 }
 
 static int os_tmpname(State* L) {
-  // Prefer unique non-existent names (PUC tmpnam). Fixed cwd names break
-  // os.rename when leftovers remain from prior runs.
+  // Prefer unique non-existent names (PUC tmpnam). Avoid '.' in the name:
+  // require/-l treat '.' as a module separator (breaks main.lua -l tests).
   static int counter = 0;
   for (int attempt = 0; attempt < 128; ++attempt) {
+#if defined(_WIN32)
     std::string name = "luatiertmp_" + std::to_string(++counter) + "_" +
                        std::to_string(static_cast<long long>(std::time(nullptr))) + "_" +
-                       std::to_string(attempt) + ".tmp";
+                       std::to_string(attempt);
+#else
+    std::string name = "/tmp/luatiertmp_" + std::to_string(++counter) + "_" +
+                       std::to_string(static_cast<long long>(std::time(nullptr))) + "_" +
+                       std::to_string(attempt);
+#endif
     FILE* probe = std::fopen(name.c_str(), "r");
     if (probe) {
       std::fclose(probe);
