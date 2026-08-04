@@ -76,6 +76,119 @@ bool is_bitwise_op(OpCode op) {
          op == OpCode::SHR;
 }
 
+// PUC intop: arithmetic via unsigned to match wraparound (avoid signed overflow UB).
+int64_t intop_add(int64_t x, int64_t y) {
+  return static_cast<int64_t>(static_cast<uint64_t>(x) + static_cast<uint64_t>(y));
+}
+int64_t intop_sub(int64_t x, int64_t y) {
+  return static_cast<int64_t>(static_cast<uint64_t>(x) - static_cast<uint64_t>(y));
+}
+int64_t intop_mul(int64_t x, int64_t y) {
+  return static_cast<int64_t>(static_cast<uint64_t>(x) * static_cast<uint64_t>(y));
+}
+int64_t intop_unm(int64_t x) {
+  return static_cast<int64_t>(0u - static_cast<uint64_t>(x));
+}
+
+// PUC luaV_shiftl: |disp| >= 64 → 0; negative disp reverses direction.
+int64_t shiftl(int64_t v, int64_t disp) {
+  constexpr int64_t NBITS = 64;
+  if (disp < 0) {
+    if (disp <= -NBITS)
+      return 0;
+    return static_cast<int64_t>(static_cast<uint64_t>(v) >> static_cast<uint64_t>(-disp));
+  }
+  if (disp >= NBITS)
+    return 0;
+  return static_cast<int64_t>(static_cast<uint64_t>(v) << static_cast<uint64_t>(disp));
+}
+
+TValue int_idiv_mod(State* L, OpCode op, int64_t m, int64_t n) {
+  if (static_cast<uint64_t>(n) + 1u <= 1u) { // n == 0 or n == -1
+    if (n == 0) {
+      if (op == OpCode::IDIV)
+        runerror(L, "attempt to divide by zero");
+      runerror(L, "attempt to perform 'n%0'");
+    }
+    if (op == OpCode::IDIV)
+      return TValue::integer(intop_unm(m));
+    return TValue::integer(0);
+  }
+  if (op == OpCode::IDIV) {
+    int64_t q = m / n;
+    if ((m ^ n) < 0 && m % n != 0)
+      q -= 1;
+    return TValue::integer(q);
+  }
+  int64_t r = m % n;
+  if (r != 0 && (m ^ n) < 0)
+    r += n;
+  return TValue::integer(r);
+}
+
+TValue float_arith(OpCode op, double x, double y) {
+  double r = 0;
+  switch (op) {
+  case OpCode::ADD: r = x + y; break;
+  case OpCode::SUB: r = x - y; break;
+  case OpCode::MUL: r = x * y; break;
+  case OpCode::DIV: r = x / y; break;
+  case OpCode::IDIV: r = std::floor(x / y); break;
+  case OpCode::MOD:
+    r = std::fmod(x, y);
+    if (r * y < 0)
+      r += y;
+    break;
+  case OpCode::POW: r = std::pow(x, y); break;
+  default: panic("bad float arith");
+  }
+  return TValue::number(r);
+}
+
+TValue bitwise_raw(State* L, OpCode op, int64_t x, int64_t y) {
+  int64_t r = 0;
+  switch (op) {
+  case OpCode::BAND: r = x & y; break;
+  case OpCode::BOR: r = x | y; break;
+  case OpCode::BXOR: r = x ^ y; break;
+  case OpCode::SHL: r = shiftl(x, y); break;
+  case OpCode::SHR: r = shiftl(x, -y); break;
+  default: panic("bad bitwise");
+  }
+  (void)L;
+  return TValue::integer(r);
+}
+
+// True if both operands are numbers and result written (no MM / string coerce).
+bool try_arith_numbers(State* L, OpCode op, const TValue& lhs, const TValue& rhs, TValue* out) {
+  if (is_bitwise_op(op)) {
+    int64_t x, y;
+    if (!to_integer(lhs, &x) || !to_integer(rhs, &y))
+      return false;
+    *out = bitwise_raw(L, op, x, y);
+    return true;
+  }
+  if (lhs.is_int() && rhs.is_int()) {
+    int64_t x = lhs.as_int(), y = rhs.as_int();
+    switch (op) {
+    case OpCode::ADD: *out = TValue::integer(intop_add(x, y)); return true;
+    case OpCode::SUB: *out = TValue::integer(intop_sub(x, y)); return true;
+    case OpCode::MUL: *out = TValue::integer(intop_mul(x, y)); return true;
+    case OpCode::IDIV:
+    case OpCode::MOD: *out = int_idiv_mod(L, op, x, y); return true;
+    case OpCode::DIV:
+    case OpCode::POW: *out = float_arith(op, static_cast<double>(x), static_cast<double>(y));
+      return true;
+    default: return false;
+    }
+  }
+  if (lhs.is_number() && rhs.is_number()) {
+    *out = float_arith(op, lhs.to_number(), rhs.to_number());
+    return true;
+  }
+  return false;
+}
+
 TValue coerce_number(State* L, const TValue& v, int reg, OpCode op) {
   TValue n;
   if (try_to_number(v, &n))
@@ -89,92 +202,19 @@ TValue arith_raw(State* L, OpCode op, const TValue& a_in, const TValue& b_in, in
                  int reg_b) {
   TValue a = coerce_number(L, a_in, reg_a, op);
   TValue b = coerce_number(L, b_in, reg_b, op);
+  TValue out;
+  if (try_arith_numbers(L, op, a, b, &out))
+    return out;
   if (is_bitwise_op(op)) {
     int64_t x, y;
     if (!to_integer(a, &x))
       tointerror(L, a, reg_a);
     if (!to_integer(b, &y))
       tointerror(L, b, reg_b);
-    int64_t r = 0;
-    // PUC luaV_shiftl: |disp| >= 64 → 0; negative disp reverses direction; bit ops via unsigned.
-    auto shiftl = [](int64_t v, int64_t disp) -> int64_t {
-      constexpr int64_t NBITS = 64;
-      if (disp < 0) {
-        if (disp <= -NBITS)
-          return 0;
-        return static_cast<int64_t>(static_cast<uint64_t>(v) >> static_cast<uint64_t>(-disp));
-      }
-      if (disp >= NBITS)
-        return 0;
-      return static_cast<int64_t>(static_cast<uint64_t>(v) << static_cast<uint64_t>(disp));
-    };
-    switch (op) {
-    case OpCode::BAND: r = x & y; break;
-    case OpCode::BOR: r = x | y; break;
-    case OpCode::BXOR: r = x ^ y; break;
-    case OpCode::SHL: r = shiftl(x, y); break;
-    case OpCode::SHR: r = shiftl(x, -y); break;
-    default: break;
-    }
-    return TValue::integer(r);
+    return bitwise_raw(L, op, x, y);
   }
-  if ((op == OpCode::ADD || op == OpCode::SUB || op == OpCode::MUL) && a.is_int() && b.is_int()) {
-    int64_t x = a.as_int(), y = b.as_int();
-    switch (op) {
-    case OpCode::ADD: return TValue::integer(x + y);
-    case OpCode::SUB: return TValue::integer(x - y);
-    case OpCode::MUL: return TValue::integer(x * y);
-    default: break;
-    }
-  }
-  // PUC luaV_div / luaV_mod: integer floor division and modulo.
-  if ((op == OpCode::IDIV || op == OpCode::MOD) && a.is_int() && b.is_int()) {
-    int64_t m = a.as_int(), n = b.as_int();
-    if (static_cast<uint64_t>(n) + 1u <= 1u) { // n == 0 or n == -1
-      if (n == 0) {
-        if (op == OpCode::IDIV)
-          runerror(L, "attempt to divide by zero");
-        runerror(L, "attempt to perform 'n%0'");
-      }
-      // n == -1: avoid overflow with minint / -1
-      if (op == OpCode::IDIV)
-        return TValue::integer(static_cast<int64_t>(0u - static_cast<uint64_t>(m)));
-      return TValue::integer(0);
-    }
-    if (op == OpCode::IDIV) {
-      int64_t q = m / n;
-      if ((m ^ n) < 0 && m % n != 0)
-        q -= 1; // C truncates toward 0; floor needs correction
-      return TValue::integer(q);
-    }
-    int64_t r = m % n;
-    if (r != 0 && (m ^ n) < 0)
-      r += n;
-    return TValue::integer(r);
-  }
-  if (!a.is_number() || !b.is_number())
-    opinterror(L, a.is_number() ? b_in : a_in, a.is_number() ? reg_b : reg_a,
-               "attempt to perform arithmetic on a ");
-  double x = a.to_number(), y = b.to_number(), r = 0;
-  switch (op) {
-  case OpCode::ADD: r = x + y; break;
-  case OpCode::SUB: r = x - y; break;
-  case OpCode::MUL: r = x * y; break;
-  case OpCode::DIV: r = x / y; break;
-  case OpCode::IDIV:
-    // Float // : IEEE floor(x/y); 0 divisor → ±inf (no runerror).
-    r = std::floor(x / y);
-    break;
-  case OpCode::MOD:
-    // Float % : PUC luai_nummod via fmod; 0 → NaN (no runerror).
-    r = std::fmod(x, y);
-    if (r * y < 0)
-      r += y;
-    break;
-  case OpCode::POW: r = std::pow(x, y); break;
-  default: panic("bad arith");
-  }
-  return TValue::number(r);
+  opinterror(L, a.is_number() ? b_in : a_in, a.is_number() ? reg_b : reg_a,
+             "attempt to perform arithmetic on a ");
 }
 
 TValue do_arith(State* L, OpCode op, const TValue& a, const TValue& b, int reg_a = -1,
@@ -320,9 +360,8 @@ int run_c_call(State* L, Closure* cl, int func_idx, int nargs, int nresults,
   int ctop = L->gettop();
   if (nret > ctop)
     nret = ctop;
-  std::vector<TValue> results(static_cast<size_t>(nret));
-  for (int i = 0; i < nret; ++i)
-    results[static_cast<size_t>(i)] = *L->at(ctop - nret + i + 1);
+  // Absolute stack index of first result (at(ctop-nret+1) == stack[stack_base + ctop - nret]).
+  const int res_abs = th->stack_base + (ctop - nret);
 
   // Yield: keep the C frame on the stack (PUC CallInfo stays) so traceback can
   // see `coroutine.yield` and resume can finish the call.
@@ -355,7 +394,7 @@ int run_c_call(State* L, Closure* cl, int func_idx, int nargs, int nresults,
       // protected call; leave nny unchanged on the continue path.
       return LUA_YIELD;
     }
-    th->yield_vals = std::move(results);
+    th->yield_vals.assign(th->stack.begin() + res_abs, th->stack.begin() + res_abs + nret);
     th->yield_func_idx = func_idx;
     th->yield_nresults = nresults;
     L->ensure_stack(func_idx + 8);
@@ -375,9 +414,12 @@ int run_c_call(State* L, Closure* cl, int func_idx, int nargs, int nresults,
   if (want < 0)
     want = 0;
   L->ensure_stack(func_idx + want + 8);
-  for (int i = 0; i < want; ++i)
-    th->stack[static_cast<size_t>(func_idx + i)] =
-        (i < nret) ? results[static_cast<size_t>(i)] : TValue::nil();
+  // Move results down onto the call slot (may overlap the C window).
+  if (nret > 0 && res_abs != func_idx)
+    std::memmove(th->stack.data() + func_idx, th->stack.data() + res_abs,
+                 static_cast<size_t>(nret) * sizeof(TValue));
+  for (int i = nret; i < want; ++i)
+    th->stack[static_cast<size_t>(func_idx + i)] = TValue::nil();
   // Clear any leftover C-window slots above the results so stale values cannot
   // be mistaken for live registers on subsequent instructions.
   int clear_to = std::max(prev_top, func_idx + 1 + nargs);
@@ -550,7 +592,7 @@ int index_yieldable(State* L, size_t fi, const TValue& table, const TValue& key,
         *out = v;
         return LUA_OK;
       }
-      TValue mm = get_metamethod(L, t, "__index");
+      TValue mm = get_metamethod(L, t, TM_INDEX);
       if (mm.is_nil()) {
         *out = TValue::nil();
         return LUA_OK;
@@ -562,7 +604,7 @@ int index_yieldable(State* L, size_t fi, const TValue& table, const TValue& key,
       t = mm;
       continue;
     }
-    TValue mm = get_metamethod(L, t, "__index");
+    TValue mm = get_metamethod(L, t, TM_INDEX);
     if (mm.is_nil())
       typeerror(L, t, -1, "index");
     if (mm.is_function()) {
@@ -584,7 +626,7 @@ int newindex_yieldable(State* L, size_t fi, const TValue& table, const TValue& k
         t.as_table()->set(L, key, value);
         return LUA_OK;
       }
-      TValue mm = get_metamethod(L, t, "__newindex");
+      TValue mm = get_metamethod(L, t, TM_NEWINDEX);
       if (mm.is_nil()) {
         t.as_table()->set(L, key, value);
         return LUA_OK;
@@ -596,7 +638,7 @@ int newindex_yieldable(State* L, size_t fi, const TValue& table, const TValue& k
       t = mm;
       continue;
     }
-    TValue mm = get_metamethod(L, t, "__newindex");
+    TValue mm = get_metamethod(L, t, TM_NEWINDEX);
     if (mm.is_nil())
       typeerror(L, t, -1, "index");
     if (mm.is_function()) {
@@ -627,6 +669,11 @@ int interpret(State* L, int min_frames) {
   const int entry_depth =
       (min_frames < 0) ? static_cast<int>(th->frames.size()) : min_frames;
 
+  // Cached base across opcodes; refreshed when frame or stack storage changes.
+  TValue* base = nullptr;
+  uint32_t base_stack_version = 0;
+  size_t base_fi = static_cast<size_t>(-1);
+
   // Use frame index (not CallFrame&) so reentrant call_closure / meta calls that
   // push_back on th->frames cannot leave a dangling reference after reallocation.
   while (static_cast<int>(th->frames.size()) >= entry_depth && !th->frames.empty()) {
@@ -640,6 +687,7 @@ int interpret(State* L, int min_frames) {
       int st = finish_interrupted_op(L, fi);
       if (st == LUA_YIELD)
         return LUA_YIELD;
+      base = nullptr; // finish may have grown stack / changed regs
       continue;
     }
     Closure* cl = fr0.cl;
@@ -648,6 +696,7 @@ int interpret(State* L, int min_frames) {
       debug_return_hook(L, th);
       th->frames.pop_back();
       debug_on_return(L, th);
+      base = nullptr;
       if (static_cast<int>(th->frames.size()) < entry_depth)
         return LUA_OK;
       continue;
@@ -677,15 +726,28 @@ int interpret(State* L, int min_frames) {
       L->ensure_stack(fr.base + p->maxstack + static_cast<int>(fr.varargs.size()) + 8);
       // Do not raise th->top to maxstack here: CALL/RETURN MULTRET rely on top
       // marking the end of the variable result range. GC uses thread_live_top().
-      return th->stack.data() + fr.base;
+      base = th->stack.data() + fr.base;
+      base_stack_version = th->stack_version;
+      base_fi = fi;
+      return base;
     };
     auto fbase = [&]() -> int { return th->frames[fi].base; };
     auto pc = [&]() -> int& { return th->frames[fi].saved_pc; };
 
-    TValue* base = reload();
-    L->gc.safepoint();
-    // Finalizers / nested calls during GC may reallocate the stack.
-    base = reload();
+    // Lazy reload: skip ensure_stack + pointer rebase when storage/frame stable.
+    if (base == nullptr || base_fi != fi || base_stack_version != th->stack_version)
+      reload();
+    // GC at strategic points only (back-edges / calls / allocs). Per-opcode
+    // safepoints remain under LUATIER_STRESS_GC_EVERY_SAFEPOINT.
+    // Fast path: skip call+reload when there is nothing to collect.
+    auto gc_step = [&]() {
+      if (!L->gc.stress_every_safepoint && L->gc.debt_ < L->gc.threshold_)
+        return;
+      L->gc.safepoint();
+      base = reload();
+    };
+    if (L->gc.stress_every_safepoint)
+      gc_step();
 #ifndef NDEBUG
     runtime_profile().opcodes++;
 #endif
@@ -727,6 +789,19 @@ int interpret(State* L, int min_frames) {
         panic("GETTABUP: bad constant");
       TValue t = cl->upvals[static_cast<size_t>(b)]->get();
       TValue key = p->constants[static_cast<size_t>(c)];
+      if (t.is_table()) {
+        Table* tb = t.as_table();
+        TValue v = tb->get(key);
+        if (!v.is_nil()) {
+          base[a] = v;
+          break;
+        }
+        Table* mt = tb->metatable;
+        if (!mt || mt->no_tm(TM_INDEX) || get_tm(L, mt, TM_INDEX).is_nil()) {
+          base[a] = TValue::nil();
+          break;
+        }
+      }
       TValue v;
       int st = index_yieldable(L, fi, t, key, &v);
       if (st == LUA_YIELD)
@@ -747,6 +822,19 @@ int interpret(State* L, int min_frames) {
       TValue t = cl->upvals[static_cast<size_t>(a)]->get();
       TValue key = p->constants[static_cast<size_t>(b)];
       TValue val = base[c];
+      if (t.is_table()) {
+        Table* tb = t.as_table();
+        TValue cur = tb->get(key);
+        if (!cur.is_nil()) {
+          tb->set(L, key, val);
+          break;
+        }
+        Table* mt = tb->metatable;
+        if (!mt || mt->no_tm(TM_NEWINDEX) || get_tm(L, mt, TM_NEWINDEX).is_nil()) {
+          tb->set(L, key, val);
+          break;
+        }
+      }
       int st = newindex_yieldable(L, fi, t, key, val);
       if (st == LUA_YIELD)
         return LUA_YIELD;
@@ -762,8 +850,24 @@ int interpret(State* L, int min_frames) {
     }
     case OpCode::GETTABLE: {
       th->err_reg = b;
+      TValue t = base[b], key = base[c];
+      if (t.is_table()) {
+        Table* tb = t.as_table();
+        TValue v = tb->get(key);
+        if (!v.is_nil()) {
+          base[a] = v;
+          th->err_reg = -1;
+          break;
+        }
+        Table* mt = tb->metatable;
+        if (!mt || mt->no_tm(TM_INDEX) || get_tm(L, mt, TM_INDEX).is_nil()) {
+          base[a] = TValue::nil();
+          th->err_reg = -1;
+          break;
+        }
+      }
       TValue v;
-      int st = index_yieldable(L, fi, base[b], base[c], &v);
+      int st = index_yieldable(L, fi, t, key, &v);
       th->err_reg = -1;
       if (st == LUA_YIELD)
         return LUA_YIELD;
@@ -782,6 +886,21 @@ int interpret(State* L, int min_frames) {
     case OpCode::SETTABLE: {
       th->err_reg = a;
       TValue t = base[a], key = base[b], val = base[c];
+      if (t.is_table()) {
+        Table* tb = t.as_table();
+        TValue cur = tb->get(key);
+        if (!cur.is_nil()) {
+          tb->set(L, key, val);
+          th->err_reg = -1;
+          break;
+        }
+        Table* mt = tb->metatable;
+        if (!mt || mt->no_tm(TM_NEWINDEX) || get_tm(L, mt, TM_NEWINDEX).is_nil()) {
+          tb->set(L, key, val);
+          th->err_reg = -1;
+          break;
+        }
+      }
       int st = newindex_yieldable(L, fi, t, key, val);
       th->err_reg = -1;
       if (st == LUA_YIELD)
@@ -798,8 +917,24 @@ int interpret(State* L, int min_frames) {
     }
     case OpCode::GETI: {
       th->err_reg = b;
+      TValue t = base[b];
+      if (t.is_table()) {
+        Table* tb = t.as_table();
+        TValue v = tb->get_int(c);
+        if (!v.is_nil()) {
+          base[a] = v;
+          th->err_reg = -1;
+          break;
+        }
+        Table* mt = tb->metatable;
+        if (!mt || mt->no_tm(TM_INDEX) || get_tm(L, mt, TM_INDEX).is_nil()) {
+          base[a] = TValue::nil();
+          th->err_reg = -1;
+          break;
+        }
+      }
       TValue v;
-      int st = index_yieldable(L, fi, base[b], TValue::integer(c), &v);
+      int st = index_yieldable(L, fi, t, TValue::integer(c), &v);
       th->err_reg = -1;
       if (st == LUA_YIELD)
         return LUA_YIELD;
@@ -818,6 +953,21 @@ int interpret(State* L, int min_frames) {
     case OpCode::SETI: {
       th->err_reg = a;
       TValue t = base[a], val = base[c];
+      if (t.is_table()) {
+        Table* tb = t.as_table();
+        TValue cur = tb->get_int(b);
+        if (!cur.is_nil()) {
+          tb->set_int(L, b, val);
+          th->err_reg = -1;
+          break;
+        }
+        Table* mt = tb->metatable;
+        if (!mt || mt->no_tm(TM_NEWINDEX) || get_tm(L, mt, TM_NEWINDEX).is_nil()) {
+          tb->set_int(L, b, val);
+          th->err_reg = -1;
+          break;
+        }
+      }
       int st = newindex_yieldable(L, fi, t, TValue::integer(b), val);
       th->err_reg = -1;
       if (st == LUA_YIELD)
@@ -834,8 +984,25 @@ int interpret(State* L, int min_frames) {
     }
     case OpCode::GETFIELD: {
       th->err_reg = b;
+      TValue t = base[b];
+      TValue key = p->constants[static_cast<size_t>(c)];
+      if (t.is_table()) {
+        Table* tb = t.as_table();
+        TValue v = tb->get(key);
+        if (!v.is_nil()) {
+          base[a] = v;
+          th->err_reg = -1;
+          break;
+        }
+        Table* mt = tb->metatable;
+        if (!mt || mt->no_tm(TM_INDEX) || get_tm(L, mt, TM_INDEX).is_nil()) {
+          base[a] = TValue::nil();
+          th->err_reg = -1;
+          break;
+        }
+      }
       TValue v;
-      int st = index_yieldable(L, fi, base[b], p->constants[static_cast<size_t>(c)], &v);
+      int st = index_yieldable(L, fi, t, key, &v);
       th->err_reg = -1;
       if (st == LUA_YIELD)
         return LUA_YIELD;
@@ -854,7 +1021,23 @@ int interpret(State* L, int min_frames) {
     case OpCode::SETFIELD: {
       th->err_reg = a;
       TValue t = base[a], val = base[c];
-      int st = newindex_yieldable(L, fi, t, p->constants[static_cast<size_t>(b)], val);
+      TValue key = p->constants[static_cast<size_t>(b)];
+      if (t.is_table()) {
+        Table* tb = t.as_table();
+        TValue cur = tb->get(key);
+        if (!cur.is_nil()) {
+          tb->set(L, key, val);
+          th->err_reg = -1;
+          break;
+        }
+        Table* mt = tb->metatable;
+        if (!mt || mt->no_tm(TM_NEWINDEX) || get_tm(L, mt, TM_NEWINDEX).is_nil()) {
+          tb->set(L, key, val);
+          th->err_reg = -1;
+          break;
+        }
+      }
+      int st = newindex_yieldable(L, fi, t, key, val);
       th->err_reg = -1;
       if (st == LUA_YIELD)
         return LUA_YIELD;
@@ -870,6 +1053,7 @@ int interpret(State* L, int min_frames) {
     }
     case OpCode::NEWTABLE:
       base[a] = TValue::obj(ValueTag::Table, table_new(L, b ? (1u << b) : 0, c ? (1u << c) : 0));
+      gc_step();
       break;
     case OpCode::SELF: {
       TValue t = base[b];
@@ -908,7 +1092,19 @@ int interpret(State* L, int min_frames) {
     case OpCode::BXOR:
     case OpCode::SHL:
     case OpCode::SHR: {
-      TValue lhs = base[b], rhs = base[c];
+      const TValue& lhs = base[b];
+      const TValue& rhs = base[c];
+      TValue out;
+      // Fast path: register numbers (Int×Int / Float / bitwise) — no arith_raw.
+      if (try_arith_numbers(L, op, lhs, rhs, &out)) {
+        base[a] = out;
+        break;
+      }
+      // String coercion or error for already-number bitwise non-integers.
+      if (lhs.is_number() && rhs.is_number()) {
+        base[a] = arith_raw(L, op, lhs, rhs, b, c);
+        break;
+      }
       TValue na, nb;
       if (try_to_number(lhs, &na) && try_to_number(rhs, &nb)) {
         base[a] = arith_raw(L, op, na, nb, b, c);
@@ -934,19 +1130,28 @@ int interpret(State* L, int min_frames) {
       break;
     }
     case OpCode::UNM: {
+      const TValue& vb = base[b];
+      if (vb.is_int()) {
+        base[a] = TValue::integer(intop_unm(vb.as_int()));
+        break;
+      }
+      if (vb.is_float()) {
+        base[a] = TValue::number(-vb.as_float());
+        break;
+      }
       TValue nb;
-      if (try_to_number(base[b], &nb)) {
+      if (try_to_number(vb, &nb)) {
         if (nb.is_int())
-          base[a] = TValue::integer(-nb.as_int());
+          base[a] = TValue::integer(intop_unm(nb.as_int()));
         else
           base[a] = TValue::number(-nb.as_float());
       } else {
-        TValue mm = get_metamethod(L, base[b], "__unm");
+        TValue mm = get_metamethod(L, vb, "__unm");
         if (mm.is_nil() || !mm.is_function()) {
           th->err_reg = b;
-          opinterror(L, base[b], b, "attempt to perform arithmetic on a ");
+          opinterror(L, vb, b, "attempt to perform arithmetic on a ");
         }
-        TValue args[1] = {base[b]};
+        TValue args[1] = {vb};
         int st = invoke_mm(L, fi, mm, args, 1, 1);
         if (st == LUA_YIELD)
           return LUA_YIELD;
@@ -1023,6 +1228,49 @@ int interpret(State* L, int min_frames) {
       cfr.concat_pos = b;
       cfr.concat_last = c;
       cfr.concat_dest = a;
+      // Fast path: all string/number — one buffer, one intern (no pairwise temps).
+      {
+        bool all_ok = true;
+        size_t total = 0;
+        char nbuf[64];
+        for (int i = b; i <= c; ++i) {
+          const TValue& v = base[i];
+          if (v.is_string()) {
+            total += v.as_string()->len;
+          } else if (v.is_int()) {
+            total += static_cast<size_t>(std::snprintf(nbuf, sizeof(nbuf), "%lld",
+                                                       static_cast<long long>(v.as_int())));
+          } else if (v.is_float()) {
+            total += static_cast<size_t>(std::snprintf(nbuf, sizeof(nbuf), "%.14g", v.as_float()));
+          } else {
+            all_ok = false;
+            break;
+          }
+        }
+        if (all_ok) {
+          std::string buf;
+          buf.resize(total);
+          size_t off = 0;
+          for (int i = b; i <= c; ++i) {
+            const TValue& v = base[i];
+            if (v.is_string()) {
+              std::memcpy(buf.data() + off, v.as_string()->data, v.as_string()->len);
+              off += v.as_string()->len;
+            } else if (v.is_int()) {
+              int n = std::snprintf(nbuf, sizeof(nbuf), "%lld",
+                                    static_cast<long long>(v.as_int()));
+              std::memcpy(buf.data() + off, nbuf, static_cast<size_t>(n));
+              off += static_cast<size_t>(n);
+            } else {
+              int n = std::snprintf(nbuf, sizeof(nbuf), "%.14g", v.as_float());
+              std::memcpy(buf.data() + off, nbuf, static_cast<size_t>(n));
+              off += static_cast<size_t>(n);
+            }
+          }
+          base[a] = TValue::obj(ValueTag::String, L->intern(buf));
+          break;
+        }
+      }
       TValue acc = base[b];
       int pos = b + 1;
       while (pos <= c) {
@@ -1203,6 +1451,7 @@ int interpret(State* L, int min_frames) {
       }
       pc() += op_sbx(ins);
       hotness_on_loop(p);
+      gc_step();
       break;
     }
     case OpCode::FORPREP: {
@@ -1298,6 +1547,7 @@ int interpret(State* L, int min_frames) {
           base[a] = TValue::integer(idx);
           base[a + 3] = TValue::integer(idx);
           hotness_on_loop(p);
+          gc_step();
         }
       } else {
         double step = base[a + 2].to_number();
@@ -1308,6 +1558,7 @@ int interpret(State* L, int min_frames) {
           base[a] = TValue::number(idx);
           base[a + 3] = TValue::number(idx);
           hotness_on_loop(p);
+          gc_step();
         }
       }
       break;
@@ -1340,6 +1591,7 @@ int interpret(State* L, int min_frames) {
         base[a] = base[a + 1];
         pc() += op_sbx(ins);
         hotness_on_loop(p);
+        gc_step();
       }
       break;
     }
@@ -1403,6 +1655,7 @@ int interpret(State* L, int min_frames) {
       np->cache = ncl;
       base = reload();
       base[a] = TValue::obj(ValueTag::Function, ncl);
+      gc_step();
       break;
     }
     case OpCode::VARARG: {
@@ -1422,6 +1675,7 @@ int interpret(State* L, int min_frames) {
       break;
     }
     case OpCode::CALL: {
+      gc_step();
       int nargs = (b == 0) ? (L->abs_top() - (fbase() + a) - 1) : (b - 1);
       if (nargs < 0)
         nargs = 0;
@@ -1446,30 +1700,35 @@ int interpret(State* L, int min_frames) {
       break;
     }
     case OpCode::TAILCALL: {
+      gc_step();
       int nargs = (b == 0) ? (L->abs_top() - (fbase() + a) - 1) : (b - 1);
       if (nargs < 0)
         nargs = 0;
       int nresults = th->frames[fi].expected_results;
       int dest = fbase();
       int call_base = dest + a;
-      // Snapshot func+args first so close/slide cannot clobber them, and so open
-      // upvalues still see the caller's original locals when closed (PUC order:
-      // close before sliding the new frame into the caller's slots).
-      std::vector<TValue> call_vals(static_cast<size_t>(nargs + 1));
+      // Snapshot func+args above live top so close/slide cannot clobber them, and
+      // so open upvalues still see the caller's original locals when closed
+      // (PUC order: close before sliding the new frame into the caller's slots).
+      const int tmp = live_regs_top(th);
+      L->ensure_stack(tmp + nargs + 1 + 8);
       for (int i = 0; i <= nargs; ++i)
-        call_vals[static_cast<size_t>(i)] = th->stack[static_cast<size_t>(call_base + i)];
-      TValue callee = call_vals[0];
+        th->stack[static_cast<size_t>(tmp + i)] =
+            th->stack[static_cast<size_t>(call_base + i)];
+      TValue callee = th->stack[static_cast<size_t>(tmp)];
       const char* tail_name_ptr = nullptr;
       debug_funcnamefromcode(&th->frames[fi], &tail_name_ptr);
       std::string tail_name = tail_name_ptr ? tail_name_ptr : "";
       L->close_upvals(th, dest);
       L->ensure_stack(dest + 1 + nargs + 8);
       for (int i = 0; i <= nargs; ++i)
-        th->stack[static_cast<size_t>(dest + i)] = call_vals[static_cast<size_t>(i)];
+        th->stack[static_cast<size_t>(dest + i)] =
+            th->stack[static_cast<size_t>(tmp + i)];
       th->top = dest + 1 + nargs;
       // Proper tail call: replace the frame; no return hook for the caller.
       th->frames.pop_back();
       debug_on_return(L, th);
+      base = nullptr;
       if (callee.is_function()) {
         if (callee.as_closure()->is_c) {
           int st = run_c_call(L, callee.as_closure(), dest, nargs, nresults, true,
@@ -1489,30 +1748,29 @@ int interpret(State* L, int min_frames) {
       break;
     }
     case OpCode::RETURN: {
+      gc_step();
       auto& fr = th->frames[fi];
       int nret = (b == 0) ? (L->abs_top() - (fr.base + a)) : (b - 1);
       if (nret < 0)
         nret = 0;
       L->close_upvals(th, fr.base);
       int dest = fr.base;
+      int src = fr.base + a;
       int want = fr.expected_results;
-      std::vector<TValue> results(static_cast<size_t>(nret));
-      // Use absolute indices: `base` can be stale after stack reallocation.
-      for (int i = 0; i < nret; ++i)
-        results[static_cast<size_t>(i)] =
-            th->stack[static_cast<size_t>(fr.base + a + i)];
-      debug_return_hook(L, th);
-      th->frames.pop_back();
-      debug_on_return(L, th);
-      // Do not use set_abs_top to grow: when top sits low after a 1-result CALL,
-      // growing would nil-fill over the results we are about to (or just) write.
       int placed = (want == LUA_MULTRET) ? nret : want;
       if (placed < 0)
         placed = 0;
-      L->ensure_stack(dest + placed + 8);
-      for (int i = 0; i < placed; ++i)
-        th->stack[static_cast<size_t>(dest + i)] =
-            (i < nret) ? results[static_cast<size_t>(i)] : TValue::nil();
+      // Grow before move; absolute indices stay valid across resize.
+      L->ensure_stack(std::max(src + nret, dest + placed) + 8);
+      debug_return_hook(L, th);
+      th->frames.pop_back();
+      debug_on_return(L, th);
+      base = nullptr;
+      if (nret > 0 && src != dest)
+        std::memmove(th->stack.data() + dest, th->stack.data() + src,
+                     static_cast<size_t>(nret) * sizeof(TValue));
+      for (int i = nret; i < placed; ++i)
+        th->stack[static_cast<size_t>(dest + i)] = TValue::nil();
       th->top = dest + placed;
       if (static_cast<int>(th->frames.size()) < entry_depth)
         return LUA_OK;
@@ -1520,7 +1778,7 @@ int interpret(State* L, int min_frames) {
     }
     case OpCode::CHECKGC:
     case OpCode::SAFEPOINT:
-      L->gc.safepoint();
+      gc_step();
       break;
     default:
       panic(std::string("unimplemented opcode ") + opcode_name(op));

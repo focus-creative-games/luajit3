@@ -47,6 +47,8 @@ const char* opcode_name(OpCode op) {
   case OpCode::SETLIST: return "SETLIST";
   case OpCode::GETFIELD: return "GETFIELD";
   case OpCode::SETFIELD: return "SETFIELD";
+  case OpCode::GETI: return "GETI";
+  case OpCode::SETI: return "SETI";
   default: return "OP";
   }
 }

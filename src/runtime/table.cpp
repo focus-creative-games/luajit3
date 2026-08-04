@@ -25,7 +25,9 @@ void Table::update_weak_mode(State* L) {
   weak_mode = 0;
   if (!metatable)
     return;
-  TValue mode = metatable->get(TValue::obj(ValueTag::String, L->intern("__mode")));
+  TValue mode = metatable->get(TValue::obj(ValueTag::String, L->tm_names[TM_MODE]
+                                                               ? L->tm_names[TM_MODE]
+                                                               : L->intern("__mode")));
   if (!mode.is_string())
     return;
   std::string_view s = mode.as_string()->view();
@@ -143,24 +145,68 @@ TValue Table::get(const TValue& key) const {
 }
 
 void Table::rehash(State* L, size_t array_hint, size_t hash_hint) {
-  std::vector<std::pair<TValue, TValue>> items;
-  for (size_t i = 0; i < array.size(); ++i) {
-    if (!array[i].is_nil())
-      items.emplace_back(TValue::integer(static_cast<int64_t>(i + 1)), array[i]);
-  }
-  for (auto& n : hash) {
-    if (n.used && !n.value.is_nil())
-      items.emplace_back(n.key, n.value);
-  }
+  std::vector<TValue> old_array = std::move(array);
+  std::vector<TableNode> old_hash = std::move(hash);
+
   array.assign(array_hint, TValue::nil());
+  size_t nitems = 0;
+  for (size_t i = 0; i < old_array.size(); ++i) {
+    if (!old_array[i].is_nil())
+      ++nitems;
+  }
+  for (auto& n : old_hash) {
+    if (n.used && !n.value.is_nil())
+      ++nitems;
+  }
   size_t hs = 8;
-  while (hs < std::max<size_t>(hash_hint, items.size() + 1))
+  while (hs < std::max<size_t>(hash_hint, nitems + 1))
     hs <<= 1;
   hash.clear();
   hash.resize(hs);
   structure_version++;
-  for (auto& kv : items)
-    set(L, kv.first, kv.second);
+
+  auto raw_insert = [&](const TValue& key, const TValue& value) {
+    if (value.is_nil())
+      return;
+    TValue lookup = key;
+    int64_t i = 0;
+    if (key_as_integer(key, &i)) {
+      lookup = TValue::integer(i);
+      if (i >= 1 && static_cast<size_t>(i) <= array.size()) {
+        array[static_cast<size_t>(i - 1)] = value;
+        L->gc.barrier(this, value);
+        return;
+      }
+    }
+    size_t idx = hash_key(lookup, hash.size());
+    for (size_t probe = 0; probe < hash.size(); ++probe) {
+      size_t slot = (idx + probe) % hash.size();
+      if (!hash[slot].used) {
+        hash[slot].used = true;
+        hash[slot].key = lookup;
+        hash[slot].value = value;
+        hash[slot].next = nullptr;
+        L->gc.barrier(this, lookup);
+        L->gc.barrier(this, value);
+        return;
+      }
+      if (values_equal(hash[slot].key, lookup)) {
+        hash[slot].value = value;
+        L->gc.barrier(this, value);
+        return;
+      }
+    }
+    panic("rehash: hash full");
+  };
+
+  for (size_t i = 0; i < old_array.size(); ++i) {
+    if (!old_array[i].is_nil())
+      raw_insert(TValue::integer(static_cast<int64_t>(i + 1)), old_array[i]);
+  }
+  for (auto& n : old_hash) {
+    if (n.used && !n.value.is_nil())
+      raw_insert(n.key, n.value);
+  }
 }
 
 void Table::set_int(State* L, int64_t i, const TValue& value) {
@@ -185,6 +231,12 @@ void Table::set(State* L, const TValue& key, const TValue& value) {
     panic("table index is nil");
   if (key.is_float() && key.as_float() != key.as_float())
     panic("table index is NaN");
+  // Writing a metamethod-like key invalidates fasttm absence cache (PUC).
+  if (key.is_string()) {
+    std::string_view s = key.as_string()->view();
+    if (s.size() >= 2 && s[0] == '_' && s[1] == '_')
+      clear_tm_cache();
+  }
   TValue lookup = key;
   int64_t i = 0;
   if (key_as_integer(key, &i)) {

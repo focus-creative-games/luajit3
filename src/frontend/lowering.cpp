@@ -4,6 +4,7 @@
 #include "runtime/string.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <utility>
 #include <unordered_map>
 #include <unordered_set>
@@ -230,6 +231,8 @@ void check_limit(FuncState& fs, int v, int limit, const char* what) {
 struct Expdesc {
   enum Kind { Void, Relocable, Nonrelocable, Constant, Local, Upval, Global, Indexed, Call } kind =
       Void;
+  // For Indexed: how `key` is encoded in GET*/SET*.
+  enum class IndexKey : uint8_t { Reg, IntImm, ConstStr };
   int info = 0;
   int t = -1; // patch list true
   int f = -1; // patch list false
@@ -238,7 +241,47 @@ struct Expdesc {
   int table = -1;
   int key = -1;
   bool key_is_rk = false;
+  IndexKey index_key = IndexKey::Reg;
 };
+
+// True if constant is an integer (or integer-valued float) in [0, 255].
+bool const_uint8_index(const TValue& v, int* out) {
+  int64_t i = 0;
+  if (v.is_int()) {
+    i = v.as_int();
+  } else if (v.is_float()) {
+    double d = v.as_float();
+    if (d != d || d != std::floor(d))
+      return false;
+    if (d < 0.0 || d > 255.0)
+      return false;
+    i = static_cast<int64_t>(d);
+  } else {
+    return false;
+  }
+  if (i < 0 || i > 255)
+    return false;
+  *out = static_cast<int>(i);
+  return true;
+}
+
+void emit_get_index(FuncState& fs, int dest, const Expdesc& idx, int line = -1) {
+  if (idx.index_key == Expdesc::IndexKey::IntImm)
+    fs.code_abc(OpCode::GETI, dest, idx.table, idx.key, line);
+  else if (idx.index_key == Expdesc::IndexKey::ConstStr)
+    fs.code_abc(OpCode::GETFIELD, dest, idx.table, idx.key, line);
+  else
+    fs.code_abc(OpCode::GETTABLE, dest, idx.table, idx.key, line);
+}
+
+void emit_set_index(FuncState& fs, const Expdesc& idx, int val_reg, int line = -1) {
+  if (idx.index_key == Expdesc::IndexKey::IntImm)
+    fs.code_abc(OpCode::SETI, idx.table, idx.key, val_reg, line);
+  else if (idx.index_key == Expdesc::IndexKey::ConstStr)
+    fs.code_abc(OpCode::SETFIELD, idx.table, idx.key, val_reg, line);
+  else
+    fs.code_abc(OpCode::SETTABLE, idx.table, idx.key, val_reg, line);
+}
 
 void expr(FuncState& fs, Expdesc& e, Expr& node);
 void statement(FuncState& fs, AstNode& node);
@@ -382,11 +425,15 @@ void discharge(FuncState& fs, Expdesc& e) {
   case Expdesc::Global: {
     e.reg = fs.new_reg();
     if (e.key == -2) {
-      // `_ENV` is a local in this function: GETTABLE local_env[name]
-      int kreg = fs.new_reg();
-      fs.code_abx(OpCode::LOADK, kreg, static_cast<uint16_t>(e.info));
-      fs.code_abc(OpCode::GETTABLE, e.reg, e.table, kreg);
-      fs.freereg = e.reg + 1;
+      // `_ENV` is a local in this function: index local_env[name]
+      if (e.info <= 255) {
+        fs.code_abc(OpCode::GETFIELD, e.reg, e.table, e.info);
+      } else {
+        int kreg = fs.new_reg();
+        fs.code_abx(OpCode::LOADK, kreg, static_cast<uint16_t>(e.info));
+        fs.code_abc(OpCode::GETTABLE, e.reg, e.table, kreg);
+        fs.freereg = e.reg + 1;
+      }
     } else {
       int env = ensure_env_upval(fs);
       if (e.info <= 255) {
@@ -420,7 +467,7 @@ void discharge(FuncState& fs, Expdesc& e) {
   }
   case Expdesc::Indexed: {
     int r = fs.new_reg();
-    fs.code_abc(OpCode::GETTABLE, r, e.table, e.key);
+    emit_get_index(fs, r, e);
     // Keep result at r; do not freereg back over it (would clobber for t.a+t.b).
     fs.freereg = r + 1;
     e.reg = r;
@@ -717,10 +764,24 @@ void expr(FuncState& fs, Expdesc& e, Expr& node) {
     expr(fs, t, *n.table);
     int rt = exp2reg(fs, t);
     expr(fs, k, *n.key);
-    int rk = exp2reg(fs, k);
     e.kind = Expdesc::Indexed;
     e.table = rt;
-    e.key = rk;
+    e.index_key = Expdesc::IndexKey::Reg;
+    int imm = 0;
+    if (k.kind == Expdesc::Constant && const_uint8_index(k.k, &imm)) {
+      e.index_key = Expdesc::IndexKey::IntImm;
+      e.key = imm;
+    } else if (k.kind == Expdesc::Constant && k.k.is_string()) {
+      int ki = fs.const_index(k.k);
+      if (ki <= 255) {
+        e.index_key = Expdesc::IndexKey::ConstStr;
+        e.key = ki;
+      } else {
+        e.key = exp2reg(fs, k);
+      }
+    } else {
+      e.key = exp2reg(fs, k);
+    }
     break;
   }
   case AstKind::ExprField: {
@@ -728,12 +789,18 @@ void expr(FuncState& fs, Expdesc& e, Expr& node) {
     Expdesc t;
     expr(fs, t, *n.table);
     int rt = exp2reg(fs, t);
-    int k = fs.string_k(n.field);
-    int rk = fs.new_reg();
-    fs.code_abx(OpCode::LOADK, rk, k);
+    int ki = fs.string_k(n.field);
     e.kind = Expdesc::Indexed;
     e.table = rt;
-    e.key = rk;
+    if (ki <= 255) {
+      e.index_key = Expdesc::IndexKey::ConstStr;
+      e.key = ki;
+    } else {
+      e.index_key = Expdesc::IndexKey::Reg;
+      int rk = fs.new_reg();
+      fs.code_abx(OpCode::LOADK, rk, ki);
+      e.key = rk;
+    }
     break;
   }
   case AstKind::ExprCall: {
@@ -747,7 +814,7 @@ void expr(FuncState& fs, Expdesc& e, Expr& node) {
     Expdesc c;
     expr(fs, c, *n.callee);
     if (c.kind == Expdesc::Indexed) {
-      fs.code_abc(OpCode::GETTABLE, base, c.table, c.key);
+      emit_get_index(fs, base, c);
     } else {
       int cr = exp2reg(fs, c);
       if (cr != base)
@@ -821,20 +888,38 @@ void expr(FuncState& fs, Expdesc& e, Expr& node) {
     for (size_t fi = 0; fi < n.fields.size(); ++fi) {
       auto& f = n.fields[fi];
       if (!f.name.empty()) {
-        int k = fs.new_reg();
-        fs.code_abx(OpCode::LOADK, k, fs.string_k(f.name));
+        int ki = fs.string_k(f.name);
         Expdesc v;
         expr(fs, v, *f.value);
         int rv = exp2reg(fs, v);
-        fs.code_abc(OpCode::SETTABLE, r, k, rv);
+        if (ki <= 255) {
+          fs.code_abc(OpCode::SETFIELD, r, ki, rv);
+        } else {
+          int k = fs.new_reg();
+          fs.code_abx(OpCode::LOADK, k, ki);
+          fs.code_abc(OpCode::SETTABLE, r, k, rv);
+        }
         fs.freereg = r + 1 + tostore;
       } else if (f.key) {
         Expdesc k, v;
         expr(fs, k, *f.key);
-        int rk = exp2reg(fs, k);
         expr(fs, v, *f.value);
         int rv = exp2reg(fs, v);
-        fs.code_abc(OpCode::SETTABLE, r, rk, rv);
+        int imm = 0;
+        if (k.kind == Expdesc::Constant && const_uint8_index(k.k, &imm)) {
+          fs.code_abc(OpCode::SETI, r, imm, rv);
+        } else if (k.kind == Expdesc::Constant && k.k.is_string()) {
+          int ki = fs.const_index(k.k);
+          if (ki <= 255)
+            fs.code_abc(OpCode::SETFIELD, r, ki, rv);
+          else {
+            int rk = exp2reg(fs, k);
+            fs.code_abc(OpCode::SETTABLE, r, rk, rv);
+          }
+        } else {
+          int rk = exp2reg(fs, k);
+          fs.code_abc(OpCode::SETTABLE, r, rk, rv);
+        }
         fs.freereg = r + 1 + tostore;
       } else {
         bool last_array = true;
@@ -946,9 +1031,13 @@ void storevar(FuncState& fs, Expdesc& var, int expr_reg) {
     fs.code_abc(OpCode::SETUPVAL, expr_reg, var.info, 0);
   } else if (var.kind == Expdesc::Global) {
     if (var.key == -2) {
-      int kreg = fs.new_reg();
-      fs.code_abx(OpCode::LOADK, kreg, static_cast<uint16_t>(var.info));
-      fs.code_abc(OpCode::SETTABLE, var.table, kreg, expr_reg);
+      if (var.info <= 255) {
+        fs.code_abc(OpCode::SETFIELD, var.table, var.info, expr_reg);
+      } else {
+        int kreg = fs.new_reg();
+        fs.code_abx(OpCode::LOADK, kreg, static_cast<uint16_t>(var.info));
+        fs.code_abc(OpCode::SETTABLE, var.table, kreg, expr_reg);
+      }
     } else {
       int env = ensure_env_upval(fs);
       if (var.info <= 255) {
@@ -962,7 +1051,7 @@ void storevar(FuncState& fs, Expdesc& var, int expr_reg) {
       }
     }
   } else if (var.kind == Expdesc::Indexed) {
-    fs.code_abc(OpCode::SETTABLE, var.table, var.key, expr_reg);
+    emit_set_index(fs, var, expr_reg);
   } else {
     panic("invalid assignment target");
   }
@@ -1120,15 +1209,17 @@ void statement(FuncState& fs, AstNode& node) {
       Expdesc e;
       expr(fs, e, *v);
       if (e.kind == Expdesc::Indexed) {
-        // Snapshot table & key registers so later stores in this statement
-        // cannot clobber locals that share those slots (PUC multi-assign:
-        // `i, a[i], a, ... = ...` must use pre-assign values of a/i).
+        // Snapshot table & key so later stores in this statement cannot clobber
+        // pre-assign values (PUC multi-assign: `i, a[i], a, ... = ...`).
         int t = fs.new_reg();
         fs.code_abc(OpCode::MOVE, t, e.table, 0);
         e.table = t;
-        int k = fs.new_reg();
-        fs.code_abc(OpCode::MOVE, k, e.key, 0);
-        e.key = k;
+        if (e.index_key == Expdesc::IndexKey::Reg) {
+          int k = fs.new_reg();
+          fs.code_abc(OpCode::MOVE, k, e.key, 0);
+          e.key = k;
+        }
+        // IntImm / ConstStr keys are immediates — no register to snapshot.
       }
       vars.push_back(e);
     }
@@ -1466,15 +1557,25 @@ void statement(FuncState& fs, AstNode& node) {
       search_var(fs, n.name_path[0], t);
       int reg = exp2reg(fs, t);
       for (size_t i = 1; i + 1 < n.name_path.size(); ++i) {
-        int k = fs.new_reg();
-        fs.code_abx(OpCode::LOADK, k, fs.string_k(n.name_path[i]), fline);
+        int ki = fs.string_k(n.name_path[i]);
         int d = fs.new_reg();
-        fs.code_abc(OpCode::GETTABLE, d, reg, k, fline);
+        if (ki <= 255) {
+          fs.code_abc(OpCode::GETFIELD, d, reg, ki, fline);
+        } else {
+          int k = fs.new_reg();
+          fs.code_abx(OpCode::LOADK, k, ki, fline);
+          fs.code_abc(OpCode::GETTABLE, d, reg, k, fline);
+        }
         reg = d;
       }
-      int k = fs.new_reg();
-      fs.code_abx(OpCode::LOADK, k, fs.string_k(n.name_path.back()), fline);
-      fs.code_abc(OpCode::SETTABLE, reg, k, er, fline);
+      int ki = fs.string_k(n.name_path.back());
+      if (ki <= 255) {
+        fs.code_abc(OpCode::SETFIELD, reg, ki, er, fline);
+      } else {
+        int k = fs.new_reg();
+        fs.code_abx(OpCode::LOADK, k, ki, fline);
+        fs.code_abc(OpCode::SETTABLE, reg, k, er, fline);
+      }
     }
     fs.freereg = fs.nactvar;
     break;

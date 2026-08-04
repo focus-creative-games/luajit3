@@ -164,6 +164,10 @@ void GC::mark_roots() {
     for (LjString* s = head; s; s = s->hnext)
       mark_object(s);
   }
+  for (LjString* s : L_->tm_names) {
+    if (s)
+      mark_object(s);
+  }
 }
 
 void GC::propagate_one() {
@@ -557,7 +561,8 @@ void GC::maybe_step() {
   if (!gc_isrunning_ || running_finalizer_ || collecting_)
     return;
   // Prefer full cycles over incomplete incremental marking until barriers are
-  // airtight; collect only at safepoints so freshly linked objects are rooted.
+  // airtight; collect only at strategic safepoints (loop back-edges, calls,
+  // NEWTABLE/CLOSURE) so freshly linked objects are rooted.
   // full_gc() owns the collecting_ guard (do not set it here or full_gc no-ops).
   if (debt_ >= threshold_) {
     full_gc();

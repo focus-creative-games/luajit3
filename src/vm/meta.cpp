@@ -60,7 +60,51 @@ void set_metatable(State* L, TValue& v, Table* mt) {
     L->gc.barrier(v.as_gc(), TValue::obj(ValueTag::Table, mt));
 }
 
+void init_tm_names(State* L) {
+  static constexpr const char* kNames[TM_N] = {
+      "__index", "__newindex", "__gc",    "__mode",  "__len",   "__eq",    "__add",
+      "__sub",   "__mul",      "__mod",   "__pow",   "__div",   "__idiv",  "__band",
+      "__bor",   "__bxor",     "__shl",   "__shr",   "__unm",   "__bnot",  "__lt",
+      "__le",    "__concat",   "__call"};
+  for (int i = 0; i < TM_N; ++i)
+    L->tm_names[static_cast<size_t>(i)] = L->intern(kNames[i]);
+}
+
+TValue get_tm(State* L, Table* mt, TmEvent event) {
+  if (!mt)
+    return TValue::nil();
+  if (mt->no_tm(event))
+    return TValue::nil();
+  LjString* name = L->tm_names[static_cast<size_t>(event)];
+  if (!name)
+    return TValue::nil();
+  TValue tm = mt->get(TValue::obj(ValueTag::String, name));
+  if (tm.is_nil())
+    mt->mark_no_tm(event);
+  return tm;
+}
+
+TValue get_metamethod(State* L, const TValue& obj, TmEvent event) {
+  return get_tm(L, get_metatable(L, obj), event);
+}
+
 TValue get_metamethod(State* L, const TValue& obj, const char* name) {
+  // Map common names to events so callers still benefit from fasttm.
+  static constexpr struct {
+    const char* s;
+    TmEvent e;
+  } kMap[] = {{"__index", TM_INDEX},     {"__newindex", TM_NEWINDEX}, {"__gc", TM_GC},
+              {"__mode", TM_MODE},       {"__len", TM_LEN},           {"__eq", TM_EQ},
+              {"__add", TM_ADD},         {"__sub", TM_SUB},           {"__mul", TM_MUL},
+              {"__mod", TM_MOD},         {"__pow", TM_POW},           {"__div", TM_DIV},
+              {"__idiv", TM_IDIV},       {"__band", TM_BAND},         {"__bor", TM_BOR},
+              {"__bxor", TM_BXOR},       {"__shl", TM_SHL},           {"__shr", TM_SHR},
+              {"__unm", TM_UNM},         {"__bnot", TM_BNOT},         {"__lt", TM_LT},
+              {"__le", TM_LE},           {"__concat", TM_CONCAT},     {"__call", TM_CALL}};
+  for (auto& m : kMap) {
+    if (std::strcmp(name, m.s) == 0)
+      return get_metamethod(L, obj, m.e);
+  }
   Table* mt = get_metatable(L, obj);
   if (!mt)
     return TValue::nil();

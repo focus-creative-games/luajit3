@@ -72,6 +72,8 @@ struct Thread : GcObject {
   DebugHookState hook;
   UpVal* open_upvals = nullptr;
   int top = 0; // absolute index one past last used slot
+  // Bumped when stack.storage relocates (ensure_stack resize).
+  uint32_t stack_version = 0;
   // C-call window: Lua API indices are relative to stack_base (at(1) == stack[stack_base]).
   int stack_base = 0;
   enum class Status { Fresh, Running, Suspended, Dead, Error } status = Status::Fresh;
@@ -99,6 +101,8 @@ struct State {
   // Per-type metatables (PUC G(L)->mt[]): String, number (Float slot; Int shares it), etc.
   std::array<Table*, static_cast<size_t>(ValueTag::Internal) + 1> type_mt{};
   StringTable strings;
+  // Cached metamethod names for fasttm (indexed by TmEvent).
+  std::array<LjString*, TM_N> tm_names{};
   GC gc;
   bool panic_on_error = false;
 

@@ -5,6 +5,7 @@
 #include "frontend/sema.hpp"
 #include "lib/libs.hpp"
 #include "vm/interpreter.hpp"
+#include "vm/meta.hpp"
 
 #include <cstdlib>
 #include <fstream>
@@ -34,6 +35,7 @@ State::State() : gc(this) {
   main->frames.reserve(64);
   globals = table_new(this, 0, 32);
   registry = table_new(this, 0, 8);
+  init_tm_names(this);
   // _G
   globals->set(this, TValue::obj(ValueTag::String, intern("_G")),
                TValue::obj(ValueTag::Table, globals));
@@ -51,8 +53,10 @@ std::unique_ptr<State> new_state() { return std::make_unique<State>(); }
 LjString* State::intern(std::string_view s) { return strings.intern(this, s); }
 
 void State::ensure_stack(int n) {
-  if (static_cast<int>(current->stack.size()) < n)
+  if (static_cast<int>(current->stack.size()) < n) {
     current->stack.resize(static_cast<size_t>(n) + 64, TValue::nil());
+    current->stack_version++;
+  }
 }
 
 int State::gettop() const { return current->top - current->stack_base; }
